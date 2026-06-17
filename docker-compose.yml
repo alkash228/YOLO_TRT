@@ -1,0 +1,44 @@
+# Модели и output — bind mount с хоста.
+# TRT: strategy=central → engines в /data/models/TRT/ (внутри контейнера).
+services:
+  yolo-drt-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: yolo-drt-api:latest
+    container_name: yolo-drt-api
+    restart: unless-stopped
+    runtime: nvidia
+    ports:
+      - "8080:8080"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    environment:
+      NVIDIA_VISIBLE_DEVICES: all
+      YOLO_DRT_DETECT_MODEL: /data/models/YOLO/yolo26x-pose.pt
+      YOLO_DRT_CROSS_MODEL: /data/models/YOLO/Helmet/helmet-26m.pt
+      YOLO_DRT_REID_MODEL: /data/models/RD/osnet_ain_x1_0_msmt17_256x128_amsgrad_ep50_lr0.0015_coslr_b64_fb10_softmax_labsmth_flip_jitter.pth
+      YOLO_DRT_OUTPUT_DIR: /data/output
+      YOLO_DRT_MODELS_DIR: /data/models
+      YOLO_DRT_USE_SEG: "false"
+      YOLO_DRT_USE_REID: "true"
+      YOLO_DRT_USE_TENSORRT: "true"
+      YOLO_DRT_CROSS_CHECK_ENABLED: "true"
+      YOLO_DRT_ENCODE_MODE: manual
+      YOLO_DRT_TRT_ENGINE_STRATEGY: central
+      YOLO_DRT_TRT_REBUILD_POLICY: missing_only
+      YOLO_DRT_TRT_MANIFEST_DIR: /data/models/TRT
+      YOLO_DRT_TRT_IMGSZ: "640"
+      YOLO_DRT_TRT_MAX_BATCH: "4"
+      YOLO_DRT_TRT_FP16: "true"
+      YOLO_DRT_TRT_WORKSPACE_GB: "2.0"
+      YOLO_DRT_TRT_AUTOCAST_FAST: "true"
+      YOLO_DRT_INFERENCE_DEVICE: cuda
+    volumes:
+      - ../MODELS_2:/data/models
+      - ../output:/data/output

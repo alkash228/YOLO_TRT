@@ -1,0 +1,77 @@
+"""Pydantic schemas for the inference API."""
+from __future__ import annotations
+
+from typing import Any, Literal
+
+from pydantic import BaseModel, Field
+
+
+class ProgressOut(BaseModel):
+    current: int = 0
+    total: int = 0
+    fps: float = 0.0
+    eta_seconds: float = 0.0
+    elapsed_sec: float = 0.0
+    gpu_mem_mb: float = 0.0
+    gpu_util_pct: float = 0.0
+    instances_current: int = 0
+    instances_peak: int = 0
+    percent: float = 0.0
+
+
+class JobResultOut(BaseModel):
+    out_dir: str | None = None
+    run_id: str | None = None
+    frames: int = 0
+    elapsed_sec: float = 0.0
+    fps_processed: float = 0.0
+    artifacts: dict[str, str | None] = Field(default_factory=dict)
+    record: dict[str, Any] | None = None
+    error: str | None = None
+
+
+class JobOut(BaseModel):
+    job_id: str
+    status: Literal["queued", "running", "done", "cancelled", "error"]
+    progress: ProgressOut
+    result: JobResultOut | None = None
+    created_at: float = 0.0
+    started_at: float | None = None
+    finished_at: float | None = None
+
+
+class JobCreatePathBody(BaseModel):
+    input_type: Literal["path"] = "path"
+    path: str
+    prompt: str = "person"
+    max_duration_seconds: float | None = None
+
+
+class JobCreateResponse(BaseModel):
+    job_id: str
+    status: str = "queued"
+
+
+class HealthOut(BaseModel):
+    status: Literal["ready", "building_engines", "starting", "gpu_missing", "error"]
+    engines_ready: dict[str, bool] = Field(default_factory=dict)
+    build_logs: list[str] = Field(default_factory=list)
+    message: str = ""
+    paths: dict[str, str] = Field(default_factory=dict)
+
+
+class ArtifactItem(BaseModel):
+    name: str
+    path: str
+    size_bytes: int
+
+
+class ArtifactsOut(BaseModel):
+    job_id: str
+    out_dir: str
+    files: list[ArtifactItem] = Field(default_factory=list)
+
+
+class RunsOut(BaseModel):
+    version: int = 1
+    runs: list[dict[str, Any]] = Field(default_factory=list)

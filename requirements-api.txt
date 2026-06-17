@@ -1,0 +1,30 @@
+# FastAPI
+fastapi>=0.115
+uvicorn[standard]>=0.32
+python-multipart>=0.0.12
+pydantic>=2.10
+
+# Inference (no PyQt, no matplotlib)
+ultralytics==8.4.60
+lap>=0.5.12
+opencv-python-headless>=4.8
+numpy>=1.24
+imageio[ffmpeg]>=2.33
+huggingface_hub>=0.20
+numba>=0.59
+nvidia-ml-py>=12.535
+# TensorRT 11 FP16 helper stack.
+nvidia-modelopt[onnx]==0.44.0
+tensorrt>=11.0
+Cython>=3.0
+h5py>=3.10
+future>=1.0
+yacs>=0.1.8
+gdown>=5.0
+chardet>=5.2
+tensorboard>=2.16
+
+# ReID code is cloned in Dockerfile and imported via PYTHONPATH.
+
+# TensorRT — install matching host CUDA in Dockerfile
+# tensorrt
