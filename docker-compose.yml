@@ -1,5 +1,5 @@
-# Модели и output — bind mount с хоста.
-# TRT: strategy=central → engines в /data/models/TRT/ (внутри контейнера).
+# Модели запекаются в образ при build (папка ./models → /data/models).
+# TRT engines: положи в ./models/TRT/ до build, иначе соберутся при первом старте (внутри контейнера).
 services:
   yolo-drt-api:
     build:
@@ -40,5 +40,4 @@ services:
       YOLO_DRT_TRT_AUTOCAST_FAST: "true"
       YOLO_DRT_INFERENCE_DEVICE: cuda
     volumes:
-      - ../MODELS_2:/data/models
       - ../output:/data/output

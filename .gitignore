@@ -5,4 +5,8 @@ __pycache__/
 *.engine
 *.onnx
 output/
-models/
+# веса не в git — кладёшь локально в models/, они попадают в образ при docker build
+models/**/*.pt
+models/**/*.pth
+models/**/*.engine
+models/**/*.onnx

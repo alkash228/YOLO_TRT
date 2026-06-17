@@ -25,6 +25,9 @@ COPY requirements-api.txt .
 RUN python3.11 -m pip install -r requirements-api.txt
 RUN git clone --depth 1 https://github.com/KaiyangZhou/deep-person-reid.git /opt/deep-person-reid
 
+# Модели (.pt/.pth и опционально TRT/*.engine) — положи в ./models перед docker compose build
+COPY models /data/models
+
 COPY app ./app
 COPY api ./api
 
