@@ -65,7 +65,7 @@ def cap_job_batch_long_video(
     source_frame_count: int = 0,
 ) -> int:
     """Очень длинные ролики (2+ ч): не держать в RAM гигантский job."""
-    cap = int(getattr(settings, "max_job_batch_size", 0)) or 64
+    cap = int(getattr(settings, "max_job_batch_size", 0)) or 200
     n_src = max(int(source_frame_count), int(n_process))
     # ~2 ч @ 25 fps — только тогда режем job; короткие/средние ролики как раньше.
     long_run = n_process > 5000 or n_src > 5000
@@ -74,25 +74,129 @@ def cap_job_batch_long_video(
     return max(1, int(job_batch))
 
 
+def resolve_frame_source(
+    settings: PipelineSettings,
+    *,
+    source_frame_count: int,
+    width: int,
+    height: int,
+    max_preload_ram_gb: float | None = None,
+) -> str:
+    """
+    Источник кадров: preload | stream | windowed.
+    auto: preload если влезает в max_preload_ram_gb, иначе windowed (не stream — GPU speed).
+    """
+    from app.core.frame_pipeline import estimate_video_ram_gb
+
+    mode = str(getattr(settings, "frame_source_mode", "auto")).casefold()
+    if mode in ("windowed", "window"):
+        return "windowed"
+    if mode == "stream":
+        return "stream"
+    if mode == "preload":
+        return "preload"
+    # auto
+    if int(source_frame_count) <= 0:
+        return "stream"
+    if not bool(getattr(settings, "preload_video", True)):
+        return "windowed"
+    if width > 0 and height > 0:
+        est_gb = estimate_video_ram_gb(width, height, int(source_frame_count))
+        budget = float(
+            max_preload_ram_gb
+            if max_preload_ram_gb is not None
+            else getattr(settings, "max_preload_ram_gb", 12.0)
+        )
+        if est_gb > budget:
+            return "windowed"
+    return "preload"
+
+
 def resolve_use_streaming(
     settings: PipelineSettings,
     *,
     source_frame_count: int,
     width: int,
     height: int,
+    max_preload_ram_gb: float | None = None,
 ) -> bool:
-    """Preload в RAM, пока влезает; streaming только при неизвестной длине или нехватке RAM."""
-    from app.core.frame_pipeline import estimate_video_ram_gb
+    """True только для frame_source=stream (OpenCV read в hot path)."""
+    return resolve_frame_source(
+        settings,
+        source_frame_count=source_frame_count,
+        width=width,
+        height=height,
+        max_preload_ram_gb=max_preload_ram_gb,
+    ) == "stream"
 
-    if int(source_frame_count) <= 0:
-        return True
-    if not bool(getattr(settings, "preload_video", True)):
-        return True
-    if width > 0 and height > 0 and int(source_frame_count) > 0:
-        est_gb = estimate_video_ram_gb(width, height, int(source_frame_count))
-        if est_gb > float(getattr(settings, "max_preload_ram_gb", 8.0)):
-            return True
-    return False
+
+def resolve_window_frames(
+    settings: PipelineSettings,
+    *,
+    job_batch: int,
+    frame_stride: int,
+    width: int,
+    height: int,
+    max_window_ram_gb: float | None = None,
+    windows_in_ram: int | None = None,
+) -> tuple[int, dict[str, int | float | bool]]:
+    """
+    infer_per_window = jobs × job_batch (всегда без хвоста GPU, кроме последнего окна ролика).
+    source_span = infer_per_window × frame_stride — сколько кадров источника прочитать.
+
+    window_frames=0 → макс. полных job'ов на окно по RAM (считается по infer-кадрам в RAM).
+    window_frames>0 → подсказка в кадрах источника, snap вверх к сетке job×stride.
+    """
+    stride = max(1, int(frame_stride))
+    job = max(1, int(job_batch))
+    hint_src = int(getattr(settings, "window_frames", 0))
+    win_ram = (
+        int(windows_in_ram)
+        if windows_in_ram is not None
+        else int(getattr(settings, "windows_in_ram", 1))
+    )
+    windows_in_ram = max(1, win_ram)
+    ram_budget_gb = float(
+        max_window_ram_gb
+        if max_window_ram_gb is not None
+        else getattr(settings, "max_window_ram_gb", 4.0)
+    )
+    if ram_budget_gb <= 0:
+        ram_budget_gb = float(getattr(settings, "max_preload_ram_gb", 12.0)) / float(windows_in_ram)
+
+    if width > 0 and height > 0 and ram_budget_gb > 0:
+        per_window_gb = ram_budget_gb
+        bytes_per_frame = width * height * 3
+        max_infer_ram = int((per_window_gb * (1024**3)) // max(1, bytes_per_frame))
+        max_infer_ram = max(job, (max_infer_ram // job) * job)
+    else:
+        max_infer_ram = max(job, job * 2)
+
+    if hint_src <= 0:
+        infer_per = max_infer_ram
+    else:
+        hint_infer = max(job, ((int(hint_src) // stride) // job) * job)
+        if hint_infer < job:
+            hint_infer = job
+        infer_per = min(hint_infer, max_infer_ram)
+        infer_per = max(infer_per, job)
+
+    jobs_per = infer_per // job
+    infer_per = jobs_per * job
+    source_span = infer_per * stride
+    tail = 0
+
+    return source_span, {
+        "hint": hint_src,
+        "infer_per_window": infer_per,
+        "source_span": source_span,
+        "jobs_per_window": jobs_per,
+        "job_batch": job,
+        "frame_stride": stride,
+        "tail_infer_frames": tail,
+        "aligned": True,
+        "max_infer_ram": max_infer_ram,
+    }
 
 
 def resolve_gpu_queue_depth(
@@ -107,7 +211,7 @@ def resolve_gpu_queue_depth(
     if n_jobs > 0:
         depth = min(depth, n_jobs)
     large_job = int(max_job_batch) > 0 and int(job_batch_size) > int(max_job_batch)
-    if not large_job and int(job_batch_size) > 96:
+    if not large_job and int(job_batch_size) > 200:
         large_job = True
     if large_job:
         depth = min(depth, 3)
@@ -130,9 +234,9 @@ def resolve_reid_embed_chunk(
         chunk = cap
     if chunk > 0:
         return chunk
-    if n_crops <= 64:
+    if n_crops <= 200:
         return 0
-    return 64
+    return 200
 
 
 def resolve_frame_stride(settings: PipelineSettings) -> int:
@@ -191,7 +295,7 @@ def effective_speed_tuning(settings: PipelineSettings) -> dict[str, int | bool]:
         }
     req_batch = int(settings.infer_batch_size)
     return {
-        "infer_batch": req_batch if req_batch > 0 else 64,
+        "infer_batch": req_batch if req_batch > 0 else 200,
         "gpu_full_batch": False,
         "max_job_batch": max(96, int(settings.max_job_batch_size)),
         "max_infer_batch": max(48, int(settings.max_infer_batch_size)),

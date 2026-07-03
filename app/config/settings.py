@@ -38,7 +38,7 @@ class PipelineSettings:
     seg_fallback_iou_min: float = 0.25
 
     appearance_thresh: float = 0.52
-    track_buffer: int = 150
+    track_buffer: int = 300
     recovery_thresh: float = 0.42
     reid_gallery_size: int = 10
     w_iou: float = 0.3
@@ -46,8 +46,8 @@ class PipelineSettings:
 
     overlay_alpha: float = 0.45
     draw_boxes: bool = True
-    draw_masks: bool = True
-    draw_centers: bool = True
+    draw_masks: bool = False
+    draw_centers: bool = False
     draw_pose: bool = True
     pose_kpt_conf: float = 0.25
     preview_every_n: int = 5
@@ -59,38 +59,52 @@ class PipelineSettings:
     infer_imgsz: int = 640
     seg_stride: int = 1
     frame_stride: int = 1
-    realtime_mode: bool = False
+    realtime_mode: bool = True
 
     parallel_post: bool = True
     post_workers: int = 6
     decode_prefetch: int = 4
 
     gpu_pipeline: bool = True
-    gpu_full_batch: bool = True
-    infer_batch_size: int = 0
-    max_infer_batch_size: int = 32
-    max_job_batch_size: int = 64
+    gpu_full_batch: bool = False
+    infer_batch_size: int = 64
+    max_infer_batch_size: int = 200
+    max_job_batch_size: int = 200
     reid_embed_chunk: int = 0
     gpu_queue_depth: int = 4
     use_batch_detect: bool = True
     reid_batch_across_frames: bool = True
+    # ReID + YOLO track на одном GPU: overlap обычно медленнее (конкуренция SM, queue>1).
+    reid_gpu_overlap: bool = False
     gpu_mask_resize: bool = True
 
     preload_video: bool = True
-    max_preload_ram_gb: float = 8.0
+    max_preload_ram_gb: float = 12.0
+    max_window_ram_gb: float = 4.0
+    smart_ram_budget: bool = True
+    max_process_ram_gb: float = 10.0
+    ram_budget_system_reserve_gb: float = 1.0
+    ram_budget_models_gb: float = 0.0
+    ram_budget_spill_gb: float = 0.25
+    ram_budget_safety_margin_gb: float = 0.5
+    frame_source_mode: str = "auto"
+    window_frames: int = 0
+    windows_in_ram: int = 1
     parallel_models: bool = False
     encode_mode: str = "manual"
     async_encode: bool = True
+    encode_preset: str = "fast"
+    encode_crf: int = 23
+    encode_codec: str = "auto"
+    encode_workers: int = 0
 
     use_tensorrt: bool = True
     tensorrt_imgsz: int = 640
-    tensorrt_max_batch: int = 16
+    tensorrt_max_batch: int = 32
     tensorrt_fp16: bool = True
-    tensorrt_workspace_gb: float = 4.0
-    tensorrt_autocast_fast: bool = False
-    # "central" -> models/TRT; "colocate" -> .engine рядом с .pt/.pth
+    tensorrt_workspace_gb: float = 2.0
+    tensorrt_autocast_fast: bool = True
     tensorrt_engine_strategy: str = "central"
-    # "missing_only" | "always"
     tensorrt_rebuild_policy: str = "missing_only"
     tensorrt_manifest_dir: Path = field(default_factory=lambda: MODELS_DIR)
 
@@ -106,15 +120,11 @@ class PipelineSettings:
 
     def ensure_dirs(self) -> None:
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        self.models_dir.mkdir(parents=True, exist_ok=True)
-        (self.output_dir / "uploads").mkdir(parents=True, exist_ok=True)
-        (self.output_dir / "input").mkdir(parents=True, exist_ok=True)
         YOLO_DIR.mkdir(parents=True, exist_ok=True)
         YOLO_SEG_DIR.mkdir(parents=True, exist_ok=True)
         RD_DIR.mkdir(parents=True, exist_ok=True)
         TRT_DIR.mkdir(parents=True, exist_ok=True)
         YOLO_HELMET_DIR.mkdir(parents=True, exist_ok=True)
-        self.tensorrt_manifest_dir.mkdir(parents=True, exist_ok=True)
 
 
 DEFAULT_SETTINGS = PipelineSettings()

@@ -204,15 +204,23 @@ class ModelParallelRunner:
 
 
 class AsyncVideoWriter:
-    """Background x264 encode — GPU loop never blocks on ffmpeg."""
+    """Background x264/NVENC encode — render loop never blocks on ffmpeg."""
 
-    def __init__(self, path: str, fps: float) -> None:
-        self._queue: queue.Queue[np.ndarray | None] = queue.Queue(maxsize=32)
+    def __init__(
+        self,
+        path: str,
+        fps: float,
+        *,
+        codec: str = "libx264",
+        ffmpeg_params: list[str] | None = None,
+        queue_size: int = 64,
+    ) -> None:
+        self._queue: queue.Queue[np.ndarray | None] = queue.Queue(maxsize=max(8, queue_size))
         self._writer = imageio.get_writer(
             path,
             fps=fps,
-            codec="libx264",
-            ffmpeg_params=["-crf", "18", "-preset", "medium"],
+            codec=codec,
+            ffmpeg_params=ffmpeg_params or ["-crf", "23", "-preset", "fast"],
         )
         self._error: Exception | None = None
         self._thread = threading.Thread(target=self._loop, name="yolo-drt-encode", daemon=True)
