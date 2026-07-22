@@ -12,9 +12,11 @@ from app.config.settings import (
 )
 
 
-def _env_path(key: str, default: Path) -> Path:
+def _env_path(key: str, default: Path | None) -> Path | None:
     raw = os.environ.get(key, "").strip()
-    return Path(raw) if raw else default
+    if not raw:
+        return default
+    return Path(raw)
 
 
 def _env_bool(key: str, default: bool) -> bool:
@@ -39,25 +41,28 @@ def _env_int(key: str, default: int) -> int:
 
 
 def load_settings_from_env() -> PipelineSettings:
-    models_dir = _env_path("YOLO_DRT_MODELS_DIR", MODELS_DIR)
-    output_dir = _env_path("YOLO_DRT_OUTPUT_DIR", OUTPUT_DIR)
+    models_dir = _env_path("YOLO_DRT_MODELS_DIR", MODELS_DIR) or MODELS_DIR
+    output_dir = _env_path("YOLO_DRT_OUTPUT_DIR", OUTPUT_DIR) or OUTPUT_DIR
 
     detect = _env_path(
         "YOLO_DRT_DETECT_MODEL",
         models_dir / "YOLO" / "yolo26x-pose.pt",
-    )
+    ) or (models_dir / "YOLO" / "yolo26x-pose.pt")
     cross = _env_path(
         "YOLO_DRT_CROSS_MODEL",
         models_dir / "YOLO" / "Helmet" / "helmet-26m.pt",
-    )
+    ) or (models_dir / "YOLO" / "Helmet" / "helmet-26m.pt")
     reid = _env_path(
         "YOLO_DRT_REID_MODEL",
         models_dir / "RD" / OSNET_FILENAME,
-    )
+    ) or (models_dir / "RD" / OSNET_FILENAME)
+    sam_model = _env_path("YOLO_DRT_SAM_MODEL", None)
 
     strategy = os.environ.get("YOLO_DRT_TRT_ENGINE_STRATEGY", "central").strip() or "central"
     rebuild = os.environ.get("YOLO_DRT_TRT_REBUILD_POLICY", "missing_only").strip() or "missing_only"
-    manifest_dir = _env_path("YOLO_DRT_TRT_MANIFEST_DIR", models_dir / "TRT")
+    manifest_dir = _env_path("YOLO_DRT_TRT_MANIFEST_DIR", models_dir / "TRT") or (
+        models_dir / "TRT"
+    )
 
     settings = PipelineSettings(
         detect_model=detect,
@@ -66,7 +71,27 @@ def load_settings_from_env() -> PipelineSettings:
         output_dir=output_dir,
         models_dir=models_dir,
         use_seg=_env_bool("YOLO_DRT_USE_SEG", False),
-        use_reid=_env_bool("YOLO_DRT_USE_REID", True),
+        # Identity: SAM F2F by default; OSNet only for offline Pass 2.
+        use_sam_identity=_env_bool("YOLO_DRT_USE_SAM_IDENTITY", True),
+        use_reid=_env_bool("YOLO_DRT_USE_REID", False),
+        sam_identity_backend=(
+            os.environ.get("YOLO_DRT_SAM_IDENTITY_BACKEND", "memory").strip() or "memory"
+        ),
+        sam_model=sam_model,
+        sam_match_iou=_env_float("YOLO_DRT_SAM_MATCH_IOU", 0.30),
+        sam_osnet_reentry=_env_bool("YOLO_DRT_SAM_OSNET_REENTRY", False),
+        sam_osnet_reentry_thresh=_env_float("YOLO_DRT_SAM_OSNET_REENTRY_THRESH", 0.70),
+        sam_osnet_reentry_min_miss=_env_int("YOLO_DRT_SAM_OSNET_REENTRY_MIN_MISS", 30),
+        use_offline_tracklet_link=_env_bool("YOLO_DRT_USE_OFFLINE_TRACKLET_LINK", True),
+        tracklet_link_max_gap_frames=_env_int("YOLO_DRT_TRACKLET_LINK_MAX_GAP_FRAMES", 300),
+        tracklet_link_min_sim=_env_float("YOLO_DRT_TRACKLET_LINK_MIN_SIM", 0.60),
+        tracklet_link_use_reid=_env_bool("YOLO_DRT_TRACKLET_LINK_USE_REID", True),
+        tracklet_link_samples_per_tracklet=_env_int(
+            "YOLO_DRT_TRACKLET_LINK_SAMPLES_PER_TRACKLET", 5
+        ),
+        tracklet_link_spatial_weight=_env_float(
+            "YOLO_DRT_TRACKLET_LINK_SPATIAL_WEIGHT", 0.15
+        ),
         use_tensorrt=_env_bool("YOLO_DRT_USE_TENSORRT", True),
         cross_check_enabled=_env_bool("YOLO_DRT_CROSS_CHECK_ENABLED", True),
         encode_mode=os.environ.get("YOLO_DRT_ENCODE_MODE", "manual").strip() or "manual",

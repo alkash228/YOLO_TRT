@@ -35,6 +35,32 @@ def bbox_rect_mask(xyxy: np.ndarray, h: int, w: int) -> np.ndarray:
     return out
 
 
+def dedupe_detections(
+    detections: list[DetectItem],
+    *,
+    iou_min: float = 0.55,
+) -> list[DetectItem]:
+    """Drop overlapping same-label boxes (seg-fallback dupes confuse identity)."""
+    if len(detections) <= 1:
+        return list(detections)
+    order = sorted(range(len(detections)), key=lambda i: detections[i].conf, reverse=True)
+    keep: list[int] = []
+    for i in order:
+        det = detections[i]
+        duplicate = False
+        for j in keep:
+            ref = detections[j]
+            if det.label.casefold() != ref.label.casefold():
+                continue
+            if box_iou(det.xyxy, ref.xyxy) >= iou_min:
+                duplicate = True
+                break
+        if not duplicate:
+            keep.append(i)
+    keep.sort()
+    return [detections[i] for i in keep]
+
+
 def merge_seg_fallback_detections(
     detections: list[DetectItem],
     segments: list[SegItem],

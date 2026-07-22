@@ -33,7 +33,25 @@ class PipelineSettings:
     detect_conf: float = 0.20
     seg_conf: float = 0.20
     use_seg: bool = False
-    use_reid: bool = True
+    # Classic OSNet ReidTracker / optional SAM long re-entry. Off by default —
+    # SAM identity does not need OSNet for F2F (Pass 2 can still load OSNet).
+    use_reid: bool = False
+    # SAM-style masklet identity (default). Bypasses OSNet gallery F2F.
+    use_sam_identity: bool = True
+    sam_identity_backend: str = "memory"  # memory | mock | ultralytics_sam2
+    sam_model: Path | None = None
+    sam_match_iou: float = 0.30
+    # If True and use_reid: OSNet only for long-lost re-entry (not frame-to-frame).
+    sam_osnet_reentry: bool = False
+    sam_osnet_reentry_thresh: float = 0.70
+    sam_osnet_reentry_min_miss: int = 30
+    # Offline Pass 2: re-merge F2F tracklets after long occlusions (full-video only).
+    use_offline_tracklet_link: bool = True
+    tracklet_link_max_gap_frames: int = 300
+    tracklet_link_min_sim: float = 0.60
+    tracklet_link_use_reid: bool = True
+    tracklet_link_samples_per_tracklet: int = 5
+    tracklet_link_spatial_weight: float = 0.15
     match_iou_min: float = 0.45
     seg_fallback_iou_min: float = 0.25
 
@@ -41,6 +59,8 @@ class PipelineSettings:
     track_buffer: int = 300
     recovery_thresh: float = 0.42
     reid_gallery_size: int = 10
+    reid_min_match_score: float = 0.30
+    reid_debug_log: bool = False
     w_iou: float = 0.3
     w_app: float = 0.7
 

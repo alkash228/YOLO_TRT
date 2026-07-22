@@ -91,6 +91,8 @@ def build_processor(
         on_log("TensorRT пропущен: выбран CPU")
 
     if use_trt:
+        from app.core.sam_memory_tracker import needs_osnet_embed
+
         central = Path(settings.models_dir) / "TRT"
         ready = engines_ready(
             detect_pt=Path(settings.detect_model),
@@ -100,6 +102,7 @@ def build_processor(
             max_batch=int(settings.tensorrt_max_batch),
             fp16=bool(settings.tensorrt_fp16),
             need_cross=bool(settings.cross_check_enabled),
+            need_reid=needs_osnet_embed(settings),
             strategy=str(settings.tensorrt_engine_strategy),
             central_dir=central,
         )
@@ -141,7 +144,11 @@ def build_processor(
         )
 
     reid = None
-    if settings.use_reid:
+    from app.core.sam_memory_tracker import needs_osnet_embed, uses_sam_identity
+
+    # Load OSNet only when classic ReID or SAM long re-entry needs embeds every frame.
+    # Offline Pass 2 loads OSNet temporarily when tracklet_link_use_reid=True.
+    if needs_osnet_embed(settings):
         reid = ReidEngine(
             settings.reid_model,
             device=device,
@@ -155,6 +162,11 @@ def build_processor(
             on_log("ReID TRT: OSNet engine active")
         elif on_log and settings.use_tensorrt:
             on_log("ReID PyTorch: .engine не найден")
+    elif on_log and uses_sam_identity(settings):
+        on_log(
+            "Identity: SAM masklet memory "
+            f"(backend={getattr(settings, 'sam_identity_backend', 'memory')}; OSNet skipped)"
+        )
 
     cross = None
     if settings.cross_check_enabled and settings.cross_check_model is not None:

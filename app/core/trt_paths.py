@@ -132,6 +132,7 @@ def engines_ready(
     max_batch: int,
     fp16: bool,
     need_cross: bool,
+    need_reid: bool = True,
     strategy: str = "central",
     central_dir: Path | None = None,
 ) -> dict[str, bool]:
@@ -143,17 +144,19 @@ def engines_ready(
         strategy=strategy,
         central_dir=central_dir,
     )
-    reid = resolve_reid_engine(
-        reid_pth,
-        fp16=fp16,
-        strategy=strategy,
-        central_dir=central_dir,
-    )
     out = {
         "detect": det.exists(),
-        "reid": reid.exists(),
+        "reid": True,
         "cross_check": True,
     }
+    if need_reid:
+        reid = resolve_reid_engine(
+            reid_pth,
+            fp16=fp16,
+            strategy=strategy,
+            central_dir=central_dir,
+        )
+        out["reid"] = reid.exists()
     if need_cross and cross_pt is not None:
         cross = resolve_yolo_engine(
             cross_pt,

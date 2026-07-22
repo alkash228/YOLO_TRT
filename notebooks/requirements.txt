@@ -1,0 +1,6 @@
+requests>=2.31
+pandas>=2.0
+matplotlib>=3.7
+seaborn>=0.13
+jupyter>=1.0
+ipykernel>=6.0

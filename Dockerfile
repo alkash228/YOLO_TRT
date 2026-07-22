@@ -7,7 +7,12 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PIP_NO_CACHE_DIR=1 \
     PYTHONPATH=/app:/opt/deep-person-reid \
     YOLO_DRT_MODELS_DIR=/data/models \
-    YOLO_DRT_OUTPUT_DIR=/data/output
+    YOLO_DRT_OUTPUT_DIR=/data/output \
+    YOLO_DRT_USE_SAM_IDENTITY=true \
+    YOLO_DRT_USE_REID=false \
+    YOLO_DRT_SAM_OSNET_REENTRY=false \
+    YOLO_DRT_USE_OFFLINE_TRACKLET_LINK=true \
+    YOLO_DRT_TRACKLET_LINK_USE_REID=true
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3.11 python3.11-venv python3-pip \

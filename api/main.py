@@ -1,6 +1,7 @@
 """FastAPI application entrypoint."""
 from __future__ import annotations
 
+import os
 import shutil
 import time
 import uuid
@@ -58,6 +59,9 @@ def _bootstrap() -> None:
         return
 
     central = Path(_settings.models_dir) / "TRT"
+    from app.core.sam_memory_tracker import needs_osnet_embed
+
+    need_osnet = needs_osnet_embed(_settings)
     if _settings.use_tensorrt:
         _engines_ready_map = engines_ready(
             detect_pt=Path(_settings.detect_model),
@@ -67,6 +71,7 @@ def _bootstrap() -> None:
             max_batch=int(_settings.tensorrt_max_batch),
             fp16=bool(_settings.tensorrt_fp16),
             need_cross=bool(_settings.cross_check_enabled),
+            need_reid=need_osnet,
             strategy=str(_settings.tensorrt_engine_strategy),
             central_dir=central,
         )
@@ -82,6 +87,7 @@ def _bootstrap() -> None:
                 max_batch=int(_settings.tensorrt_max_batch),
                 fp16=bool(_settings.tensorrt_fp16),
                 need_cross=bool(_settings.cross_check_enabled),
+                need_reid=need_osnet,
                 strategy=str(_settings.tensorrt_engine_strategy),
                 central_dir=central,
             )
@@ -92,7 +98,11 @@ def _bootstrap() -> None:
     _processor = build_processor(_settings, warmup=True, on_log=_log)
     job_manager.set_processor(_processor, _settings)
     _app_status = "ready"
-    _log("Сервис готов")
+    identity = (
+        f"sam={_settings.use_sam_identity} reid={_settings.use_reid} "
+        f"tracklet_link={_settings.use_offline_tracklet_link}"
+    )
+    _log(f"Сервис готов ({identity})")
 
 
 @asynccontextmanager
@@ -103,6 +113,16 @@ async def lifespan(app: FastAPI):
         global _app_status
         _app_status = "error"
         _log(f"Bootstrap error: {exc}")
+
+    from app.core.network_urls import print_listen_banner
+
+    api_port = int(os.environ.get("PORT", "8080"))
+    print_listen_banner(
+        service="YOLO_DRT Docker API",
+        host="0.0.0.0",
+        port=api_port,
+        extra_lines=("Swagger: /docs · Health: /health",),
+    )
     yield
 
 
@@ -166,6 +186,13 @@ def _health_paths() -> dict[str, str]:
         "detect_weights": str(det_pt),
         "cross_weights": str(cross_pt) if cross_pt else "",
         "reid_weights": str(reid_pth),
+        "reid_weights_exists": str(reid_pth.is_file()),
+        "use_sam_identity": str(bool(s.use_sam_identity)),
+        "use_reid": str(bool(s.use_reid)),
+        "use_offline_tracklet_link": str(bool(s.use_offline_tracklet_link)),
+        "tracklet_link_use_reid": str(bool(s.tracklet_link_use_reid)),
+        "sam_osnet_reentry": str(bool(s.sam_osnet_reentry)),
+        "cross_check_enabled": str(bool(s.cross_check_enabled)),
     }
     det_eng = resolve_yolo_engine(
         det_pt, imgsz=imgsz, max_batch=max_batch, fp16=fp16,

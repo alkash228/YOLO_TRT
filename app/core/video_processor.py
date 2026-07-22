@@ -33,7 +33,12 @@ from app.core.frame_pipeline import (
     post_process_frame,
 )
 from app.core.cross_check import CrossCheckDetection, CrossCheckVerdict, evaluate_cross_check_batch
-from app.core.fusion import inherit_motion_ids, match_detections_to_segments, merge_seg_fallback_detections
+from app.core.fusion import (
+    dedupe_detections,
+    inherit_motion_ids,
+    match_detections_to_segments,
+    merge_seg_fallback_detections,
+)
 from app.core.async_finalize import AsyncBatchFinalizer
 from app.core.batch_prepare import prepare_batch_frames
 from app.core.batch_utils import (
@@ -77,7 +82,19 @@ from app.core.packet_spill import PacketSpillWriter
 from app.core.pose_utils import keypoints_to_json
 from app.core.prompt_utils import label_match, prompt_terms
 from app.core.reid_engine import ReidEngine
-from app.core.reid_tracker import ReidTracker
+from app.core.sam_memory_tracker import (
+    build_identity_tracker,
+    needs_osnet_embed,
+)
+from app.core.tracklet_linker import (
+    build_tracklets_from_frames,
+    build_tracklets_from_packets,
+    enrich_tracklets_from_video,
+    link_tracklets,
+    remap_object_ids_in_frames,
+    remap_object_ids_in_packets,
+    rewrite_spill_chunks_with_packets,
+)
 from app.core.schema import (
     ProcessVideoResult,
     RunStats,
@@ -110,14 +127,9 @@ class VideoProcessor:
         self.cross_check_violations_total = 0
         self._job_batch_size = 16
         self.motion_tracker = MotionTracker()
-        self.tracker = ReidTracker(
-            appearance_thresh=settings.appearance_thresh,
-            track_buffer=settings.track_buffer,
-            gallery_size=settings.reid_gallery_size,
-            w_iou=settings.w_iou,
-            w_app=settings.w_app,
-            recovery_thresh=settings.recovery_thresh,
-        )
+        self._on_debug_log: Callable[[str], None] | None = None
+        # SAM masklet identity OR classic OSNet ReidTracker (see use_sam_identity).
+        self.tracker = build_identity_tracker(settings)
 
     @staticmethod
     def _gpu_mem_mb() -> float:
@@ -259,6 +271,165 @@ class VideoProcessor:
         for packet in sorted(packets, key=lambda p: p.frame_idx):
             out.append(self._frame_dict_from_packet(packet, prompt_id_lookup))
         return out
+
+    def _apply_offline_tracklet_link(
+        self,
+        *,
+        deferred_packets: list[FramePacket],
+        frames_payload: list[dict[str, object]],
+        spill_manifest_path: Path | None,
+        out_dir: Path,
+        input_path: str,
+        on_debug_log: Callable[[str], None] | None = None,
+    ) -> dict[str, object] | None:
+        """
+        Pass 2: merge non-overlapping tracklets after F2F tracking.
+        Remaps packet stable_ids and/or frames_payload object_id in place.
+        """
+        if not bool(getattr(self.settings, "use_offline_tracklet_link", False)):
+            return None
+
+        packets: list[FramePacket] | None = None
+        manifest: dict | None = None
+        if spill_manifest_path is not None and spill_manifest_path.is_file():
+            from app.core.packet_spill import load_all_spilled_packets, load_packets_manifest
+
+            manifest = load_packets_manifest(spill_manifest_path)
+            packets = load_all_spilled_packets(manifest, run_dir=out_dir)
+            if deferred_packets:
+                by_fi = {int(p.frame_idx): p for p in packets}
+                for p in deferred_packets:
+                    by_fi[int(p.frame_idx)] = p
+                packets = sorted(by_fi.values(), key=lambda p: int(p.frame_idx))
+        elif deferred_packets:
+            packets = list(deferred_packets)
+
+        if packets:
+            tracklets = build_tracklets_from_packets(packets)
+        elif frames_payload:
+            tracklets = build_tracklets_from_frames(frames_payload)
+        else:
+            return None
+
+        if len(tracklets) < 2:
+            if on_debug_log:
+                on_debug_log(
+                    f"Tracklet link: skip ({len(tracklets)} tracklet(s), need ≥2)"
+                )
+            return None
+
+        max_gap = int(getattr(self.settings, "tracklet_link_max_gap_frames", 300))
+        min_sim = float(getattr(self.settings, "tracklet_link_min_sim", 0.60))
+        spatial_w = float(getattr(self.settings, "tracklet_link_spatial_weight", 0.15))
+        use_reid = bool(getattr(self.settings, "tracklet_link_use_reid", True))
+        samples = int(getattr(self.settings, "tracklet_link_samples_per_tracklet", 5))
+
+        missing_emb = sum(1 for t in tracklets if t.embedding is None)
+        temp_engine: ReidEngine | None = None
+        embed_engine = self.reid_engine
+        if use_reid and missing_emb > 0:
+            if embed_engine is None:
+                reid_path = Path(self.settings.reid_model)
+                if reid_path.is_file():
+                    try:
+                        if on_debug_log:
+                            on_debug_log(
+                                "Tracklet link: loading OSNet for offline embeddings…"
+                            )
+                        temp_engine = ReidEngine(
+                            reid_path,
+                            device=getattr(self.settings, "inference_device", "cuda"),
+                            use_amp=bool(self.settings.use_amp),
+                            use_tensorrt=bool(self.settings.use_tensorrt),
+                            tensorrt_fp16=bool(self.settings.tensorrt_fp16),
+                            tensorrt_engine_strategy=str(
+                                getattr(self.settings, "tensorrt_engine_strategy", "central")
+                            ),
+                            tensorrt_central_dir=Path(
+                                getattr(self.settings, "models_dir", "/data/models")
+                            )
+                            / "TRT",
+                        )
+                        embed_engine = temp_engine
+                    except Exception as exc:
+                        if on_debug_log:
+                            on_debug_log(f"Tracklet link: OSNet load failed: {exc}")
+                elif on_debug_log:
+                    on_debug_log(
+                        f"Tracklet link: ReID weights missing ({reid_path.name}); "
+                        "appearance merge skipped"
+                    )
+            if embed_engine is not None:
+                enrich_tracklets_from_video(
+                    tracklets,
+                    input_path,
+                    embed_fn=embed_engine.embed_batch,
+                    samples_per_tracklet=max(1, samples),
+                    on_log=on_debug_log,
+                )
+        if temp_engine is not None:
+            del temp_engine
+            release_gpu_memory()
+
+        has_any_emb = any(t.embedding is not None for t in tracklets)
+        require_emb = bool(use_reid and has_any_emb)
+        if use_reid and not has_any_emb and on_debug_log:
+            on_debug_log(
+                "Tracklet link: no embeddings available — "
+                "skipping (enable tracklet_link_use_reid + OSNet weights)"
+            )
+            return None
+
+        result = link_tracklets(
+            tracklets,
+            max_gap_frames=max_gap,
+            min_sim=min_sim,
+            spatial_weight=spatial_w,
+            require_embedding=require_emb,
+        )
+        changed = sum(1 for o, n in result.id_map.items() if o != n)
+        if changed <= 0:
+            if on_debug_log:
+                on_debug_log(
+                    f"Tracklet link: no merges "
+                    f"({result.n_tracklets_in} tracklets, gap≤{max_gap}, sim≥{min_sim})"
+                )
+            return {
+                "n_tracklets_in": result.n_tracklets_in,
+                "n_ids_out": result.n_ids_out,
+                "merges": 0,
+            }
+
+        n_pkt = 0
+        n_fr = 0
+        if packets is not None:
+            n_pkt = remap_object_ids_in_packets(packets, result.id_map)
+            if deferred_packets and packets is not deferred_packets:
+                by_fi = {int(p.frame_idx): p for p in packets}
+                for i, p in enumerate(deferred_packets):
+                    remapped = by_fi.get(int(p.frame_idx))
+                    if remapped is not None:
+                        deferred_packets[i] = remapped
+            if manifest is not None and spill_manifest_path is not None:
+                rewrite_spill_chunks_with_packets(
+                    manifest, run_dir=out_dir, packets=packets
+                )
+        if frames_payload:
+            n_fr = remap_object_ids_in_frames(frames_payload, result.id_map)
+
+        info: dict[str, object] = {
+            "n_tracklets_in": result.n_tracklets_in,
+            "n_ids_out": result.n_ids_out,
+            "merges": len(result.merges),
+            "instances_remapped": n_pkt + n_fr,
+            "id_map": {str(k): v for k, v in result.id_map.items() if k != v},
+        }
+        if on_debug_log:
+            on_debug_log(
+                f"Tracklet link: {result.n_tracklets_in}→{result.n_ids_out} IDs "
+                f"({len(result.merges)} merges, remapped {n_pkt + n_fr} instances)"
+            )
+        return info
 
     def _frame_dict_from_packet(
         self,
@@ -610,23 +781,43 @@ class VideoProcessor:
                 segments,
                 match_iou_min=self.settings.seg_fallback_iou_min,
             )
-        use_reid = self.settings.use_reid and self.reid_engine is not None
-        if use_reid:
+        use_sam = bool(getattr(self.settings, "use_sam_identity", False))
+        want_identity = use_sam or (
+            self.settings.use_reid and self.reid_engine is not None
+        )
+        need_osnet = needs_osnet_embed(self.settings) and self.reid_engine is not None
+        if want_identity:
             detections = inherit_motion_ids(detections)
+            detections = dedupe_detections(detections, iou_min=0.55)
 
-        crops: list[np.ndarray] = []
+        crops: list[np.ndarray | None] = []
         valid_dets: list[DetectItem] = []
         for det in detections:
-            crop = ReidEngine.crop_from_bbox(frame, det.xyxy)
-            if crop is not None and crop.size > 0:
-                crops.append(crop)
-                valid_dets.append(det)
+            valid_dets.append(det)
+            if need_osnet:
+                crops.append(ReidEngine.crop_from_bbox(frame, det.xyxy))
+            else:
+                crops.append(None)
+        crop_list = [c for c in crops if c is not None and c.size > 0]
 
         t0 = time.perf_counter()
-        if use_reid:
-            embeddings = self.reid_engine.embed_batch(crops)
+        if want_identity:
+            if need_osnet and crop_list:
+                raw_embs = self.reid_engine.embed_batch(crop_list)
+                emb_dim = int(raw_embs.shape[1])
+                embs = np.zeros((len(valid_dets), emb_dim), dtype=np.float32)
+                ci = 0
+                for di, crop in enumerate(crops):
+                    if crop is not None and crop.size > 0:
+                        embs[di] = raw_embs[ci]
+                        ci += 1
+                embeddings = embs
+            else:
+                embeddings = np.zeros((len(valid_dets), 512), dtype=np.float32)
             reid_ms = (time.perf_counter() - t0) * 1000.0
-            track_result = self.tracker.update(valid_dets, embeddings)
+            track_result = self.tracker.update(
+                valid_dets, embeddings, frame_idx=frame_idx
+            )
             stable_ids = (
                 np.array(track_result.stable_ids, dtype=np.int64)
                 if track_result.stable_ids
@@ -805,8 +996,12 @@ class VideoProcessor:
         per_seg_ms = batch.seg_ms / max(1, n)
         per_cross_ms = batch.cross_ms / max(1, n)
 
-        use_reid = self.settings.use_reid and self.reid_engine is not None
-        use_motion_tracker = self.settings.gpu_full_batch and not use_reid
+        use_sam = bool(getattr(self.settings, "use_sam_identity", False))
+        want_identity = use_sam or (
+            self.settings.use_reid and self.reid_engine is not None
+        )
+        need_osnet = needs_osnet_embed(self.settings) and self.reid_engine is not None
+        use_motion_tracker = self.settings.gpu_full_batch and not want_identity
 
         emb_by_slot: dict[tuple[int, int], np.ndarray] = {}
         reid_ms_total = 0.0
@@ -820,7 +1015,7 @@ class VideoProcessor:
                 frame_segments.append(pf.segments)
                 frame_cross_raw.append(pf.cross_raw)
             if (
-                use_reid
+                need_osnet
                 and batch.reid_embeddings is not None
                 and batch.reid_crop_map is not None
             ):
@@ -861,7 +1056,7 @@ class VideoProcessor:
                 frame_valid.append(pf.valid_dets)
                 frame_segments.append(pf.segments)
                 frame_cross_raw.append(pf.cross_raw)
-            if use_reid and all_crops:
+            if need_osnet and all_crops:
                 t0 = time.perf_counter()
                 trt_cap = (
                     self.reid_engine.trt_max_batch
@@ -902,11 +1097,14 @@ class VideoProcessor:
             frame = frames_bgr[fi]
 
             reid_ms = 0.0
-            if use_reid:
-                if valid_dets:
+            if want_identity:
+                if need_osnet and valid_dets:
                     if self.settings.reid_batch_across_frames:
                         embs = np.stack(
-                            [emb_by_slot[(fi, di)] for di in range(len(valid_dets))],
+                            [
+                                emb_by_slot.get((fi, di), np.zeros(512, dtype=np.float32))
+                                for di in range(len(valid_dets))
+                            ],
                             axis=0,
                         )
                         reid_ms = per_reid_ms
@@ -914,11 +1112,21 @@ class VideoProcessor:
                         crops = [ReidEngine.crop_from_bbox(frame, d.xyxy) for d in valid_dets]
                         crops = [c for c in crops if c is not None and c.size > 0]
                         t0 = time.perf_counter()
-                        embs = self.reid_engine.embed_batch(crops)
+                        if crops:
+                            raw = self.reid_engine.embed_batch(crops)
+                            emb_dim = int(raw.shape[1])
+                            embs = np.zeros((len(valid_dets), emb_dim), dtype=np.float32)
+                            # best-effort: align only when all crops succeeded
+                            if raw.shape[0] == len(valid_dets):
+                                embs = raw
+                        else:
+                            embs = np.zeros((len(valid_dets), 512), dtype=np.float32)
                         reid_ms = (time.perf_counter() - t0) * 1000.0
+                elif valid_dets:
+                    embs = np.zeros((len(valid_dets), 512), dtype=np.float32)
                 else:
                     embs = np.zeros((0, 512), dtype=np.float32)
-                track_result = self.tracker.update(valid_dets, embs)
+                track_result = self.tracker.update(valid_dets, embs, frame_idx=frame_idx)
                 stable_ids = (
                     np.array(track_result.stable_ids, dtype=np.int64)
                     if track_result.stable_ids
@@ -1028,7 +1236,11 @@ class VideoProcessor:
         spill_flush_hooks: list[Callable[[], None]] | None = None,
     ) -> tuple[int, int]:
         seg_eng = self.seg_engine if self.settings.use_seg else None
-        use_reid = self.settings.use_reid and self.reid_engine is not None
+        use_sam = bool(getattr(self.settings, "use_sam_identity", False))
+        need_osnet = needs_osnet_embed(self.settings) and self.reid_engine is not None
+        want_identity = use_sam or (
+            self.settings.use_reid and self.reid_engine is not None
+        )
         eff_bs = self._job_batch_size
         n_jobs = (n_process + eff_bs - 1) // eff_bs if n_process > 0 else 0
         worker = GpuInferWorker(
@@ -1040,20 +1252,24 @@ class VideoProcessor:
         worker.start()
         detect_mode = "predict_batch" if not worker._detect_use_track else "track"
         dev = str(getattr(self.settings, "inference_device", "cuda") or "cuda").casefold()
-        # Track (обязателен при ReID) уже грузит GPU; второй cuda-stream не ускоряет, только queue>1.
+        # Track (обязателен при stable identity) уже грузит GPU; второй cuda-stream не ускоряет.
         reid_overlap = bool(
-            use_reid
+            need_osnet
             and bool(getattr(self.settings, "reid_gpu_overlap", False))
             and dev != "cpu"
             and torch.cuda.is_available()
             and not worker._detect_use_track
         )
-        serial_cuda = use_reid and not reid_overlap
-        depth = 1 if serial_cuda else resolve_gpu_queue_depth(
+        serial_cuda = need_osnet and not reid_overlap
+        # SAM-only: CPU tracker can overlap with next YOLO job (no OSNet on CUDA).
+        pipeline_cpu = serial_cuda or (want_identity and not need_osnet)
+        depth = 2 if (pipeline_cpu or reid_overlap) else (
+            1 if serial_cuda else resolve_gpu_queue_depth(
             self.settings.gpu_queue_depth,
             n_jobs=n_jobs,
             job_batch_size=eff_bs,
             max_job_batch=self.settings.max_job_batch_size,
+        )
         )
         reid_worker: ReidEmbedWorker | None = None
         if reid_overlap:
@@ -1070,20 +1286,22 @@ class VideoProcessor:
             req_txt = "авто→все кадры" if int(req) <= 0 and self.settings.gpu_full_batch else str(req)
             cap_note = ""
             if (
-                self.settings.use_reid
+                need_osnet
                 and int(self.settings.max_job_batch_size) > 0
                 and int(req) > eff_bs
             ):
                 cap_note = f" | job cap ReID {req}→{eff_bs}"
             queue_note = ""
-            if depth != int(self.settings.gpu_queue_depth):
+            if depth != int(self.settings.gpu_queue_depth) and not (pipeline_cpu or reid_overlap):
                 queue_note = f" (запрос {self.settings.gpu_queue_depth})"
             if reid_overlap:
                 mode_note = " | ReID GPU overlap (cuda stream)"
             elif serial_cuda:
                 mode_note = " | CUDA serial (ReID)"
-                if use_reid and bool(getattr(self.settings, "reid_gpu_overlap", False)):
+                if need_osnet and bool(getattr(self.settings, "reid_gpu_overlap", False)):
                     mode_note += " [track: overlap off]"
+            elif want_identity and not need_osnet:
+                mode_note = " | SAM identity (no live OSNet)"
             else:
                 mode_note = ""
             on_debug_log(
@@ -2130,6 +2348,15 @@ class VideoProcessor:
                         source_frame_count=source_frame_count,
                         window_frames=int(window_align_info.get("source_span", effective_window_frames)),
                     )
+                # Pass 2: offline tracklet link before packets save / MP4 / JSON.
+                self._apply_offline_tracklet_link(
+                    deferred_packets=deferred_packets,
+                    frames_payload=frames_payload,
+                    spill_manifest_path=spill_manifest_path,
+                    out_dir=out_dir,
+                    input_path=str(input_path),
+                    on_debug_log=on_debug_log,
+                )
                 if manual_encode:
                     if on_debug_log:
                         on_debug_log(
@@ -2254,6 +2481,21 @@ class VideoProcessor:
             frames_payload = self._frames_payload_from_packets(
                 deferred_packets,
                 prompt_id_lookup,
+            )
+
+        # Parallel / streaming encode: remap JSON IDs (MP4 may keep Pass-1 labels).
+        if (
+            not deferred_encode
+            and bool(getattr(self.settings, "use_offline_tracklet_link", False))
+            and frames_payload
+        ):
+            self._apply_offline_tracklet_link(
+                deferred_packets=deferred_packets,
+                frames_payload=frames_payload,
+                spill_manifest_path=None,
+                out_dir=out_dir,
+                input_path=str(input_path),
+                on_debug_log=on_debug_log,
             )
 
         payload = build_result_payload(
@@ -2387,7 +2629,10 @@ class VideoProcessor:
             "effective_batch_size": self._job_batch_size,
             "detect_mode": (
                 "track"
-                if self.settings.use_reid
+                if (
+                    self.settings.use_reid
+                    or bool(getattr(self.settings, "use_sam_identity", False))
+                )
                 else ("predict_batch" if self.settings.gpu_full_batch else "track_or_batch")
             ),
             "gpu_queue_depth": self.settings.gpu_queue_depth,
@@ -2405,6 +2650,19 @@ class VideoProcessor:
             "use_batch_detect": self.settings.use_batch_detect,
             "use_seg": self.settings.use_seg,
             "use_reid": self.settings.use_reid,
+            "use_sam_identity": bool(getattr(self.settings, "use_sam_identity", False)),
+            "sam_identity_backend": str(
+                getattr(self.settings, "sam_identity_backend", "memory")
+            ),
+            "use_offline_tracklet_link": bool(
+                getattr(self.settings, "use_offline_tracklet_link", False)
+            ),
+            "tracklet_link_max_gap_frames": int(
+                getattr(self.settings, "tracklet_link_max_gap_frames", 300)
+            ),
+            "tracklet_link_min_sim": float(
+                getattr(self.settings, "tracklet_link_min_sim", 0.60)
+            ),
             "cross_check_enabled": self.settings.cross_check_enabled,
             "encode_mode": self.settings.encode_mode,
             "parallel_post": self.settings.parallel_post,

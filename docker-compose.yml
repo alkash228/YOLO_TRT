@@ -26,7 +26,12 @@ services:
       YOLO_DRT_OUTPUT_DIR: /data/output
       YOLO_DRT_MODELS_DIR: /data/models
       YOLO_DRT_USE_SEG: "false"
-      YOLO_DRT_USE_REID: "true"
+      # Identity: SAM F2F (no live OSNet). Pass 2 uses OSNet after the video.
+      YOLO_DRT_USE_SAM_IDENTITY: "true"
+      YOLO_DRT_USE_REID: "false"
+      YOLO_DRT_SAM_OSNET_REENTRY: "false"
+      YOLO_DRT_USE_OFFLINE_TRACKLET_LINK: "true"
+      YOLO_DRT_TRACKLET_LINK_USE_REID: "true"
       YOLO_DRT_USE_TENSORRT: "true"
       YOLO_DRT_CROSS_CHECK_ENABLED: "true"
       YOLO_DRT_ENCODE_MODE: manual

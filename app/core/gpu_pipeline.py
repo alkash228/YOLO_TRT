@@ -458,8 +458,10 @@ class GpuInferWorker:
         self._settings = settings
         self._use_seg = bool(settings.use_seg and seg_engine is not None)
         self._use_cross = bool(settings.cross_check_enabled and cross_engine is not None)
-        # ReID нужен BoT-SORT (track persist); predict_batch + MotionTracker даёт скачки ID.
-        if settings.use_reid:
+        # Stable identity (SAM or OSNet) needs BoT-SORT track; predict_batch alone jumps IDs.
+        from app.core.sam_memory_tracker import uses_stable_identity
+
+        if uses_stable_identity(settings):
             self._detect_use_track = True
         elif settings.gpu_full_batch:
             self._detect_use_track = False

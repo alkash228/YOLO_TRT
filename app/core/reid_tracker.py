@@ -41,6 +41,7 @@ class TrackerUpdateResult:
     stable_ids: list[int]
     id_switches: int
     reid_recoveries: int
+    debug_lines: list[str] = field(default_factory=list)
 
 
 class ReidTracker:
@@ -141,7 +142,10 @@ class ReidTracker:
         self,
         detections: list[DetectItem],
         embeddings: np.ndarray,
+        *,
+        frame_idx: int = -1,
     ) -> TrackerUpdateResult:
+        del frame_idx  # accepted for IdentityTracker / SamMemoryTracker parity
         frame_recoveries = 0
 
         for tid in list(self._tracks.keys()):

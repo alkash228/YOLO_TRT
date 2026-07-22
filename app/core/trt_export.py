@@ -510,7 +510,12 @@ def build_all_engines(
     specs: list[tuple[str, Path]] = [("detect", Path(settings.detect_model))]
     if settings.cross_check_enabled and settings.cross_check_model is not None:
         specs.append(("cross_check", Path(settings.cross_check_model)))
-    specs.append(("reid", Path(settings.reid_model)))
+    from app.core.sam_memory_tracker import needs_osnet_embed
+
+    # OSNet TRT only when live embeds are required (classic ReID / SAM re-entry).
+    # Pass 2 can load .pth on demand without a prebuilt engine.
+    if needs_osnet_embed(settings):
+        specs.append(("reid", Path(settings.reid_model)))
 
     _log(
         log,

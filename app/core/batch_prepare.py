@@ -7,7 +7,11 @@ import numpy as np
 
 from app.config.settings import PipelineSettings
 from app.core.detect_engine import DetectItem
-from app.core.fusion import inherit_motion_ids, merge_seg_fallback_detections
+from app.core.fusion import (
+    dedupe_detections,
+    inherit_motion_ids,
+    merge_seg_fallback_detections,
+)
 from app.core.motion_tracker import MotionTracker
 from app.core.prompt_utils import label_match
 from app.core.reid_engine import ReidEngine
@@ -33,8 +37,11 @@ def prepare_batch_frames(
     use_motion_tracker: bool,
 ) -> tuple[list[PreparedFrame], list[np.ndarray], list[tuple[int, int]]]:
     """Filter/merge detections and collect ReID crops (shared GPU+CPU path)."""
+    from app.core.sam_memory_tracker import needs_osnet_embed, uses_stable_identity
+
     use_seg = bool(settings.use_seg)
-    use_reid = bool(settings.use_reid)
+    want_identity = uses_stable_identity(settings)
+    need_osnet = needs_osnet_embed(settings)
     n = len(frames_bgr)
     out: list[PreparedFrame] = []
     all_crops: list[np.ndarray] = []
@@ -56,18 +63,19 @@ def prepare_batch_frames(
                 segments_f,
                 match_iou_min=settings.seg_fallback_iou_min,
             )
-        if use_reid:
+        if want_identity:
             detections_f = inherit_motion_ids(detections_f)
+            detections_f = dedupe_detections(detections_f, iou_min=0.55)
 
         valid_dets: list[DetectItem] = []
-        if use_reid:
+        if need_osnet:
             frame = frames_bgr[fi]
             for det in detections_f:
+                valid_dets.append(det)
                 crop = ReidEngine.crop_from_bbox(frame, det.xyxy)
                 if crop is not None and crop.size > 0:
-                    crop_map.append((fi, len(valid_dets)))
+                    crop_map.append((fi, len(valid_dets) - 1))
                     all_crops.append(crop)
-                    valid_dets.append(det)
         else:
             valid_dets = detections_f
 
