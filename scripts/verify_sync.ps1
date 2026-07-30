@@ -13,6 +13,7 @@ $pairs = @(
     @{ Rel = "app\config\ui_fast_profile.json" },
     @{ Rel = "config\ui_fast_profile.json"; RootOnly = $false; DockerRel = "config\ui_fast_profile.json"; SrcRel = "app\config\ui_fast_profile.json" },
     @{ Rel = "app\core\video_encode.py" },
+    @{ Rel = "app\core\ffmpeg_utils.py" },
     @{ Rel = "app\core\pipeline.py" },
     @{ Rel = "app\config\settings.py" }
 )
