@@ -10,6 +10,7 @@ models/**/*.pt
 models/**/*.pth
 models/**/*.engine
 models/**/*.onnx
+docker-build.log
 WEB_app/
 notebooks/.ipynb_checkpoints/
 notebooks/anaconda_projects/

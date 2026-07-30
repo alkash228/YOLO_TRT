@@ -3,8 +3,11 @@ from __future__ import annotations
 
 import json
 import re
+import textwrap
+from collections.abc import Iterator
 from dataclasses import asdict, dataclass
-from typing import Any
+from pathlib import Path
+from typing import Any, Callable
 
 
 @dataclass(slots=True)
@@ -56,6 +59,46 @@ class ProcessVideoResult:
 
 def video_data_json_dumps(payload: dict[str, Any]) -> str:
     return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
+def write_result_json(
+    path: Path,
+    payload: dict[str, Any],
+    *,
+    frame_iter: Iterator[dict[str, Any]] | None = None,
+    on_progress: Callable[[int], None] | None = None,
+    progress_every: int = 5000,
+) -> None:
+    """Write result JSON; stream frames[] from spill when frame_iter is set."""
+    if frame_iter is None:
+        Path(path).write_text(video_data_json_dumps(payload), encoding="utf-8")
+        return
+
+    out = Path(path)
+    with out.open("w", encoding="utf-8") as f:
+        f.write("{\n")
+        body_keys = [k for k in payload if k != "frames"]
+        for i, key in enumerate(body_keys):
+            val = json.dumps(payload[key], ensure_ascii=False, indent=2)
+            f.write(f'  {json.dumps(key, ensure_ascii=False)}: ')
+            f.write(textwrap.indent(val, "  ").lstrip())
+            f.write(",\n" if i < len(body_keys) - 1 else ",\n")
+        f.write('  "frames": [\n')
+        first = True
+        count = 0
+        for frame in frame_iter:
+            count += 1
+            if on_progress and progress_every > 0 and count % progress_every == 0:
+                on_progress(count)
+            if not first:
+                f.write(",\n")
+            first = False
+            fr = json.dumps(frame, ensure_ascii=False, separators=(",", ":"))
+            f.write("    ")
+            f.write(fr)
+        if on_progress and count > 0:
+            on_progress(count)
+        f.write("\n  ]\n}\n")
 
 
 def label_slug(label: str) -> str:

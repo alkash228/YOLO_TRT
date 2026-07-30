@@ -15,6 +15,7 @@ $pairs = @(
     @{ Rel = "app\core\video_encode.py" },
     @{ Rel = "app\core\ffmpeg_utils.py" },
     @{ Rel = "app\core\pipeline.py" },
+    @{ Rel = "app\core\schema.py" },
     @{ Rel = "app\config\settings.py" }
 )
 
