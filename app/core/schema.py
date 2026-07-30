@@ -38,6 +38,7 @@ class VideoProgress:
     instances_current: int = 0
     instances_peak: int = 0
     stats: RunStats | None = None
+    phase: str = "inference"
 
 
 @dataclass(slots=True)

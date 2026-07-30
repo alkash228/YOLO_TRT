@@ -161,13 +161,11 @@ def resolve_smart_ram_plan(
         estimated_peak = models_gb + pipeline_gb + reserve_gb + spill_gb + safety_gb + per_window_gb
     estimated_peak = min(estimated_peak + safety_gb * 0.5, budget + safety_gb)
 
-    max_preload = max(
-        min_window_gb,
-        min(
-            budget - (baseline if baseline > 0.4 else models_gb) - safety_gb,
-            window_ceiling if window_ceiling > 0 else budget,
-        ),
-    )
+    # Preload budget = process RAM left after models; do NOT cap by max_window_ram_gb
+    # (that ceiling is only for windowed decode). Wrong cap forced API into windowed
+    # while UI felt fast on short clips that fit in RAM.
+    occupied = (baseline if baseline > 0.4 else models_gb) + safety_gb
+    max_preload = max(min_window_gb, budget - occupied)
 
     return RamBudgetPlan(
         budget_gb=budget,

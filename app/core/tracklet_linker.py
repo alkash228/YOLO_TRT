@@ -401,32 +401,47 @@ def enrich_tracklets_from_video(
             on_log(f"Tracklet link: cannot open video for ReID crops: {video_path}")
         return 0
 
-    # Gather (tracklet_idx, frame_idx, bbox) samples, then read frames in order.
+    # Sample crops: one forward decode pass (H.264 random seek is very slow).
     jobs: list[tuple[int, int, np.ndarray]] = []
     for ti, tr in enumerate(need):
         idxs = sample_indices(tr.n_frames, int(samples_per_tracklet))
         for si in idxs:
             jobs.append((ti, int(tr.frame_indices[si]), tr.bboxes_xyxy[si]))
-    jobs.sort(key=lambda j: j[1])
+    by_frame: dict[int, list[tuple[int, np.ndarray]]] = defaultdict(list)
+    for ti, fi, xyxy in jobs:
+        by_frame[int(fi)].append((ti, xyxy))
+    targets = sorted(by_frame.keys())
+    if not targets:
+        cap.release()
+        return 0
+
+    from app.core.reid_engine import ReidEngine
 
     crops_by_ti: dict[int, list[np.ndarray]] = defaultdict(list)
-    frame_cache_idx = -1
-    frame_bgr: np.ndarray | None = None
-    for ti, fi, xyxy in jobs:
-        if fi != frame_cache_idx:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, float(fi))
-            ok, frame_bgr = cap.read()
-            frame_cache_idx = fi if ok else -1
-            if not ok:
-                frame_bgr = None
-        if frame_bgr is None:
-            continue
-        from app.core.reid_engine import ReidEngine
-
-        crop = ReidEngine.crop_from_bbox(frame_bgr, xyxy, pad=pad)
-        if crop is None or crop.size == 0:
-            continue
-        crops_by_ti[ti].append(crop)
+    # Single jump to first needed frame, then only forward reads.
+    start_fi = int(targets[0])
+    if start_fi > 0:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, float(start_fi))
+    cur = start_fi
+    ti_target = 0
+    while ti_target < len(targets):
+        want = int(targets[ti_target])
+        while cur < want:
+            ok_skip, _ = cap.read()
+            if not ok_skip:
+                cur = want
+                break
+            cur += 1
+        ok, frame_bgr = cap.read()
+        if not ok or frame_bgr is None:
+            break
+        for ti, xyxy in by_frame[want]:
+            crop = ReidEngine.crop_from_bbox(frame_bgr, xyxy, pad=pad)
+            if crop is None or crop.size == 0:
+                continue
+            crops_by_ti[ti].append(crop)
+        cur = want + 1
+        ti_target += 1
     cap.release()
 
     filled = 0

@@ -16,15 +16,11 @@ nvidia-ml-py>=12.535
 # TensorRT 11 FP16 helper stack.
 nvidia-modelopt[onnx]==0.44.0
 tensorrt>=11.0
+onnx>=1.15
+onnxslim>=0.1.82
 Cython>=3.0
 h5py>=3.10
-future>=1.0
 yacs>=0.1.8
 gdown>=5.0
-chardet>=5.2
-tensorboard>=2.16
 
-# ReID code is cloned in Dockerfile and imported via PYTHONPATH.
-
-# TensorRT — install matching host CUDA in Dockerfile
-# tensorrt
+# ReID: deep-person-reid cloned in Dockerfile (PYTHONPATH).

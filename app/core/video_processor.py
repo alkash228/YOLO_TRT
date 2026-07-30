@@ -4,6 +4,7 @@ from __future__ import annotations
 import gc
 import json
 import queue as queue_module
+import shutil
 import subprocess
 import time
 import uuid
@@ -32,13 +33,13 @@ from app.core.frame_pipeline import (
     materialize_packet_for_render,
     post_process_frame,
 )
-from app.core.cross_check import CrossCheckDetection, CrossCheckVerdict, evaluate_cross_check_batch
-from app.core.fusion import (
-    dedupe_detections,
-    inherit_motion_ids,
-    match_detections_to_segments,
-    merge_seg_fallback_detections,
+from app.core.cross_check import (
+    CrossCheckDetection,
+    CrossCheckVerdict,
+    evaluate_cross_check_batch,
+    smooth_helmet_verdicts,
 )
+from app.core.fusion import dedupe_detections, inherit_motion_ids, match_detections_to_segments, merge_seg_fallback_detections
 from app.core.async_finalize import AsyncBatchFinalizer
 from app.core.batch_prepare import prepare_batch_frames
 from app.core.batch_utils import (
@@ -46,20 +47,21 @@ from app.core.batch_utils import (
     effective_speed_tuning,
     frame_stride_summary,
     resolve_batch_prefetch_depth,
-    resolve_frame_source,
+    resolve_frame_source_ex,
     resolve_gpu_queue_depth,
     resolve_infer_batch_size,
     resolve_reid_embed_chunk,
-    resolve_use_streaming,
     resolve_window_frames,
     source_frame_indices,
 )
 from app.core.gpu_monitor import GpuMonitor
+from app.core.process_resource_monitor import ProcessResourceMonitor
 from app.core.gpu_pipeline import (
     FrameBatchJob,
     GpuInferWorker,
     ReidEmbedWorker,
     chunk_frame_jobs,
+    enrich_gpu_batch_reid,
     make_async_batch_jobs,
 )
 from app.core.motion_tracker import MotionTracker
@@ -69,12 +71,12 @@ from app.core.run_registry import (
     generate_run_charts,
     read_metrics_jsonl,
 )
-from app.core.gpu_cleanup import release_gpu_memory
-from app.core.process_memory import current_process_rss_gb
-from app.core.ram_budget import RamBudgetPlan, resolve_smart_ram_plan
 from app.core.mask_json import mask_u8_to_rle_dict
 from app.core.memory_stats import build_memory_report
 from app.core.video_encode import (
+    build_encode_writer_args,
+    encode_manifest_to_video,
+    encode_packets_to_video,
     packets_path_for_run,
     save_run_packets,
 )
@@ -105,7 +107,10 @@ from app.core.schema import (
     run_stats_to_dict,
     stats_summary_from_counters,
     video_data_json_dumps,
+    write_result_json,
 )
+from app.core.process_memory import current_process_rss_gb
+from app.core.ram_budget import RamBudgetPlan, resolve_smart_ram_plan
 from app.core.seg_engine import SegEngine
 from app.core.window_frame_loader import VideoWindow, WindowPrefetcher, WindowedBatchJobs
 
@@ -128,14 +133,90 @@ class VideoProcessor:
         self._job_batch_size = 16
         self.motion_tracker = MotionTracker()
         self._on_debug_log: Callable[[str], None] | None = None
+        self._on_progress_tick: Callable[[int, int, str], None] | None = None
+        self._progress_slot: Any = None
+        # Per-run stage timers (decode / GPU worker wall / CPU finalize).
+        self._stage_timing: dict[str, float] = {
+            "decode_sec": 0.0,
+            "gpu_infer_sec": 0.0,
+            "cpu_finalize_sec": 0.0,
+        }
         # SAM masklet identity OR classic OSNet ReidTracker (see use_sam_identity).
         self.tracker = build_identity_tracker(settings)
+        self._helmet_verdict_history: dict[int, list[bool]] = {}
+
+    def _apply_cross_check(
+        self,
+        *,
+        valid_dets: list,
+        width: int,
+        height: int,
+        stable_ids: np.ndarray,
+        frame=None,
+        accessories: list | None = None,
+    ) -> tuple[list[CrossCheckVerdict], list[CrossCheckDetection], float]:
+        cross_verdicts: list[CrossCheckVerdict] = []
+        cross_accessories: list[CrossCheckDetection] = []
+        cross_ms = 0.0
+        if (
+            not self.settings.cross_check_enabled
+            or self.cross_check_engine is None
+            or not valid_dets
+        ):
+            return cross_verdicts, cross_accessories, cross_ms
+        if accessories is None:
+            if frame is None:
+                return cross_verdicts, cross_accessories, cross_ms
+            obj_terms = prompt_terms(self.settings.cross_check_object_prompt)
+            t_cross = time.perf_counter()
+            aux_raw = self.cross_check_engine.predict(frame)
+            cross_ms = (time.perf_counter() - t_cross) * 1000.0
+            accessories = [d for d in aux_raw if label_match(d.label, obj_terms)]
+        cross_accessories = [
+            CrossCheckDetection(d.label, float(d.conf), d.xyxy.copy()) for d in accessories
+        ]
+        cross_verdicts = evaluate_cross_check_batch(
+            valid_dets,
+            accessories,
+            kpt_conf=self.settings.pose_kpt_conf,
+            min_intersection_px=self.settings.cross_check_min_intersection_px,
+            min_iou=self.settings.cross_check_min_iou,
+            frame_w=width,
+            frame_h=height,
+            warn_text=self.settings.cross_check_warning_text,
+            helmet_min_conf=float(getattr(self.settings, "cross_check_helmet_min_conf", 0.0) or 0.0),
+        )
+        streak = int(getattr(self.settings, "cross_check_min_violation_streak", 2) or 2)
+        if streak > 1 and len(stable_ids) == len(cross_verdicts):
+            cross_verdicts = smooth_helmet_verdicts(
+                stable_ids,
+                cross_verdicts,
+                self._helmet_verdict_history,
+                min_violation_streak=streak,
+                history_len=int(getattr(self.settings, "cross_check_verdict_history", 5) or 5),
+            )
+        self.cross_check_violations_total += sum(1 for v in cross_verdicts if not v.ok)
+        return cross_verdicts, cross_accessories, cross_ms
 
     @staticmethod
     def _gpu_mem_mb() -> float:
         if not torch.cuda.is_available():
             return 0.0
         return float(torch.cuda.memory_allocated() / (1024 * 1024))
+
+    @staticmethod
+    def _persist_source_in_run(input_path: str, out_dir: Path, run_id: str) -> str:
+        """Copy source MP4 into run folder so deferred/manual encode survives job staging cleanup."""
+        src = Path(input_path)
+        if not src.is_file():
+            return str(input_path)
+        dest = out_dir / f"{run_id}_source{src.suffix or '.mp4'}"
+        try:
+            if not dest.exists() or dest.stat().st_size != src.stat().st_size:
+                shutil.copy2(src, dest)
+        except OSError:
+            return str(src.resolve())
+        return str(dest.resolve())
 
     @staticmethod
     def _resolve_prompt_id(
@@ -342,13 +423,6 @@ class VideoProcessor:
                             use_amp=bool(self.settings.use_amp),
                             use_tensorrt=bool(self.settings.use_tensorrt),
                             tensorrt_fp16=bool(self.settings.tensorrt_fp16),
-                            tensorrt_engine_strategy=str(
-                                getattr(self.settings, "tensorrt_engine_strategy", "central")
-                            ),
-                            tensorrt_central_dir=Path(
-                                getattr(self.settings, "models_dir", "/data/models")
-                            )
-                            / "TRT",
                         )
                         embed_engine = temp_engine
                     except Exception as exc:
@@ -368,8 +442,8 @@ class VideoProcessor:
                     on_log=on_debug_log,
                 )
         if temp_engine is not None:
+            # Do NOT empty_cache here — kills allocator reuse and slows the next API job.
             del temp_engine
-            release_gpu_memory()
 
         has_any_emb = any(t.embedding is not None for t in tracklets)
         require_emb = bool(use_reid and has_any_emb)
@@ -530,6 +604,40 @@ class VideoProcessor:
     ) -> None:
         deferred_packets.append(compact_packet_for_cache(packet) if compact else packet)
 
+    def _sync_progress_resources(
+        self,
+        gpu_monitor: GpuMonitor | None,
+        process_res_mon: ProcessResourceMonitor | None,
+    ) -> None:
+        slot = getattr(self, "_progress_slot", None)
+        if slot is None:
+            return
+        proc = process_res_mon.latest() if process_res_mon is not None else None
+        gpu = gpu_monitor.latest() if gpu_monitor is not None else None
+        slot.set_resources(
+            process_rss_mb=proc.process_rss_mb if proc is not None else 0.0,
+            cuda_allocated_mb=proc.cuda_allocated_mb if proc is not None else 0.0,
+            cuda_reserved_mb=proc.cuda_reserved_mb if proc is not None else 0.0,
+            gpu_device_used_mb=float(gpu.mem_used_mb) if gpu is not None else 0.0,
+            gpu_util_pct=float(gpu.gpu_util_pct) if gpu is not None else 0.0,
+        )
+
+    def _write_progress_hook(self, current: int, total: int, phase: str) -> None:
+        """Throttled progress slot (API) or legacy tick callback."""
+        out_frame = max(0, int(current))
+        total_out = max(0, int(total)) if int(total) > 0 else max(1, out_frame)
+        slot = getattr(self, "_progress_slot", None)
+        if slot is not None:
+            slot.maybe_update(out_frame, total_out, phase)
+            self._sync_progress_resources(
+                getattr(self, "_gpu_monitor", None),
+                getattr(self, "_process_res_mon", None),
+            )
+            return
+        tick = getattr(self, "_on_progress_tick", None)
+        if tick is not None:
+            tick(out_frame, total_out, phase)
+
     def _pulse_infer_progress(
         self,
         *,
@@ -539,31 +647,57 @@ class VideoProcessor:
         start_ts: float,
         on_progress: Callable[[VideoProgress], None] | None,
         gpu_monitor: GpuMonitor | None,
+        process_res_mon: ProcessResourceMonitor | None = None,
         phase: str = "inference",
+        fps_start_ts: float | None = None,
+        min_interval_sec: float = 0.0,
     ) -> None:
+        slot = getattr(self, "_progress_slot", None)
+        tick = getattr(self, "_on_progress_tick", None)
+        if on_progress is None and tick is None and slot is None:
+            return
+        now = time.perf_counter()
+        # Throttle wait-loop spam only; batch-complete pulses pass min_interval_sec=0.
+        if min_interval_sec > 0:
+            last = float(getattr(self, "_last_progress_pulse_ts", 0.0) or 0.0)
+            if now - last < min_interval_sec:
+                return
+        self._last_progress_pulse_ts = now
+        out_frame = max(0, int(current_frame))
+        total_out = total if total > 0 else max(1, out_frame)
+        self._write_progress_hook(out_frame, total_out, phase)
         if on_progress is None:
             return
-        out_frame = max(0, int(current_frame))
-        elapsed = time.perf_counter() - start_ts
-        proc_fps = out_frame / elapsed if elapsed > 0 and out_frame > 0 else 0.0
+        elapsed = now - start_ts
+        fps_anchor = float(fps_start_ts) if fps_start_ts is not None else start_ts
+        fps_elapsed = max(1e-6, now - fps_anchor)
+        proc_fps = out_frame / fps_elapsed if out_frame > 0 else 0.0
         eta = ((total - out_frame) / proc_fps) if proc_fps > 0 and total > 0 else 0.0
         gpu_util = 0.0
+        gpu_mem = 0.0
         if gpu_monitor is not None:
             latest = gpu_monitor.latest()
             if latest is not None:
                 gpu_util = latest.gpu_util_pct
+        if process_res_mon is not None:
+            proc = process_res_mon.latest()
+            if proc is not None:
+                gpu_mem = float(proc.cuda_allocated_mb)
+        elif gpu_mem <= 0.0:
+            gpu_mem = self._gpu_mem_mb()
         on_progress(
             VideoProgress(
                 current=out_frame,
-                total=total if total > 0 else max(1, out_frame),
+                total=total_out,
                 fps=proc_fps,
                 eta_seconds=eta,
-                gpu_mem_mb=self._gpu_mem_mb(),
+                gpu_mem_mb=gpu_mem,
                 elapsed_sec=elapsed,
                 gpu_util_pct=gpu_util,
                 instances_current=0,
                 instances_peak=instances_peak,
                 stats=None,
+                phase=phase,
             )
         )
 
@@ -588,6 +722,11 @@ class VideoProcessor:
             if current_frame is not None
             else int(packet.frame_idx) + 1
         )
+        total_out = total if total > 0 else out_frame
+        self._write_progress_hook(out_frame, total_out, phase)
+        # Silent API path: skip RunStats / cuda.memory_allocated / VideoProgress.
+        if not write_metrics and on_progress is None:
+            return
         elapsed = time.perf_counter() - start_ts
         proc_fps = out_frame / elapsed if elapsed > 0 else 0.0
         eta = ((total - out_frame) / proc_fps) if proc_fps > 0 and total > 0 else 0.0
@@ -603,7 +742,7 @@ class VideoProcessor:
         )
         stats = RunStats(
             frame=out_frame,
-            total_frames=total if total > 0 else out_frame,
+            total_frames=total_out,
             fps=proc_fps,
             eta_sec=eta,
             gpu_mem_mb=self._gpu_mem_mb(),
@@ -627,7 +766,7 @@ class VideoProcessor:
             on_progress(
                 VideoProgress(
                     current=out_frame,
-                    total=total if total > 0 else out_frame,
+                    total=total_out,
                     fps=proc_fps,
                     eta_seconds=eta,
                     gpu_mem_mb=stats.gpu_mem_mb,
@@ -636,6 +775,7 @@ class VideoProcessor:
                     instances_current=packet.n_inst,
                     instances_peak=instances_peak,
                     stats=stats,
+                    phase=phase,
                 )
             )
 
@@ -718,6 +858,7 @@ class VideoProcessor:
                         instances_current=packet.n_inst,
                         instances_peak=instances_peak,
                         stats=stats,
+                        phase="post",
                     )
                 )
 
@@ -790,12 +931,26 @@ class VideoProcessor:
             detections = inherit_motion_ids(detections)
             detections = dedupe_detections(detections, iou_min=0.55)
 
+        use_torso = bool(getattr(self.settings, "reid_torso_crop", True))
+        kpt_conf = float(getattr(self.settings, "pose_kpt_conf", 0.25))
+        torso_pad = float(getattr(self.settings, "reid_torso_pad", 0.20))
+        torso_min_area = float(getattr(self.settings, "reid_torso_min_area_ratio", 0.12))
         crops: list[np.ndarray | None] = []
         valid_dets: list[DetectItem] = []
         for det in detections:
             valid_dets.append(det)
             if need_osnet:
-                crops.append(ReidEngine.crop_from_bbox(frame, det.xyxy))
+                crops.append(
+                    ReidEngine.crop_for_reid(
+                        frame,
+                        det.xyxy,
+                        det.keypoints,
+                        kpt_conf=kpt_conf,
+                        use_torso=use_torso,
+                        torso_pad=torso_pad,
+                        torso_min_area_ratio=torso_min_area,
+                    )
+                )
             else:
                 crops.append(None)
         crop_list = [c for c in crops if c is not None and c.size > 0]
@@ -815,9 +970,7 @@ class VideoProcessor:
             else:
                 embeddings = np.zeros((len(valid_dets), 512), dtype=np.float32)
             reid_ms = (time.perf_counter() - t0) * 1000.0
-            track_result = self.tracker.update(
-                valid_dets, embeddings, frame_idx=frame_idx
-            )
+            track_result = self.tracker.update(valid_dets, embeddings, frame_idx=frame_idx)
             stable_ids = (
                 np.array(track_result.stable_ids, dtype=np.int64)
                 if track_result.stable_ids
@@ -834,7 +987,6 @@ class VideoProcessor:
                 dtype=np.int64,
             )
             reid_recoveries = 0
-
         masks = match_detections_to_segments(
             valid_dets,
             segments,
@@ -860,33 +1012,13 @@ class VideoProcessor:
         else:
             infer_ms = (time.perf_counter() - t_infer) * 1000.0
 
-        cross_verdicts: list[CrossCheckVerdict] = []
-        cross_accessories: list[CrossCheckDetection] = []
-        cross_ms = 0.0
-        if (
-            self.settings.cross_check_enabled
-            and self.cross_check_engine is not None
-            and valid_dets
-        ):
-            obj_terms = prompt_terms(self.settings.cross_check_object_prompt)
-            t_cross = time.perf_counter()
-            aux_raw = self.cross_check_engine.predict(frame)
-            cross_ms = (time.perf_counter() - t_cross) * 1000.0
-            accessories = [d for d in aux_raw if label_match(d.label, obj_terms)]
-            cross_accessories = [
-                CrossCheckDetection(d.label, float(d.conf), d.xyxy.copy()) for d in accessories
-            ]
-            cross_verdicts = evaluate_cross_check_batch(
-                valid_dets,
-                accessories,
-                kpt_conf=self.settings.pose_kpt_conf,
-                min_intersection_px=self.settings.cross_check_min_intersection_px,
-                min_iou=self.settings.cross_check_min_iou,
-                frame_w=width,
-                frame_h=height,
-                warn_text=self.settings.cross_check_warning_text,
-            )
-            self.cross_check_violations_total += sum(1 for v in cross_verdicts if not v.ok)
+        cross_verdicts, cross_accessories, cross_ms = self._apply_cross_check(
+            valid_dets=valid_dets,
+            frame=frame,
+            width=width,
+            height=height,
+            stable_ids=stable_ids,
+        )
 
         packet = make_infer_packet(
             frame_idx=frame_idx,
@@ -949,10 +1081,13 @@ class VideoProcessor:
         if all_frames is not None:
             indices = process_indices if process_indices else list(range(len(all_frames)))
             selected = [all_frames[i] for i in indices]
+            # TRT track/predict сами pad'ят до engine batch; pad хвоста job→bs
+            # только копирует last frame (и раньше светил «28→64») без пользы.
             jobs = chunk_frame_jobs(
                 selected,
                 batch_size=bs,
                 frame_indices=indices,
+                pad_last_job=False,
             )
             if on_debug_log:
                 on_debug_log(
@@ -987,6 +1122,8 @@ class VideoProcessor:
         obj_terms: list[str],
         height: int,
         width: int,
+        *,
+        on_debug_log: Callable[[str], None] | None = None,
     ) -> list[tuple[FramePacket, int]]:
         n = len(batch.frame_indices)
         if n == 0:
@@ -1001,6 +1138,7 @@ class VideoProcessor:
             self.settings.use_reid and self.reid_engine is not None
         )
         need_osnet = needs_osnet_embed(self.settings) and self.reid_engine is not None
+        # BoT-SORT track when stable identity is needed (SAM or OSNet).
         use_motion_tracker = self.settings.gpu_full_batch and not want_identity
 
         emb_by_slot: dict[tuple[int, int], np.ndarray] = {}
@@ -1026,21 +1164,10 @@ class VideoProcessor:
                     for slot, key in enumerate(crop_map):
                         emb_by_slot[key] = batch.reid_embeddings[slot]
                 else:
-                    crops_retry: list[np.ndarray] = []
-                    keys_retry: list[tuple[int, int]] = []
-                    for fi, pf in enumerate(batch.prepared_frames):
-                        frame = frames_bgr[fi]
-                        for di, det in enumerate(pf.valid_dets):
-                            crop = ReidEngine.crop_from_bbox(frame, det.xyxy)
-                            if crop is not None and crop.size > 0:
-                                keys_retry.append((fi, di))
-                                crops_retry.append(crop)
-                    t0 = time.perf_counter()
-                    retry_emb = self.reid_engine.embed_batch(crops_retry)
-                    reid_ms_total += (time.perf_counter() - t0) * 1000.0
-                    for slot, key in enumerate(keys_retry):
-                        if slot < retry_emb.shape[0]:
-                            emb_by_slot[key] = retry_emb[slot]
+                    # GPU ReID уже на main; finalizer не трогает CUDA (deadlock с enrich).
+                    n_use = min(n_emb, len(crop_map))
+                    for slot in range(n_use):
+                        emb_by_slot[crop_map[slot]] = batch.reid_embeddings[slot]
         else:
             prepared, all_crops, crop_map = prepare_batch_frames(
                 detections=batch.detections,
@@ -1098,32 +1225,55 @@ class VideoProcessor:
 
             reid_ms = 0.0
             if want_identity:
-                if need_osnet and valid_dets:
-                    if self.settings.reid_batch_across_frames:
+                if valid_dets:
+                    if need_osnet and self.settings.reid_batch_across_frames:
+                        emb_dim = int(next(iter(emb_by_slot.values())).shape[0]) if emb_by_slot else 512
                         embs = np.stack(
                             [
-                                emb_by_slot.get((fi, di), np.zeros(512, dtype=np.float32))
+                                emb_by_slot.get(
+                                    (fi, di),
+                                    np.zeros(emb_dim, dtype=np.float32),
+                                )
                                 for di in range(len(valid_dets))
                             ],
                             axis=0,
                         )
                         reid_ms = per_reid_ms
-                    else:
-                        crops = [ReidEngine.crop_from_bbox(frame, d.xyxy) for d in valid_dets]
-                        crops = [c for c in crops if c is not None and c.size > 0]
+                    elif need_osnet:
+                        use_torso = bool(getattr(self.settings, "reid_torso_crop", True))
+                        kpt_conf = float(getattr(self.settings, "pose_kpt_conf", 0.25))
+                        torso_pad = float(getattr(self.settings, "reid_torso_pad", 0.20))
+                        torso_min_area = float(
+                            getattr(self.settings, "reid_torso_min_area_ratio", 0.12)
+                        )
+                        crops = [
+                            ReidEngine.crop_for_reid(
+                                frame,
+                                d.xyxy,
+                                d.keypoints,
+                                kpt_conf=kpt_conf,
+                                use_torso=use_torso,
+                                torso_pad=torso_pad,
+                                torso_min_area_ratio=torso_min_area,
+                            )
+                            for d in valid_dets
+                        ]
+                        crop_list = [c for c in crops if c is not None and c.size > 0]
                         t0 = time.perf_counter()
-                        if crops:
-                            raw = self.reid_engine.embed_batch(crops)
-                            emb_dim = int(raw.shape[1])
+                        if crop_list:
+                            raw_embs = self.reid_engine.embed_batch(crop_list)
+                            emb_dim = int(raw_embs.shape[1])
                             embs = np.zeros((len(valid_dets), emb_dim), dtype=np.float32)
-                            # best-effort: align only when all crops succeeded
-                            if raw.shape[0] == len(valid_dets):
-                                embs = raw
+                            ci = 0
+                            for di, c in enumerate(crops):
+                                if c is not None and c.size > 0:
+                                    embs[di] = raw_embs[ci]
+                                    ci += 1
                         else:
                             embs = np.zeros((len(valid_dets), 512), dtype=np.float32)
                         reid_ms = (time.perf_counter() - t0) * 1000.0
-                elif valid_dets:
-                    embs = np.zeros((len(valid_dets), 512), dtype=np.float32)
+                    else:
+                        embs = np.zeros((len(valid_dets), 512), dtype=np.float32)
                 else:
                     embs = np.zeros((0, 512), dtype=np.float32)
                 track_result = self.tracker.update(valid_dets, embs, frame_idx=frame_idx)
@@ -1162,28 +1312,13 @@ class VideoProcessor:
                 labels = []
                 keypoints_list = []
 
-            cross_verdicts: list[CrossCheckVerdict] = []
-            cross_accessories: list[CrossCheckDetection] = []
-            if (
-                self.settings.cross_check_enabled
-                and self.cross_check_engine is not None
-                and valid_dets
-            ):
-                accessories = [d for d in frame_cross_raw[fi] if label_match(d.label, obj_terms)]
-                cross_accessories = [
-                    CrossCheckDetection(d.label, float(d.conf), d.xyxy.copy()) for d in accessories
-                ]
-                cross_verdicts = evaluate_cross_check_batch(
-                    valid_dets,
-                    accessories,
-                    kpt_conf=self.settings.pose_kpt_conf,
-                    min_intersection_px=self.settings.cross_check_min_intersection_px,
-                    min_iou=self.settings.cross_check_min_iou,
-                    frame_w=width,
-                    frame_h=height,
-                    warn_text=self.settings.cross_check_warning_text,
-                )
-                self.cross_check_violations_total += sum(1 for v in cross_verdicts if not v.ok)
+            cross_verdicts, cross_accessories, _ = self._apply_cross_check(
+                valid_dets=valid_dets,
+                width=width,
+                height=height,
+                stable_ids=stable_ids,
+                accessories=[d for d in frame_cross_raw[fi] if label_match(d.label, obj_terms)],
+            )
 
             infer_ms = per_det_ms + per_seg_ms + per_cross_ms + reid_ms
             packet = make_infer_packet(
@@ -1248,6 +1383,7 @@ class VideoProcessor:
             seg_eng,
             self.cross_check_engine,
             self.settings,
+            on_batch_log=on_debug_log,
         )
         worker.start()
         detect_mode = "predict_batch" if not worker._detect_use_track else "track"
@@ -1260,17 +1396,29 @@ class VideoProcessor:
             and torch.cuda.is_available()
             and not worker._detect_use_track
         )
+        # OSNet serial pipeline only when embeds are required; SAM-only skips it.
         serial_cuda = need_osnet and not reid_overlap
-        # SAM-only: CPU tracker can overlap with next YOLO job (no OSNet on CUDA).
+        # ReID serial: YOLO job N+1 на GPU, пока CPU tracker обрабатывает job N (без YOLO||ReID).
         pipeline_cpu = serial_cuda or (want_identity and not need_osnet)
-        depth = 2 if (pipeline_cpu or reid_overlap) else (
-            1 if serial_cuda else resolve_gpu_queue_depth(
+        # Preload держит кадры в RAM — глубина очереди = ссылки на job, не копии кадров.
+        # Раньше SAM/ReID жёстко ставили queue=2 → GPU worker часто простаивал между job.
+        requested_depth = resolve_gpu_queue_depth(
             self.settings.gpu_queue_depth,
             n_jobs=n_jobs,
             job_batch_size=eff_bs,
             max_job_batch=self.settings.max_job_batch_size,
         )
-        )
+        if reid_overlap:
+            # Два CUDA-потребителя (detect + OSNet stream) — не раздувать in-flight.
+            depth = min(2, requested_depth)
+        elif serial_cuda:
+            # YOLO||CPU finalize: минимум 2, иначе нет overlap.
+            depth = max(2, min(requested_depth, 3))
+        elif pipeline_cpu:
+            # SAM masklet без live OSNet: CPU tracker лёгкий — можно глубже (до settings).
+            depth = max(2, requested_depth)
+        else:
+            depth = requested_depth
         reid_worker: ReidEmbedWorker | None = None
         if reid_overlap:
             assert self.reid_engine is not None
@@ -1292,26 +1440,35 @@ class VideoProcessor:
             ):
                 cap_note = f" | job cap ReID {req}→{eff_bs}"
             queue_note = ""
-            if depth != int(self.settings.gpu_queue_depth) and not (pipeline_cpu or reid_overlap):
+            if depth != int(self.settings.gpu_queue_depth):
                 queue_note = f" (запрос {self.settings.gpu_queue_depth})"
-            if reid_overlap:
+            if use_sam:
+                mode_note = " | SAM masklet identity"
+            elif reid_overlap:
                 mode_note = " | ReID GPU overlap (cuda stream)"
             elif serial_cuda:
-                mode_note = " | CUDA serial (ReID)"
+                mode_note = " | ReID pipeline (YOLO||CPU tracker)"
                 if need_osnet and bool(getattr(self.settings, "reid_gpu_overlap", False)):
-                    mode_note += " [track: overlap off]"
-            elif want_identity and not need_osnet:
-                mode_note = " | SAM identity (no live OSNet)"
+                    mode_note += " [gpu overlap off]"
             else:
                 mode_note = ""
+            trt_b = int(getattr(self.detect_engine, "trt_max_batch", 0) or 0)
+            trt_note = ""
+            if trt_b > 0 and eff_bs > trt_b:
+                trt_note = (
+                    f" | TRT detect b{trt_b} (job {eff_bs}→{eff_bs // trt_b}× launches/job; "
+                    f"rebuild engine b{min(eff_bs, int(self.settings.tensorrt_max_batch))} to fill GPU)"
+                )
             on_debug_log(
                 f"GPU job: {eff_bs} кадр/батч × {n_jobs} job | inference {n_process} кадр | "
                 f"detect={detect_mode} | YOLO chunk={self.settings.max_infer_batch_size} | "
-                f"queue={depth}{queue_note} | запрос batch={req_txt}{cap_note}{mode_note}"
+                f"queue={depth}{queue_note} | запрос batch={req_txt}{cap_note}{mode_note}{trt_note}"
             )
         job_iter = batch_jobs
         pending_jobs: deque[FrameBatchJob] = deque()
         in_flight = 0
+        # GPU-completed frames (ahead of CPU finalize) — progress must not wait for emit.
+        gpu_done_ref = [0]
 
         def _close_batch_feeder() -> None:
             close_fn = getattr(job_iter, "close", None)
@@ -1330,6 +1487,10 @@ class VideoProcessor:
                 in_flight += 1
 
         def _finalize_job(result, frames_bgr: list[np.ndarray]):
+            t0 = time.perf_counter()
+            n_fr = len(getattr(result, "frame_indices", []) or [])
+            if on_debug_log and n_fr < self._job_batch_size:
+                on_debug_log(f"Finalizer: tracker {n_fr} fr…")
             packets = self._cpu_finalize_batch(
                 result,
                 frames_bgr,
@@ -1337,8 +1498,17 @@ class VideoProcessor:
                 obj_terms,
                 height,
                 width,
+                on_debug_log=on_debug_log,
             )
+            self._stage_timing["cpu_finalize_sec"] = float(
+                self._stage_timing.get("cpu_finalize_sec", 0.0)
+            ) + max(0.0, time.perf_counter() - t0)
+            if on_debug_log and n_fr < self._job_batch_size:
+                ms = (time.perf_counter() - t0) * 1000.0
+                on_debug_log(f"Finalizer: {len(packets)} pkts in {ms:.0f}ms")
             if deferred_encode:
+                # Compact once here; _emit_packets must NOT compact again
+                # (second compact used to wipe masks_rle → empty JSON instances).
                 return [
                     (compact_packet_for_cache(packet), n_inst)
                     for packet, n_inst in packets
@@ -1359,8 +1529,16 @@ class VideoProcessor:
                 infer_done_ref[0] += 1
 
                 if deferred_encode:
-                    self._append_deferred_packet(packet, deferred_packets)
+                    # Already compacted in _finalize_job when deferred_encode.
+                    self._append_deferred_packet(packet, deferred_packets, compact=False)
                     last_packet = packet
+                    # Manual/deferred never hits _emit_post_results — still accumulate ms.
+                    emit_kwargs["detect_ms_acc"][0] += float(packet.detect_ms)
+                    emit_kwargs["seg_ms_acc"][0] += float(packet.seg_ms)
+                    emit_kwargs["reid_ms_acc"][0] += float(packet.reid_ms)
+                    emit_kwargs["total_ms_acc"][0] += float(
+                        infer_ms_by_frame.get(packet.frame_idx, packet.infer_ms)
+                    )
                 elif post_exec is not None:
                     post_exec.submit(packet, frame_source=all_frames)
                 else:
@@ -1416,6 +1594,7 @@ class VideoProcessor:
                     metrics_path=emit_kwargs["metrics_path"],
                     on_progress=emit_kwargs.get("on_progress"),
                     gpu_monitor=emit_kwargs.get("gpu_monitor"),
+                    process_res_mon=emit_kwargs.get("process_res_mon"),
                     phase="inference",
                     write_metrics=False,
                     current_frame=infer_done_ref[0],
@@ -1430,6 +1609,35 @@ class VideoProcessor:
             if finalizer is not None:
                 for batch_packets in finalizer.drain():
                     _emit_packets(batch_packets)
+
+        def _submit_finalize(result, frames_bgr: list) -> None:
+            if finalizer is None:
+                packets = _finalize_job(result, frames_bgr)
+                _emit_packets(packets)
+                return
+            # Иначе RAM: 100+ job × 64 кадра в очереди finalizer → swap/«зависание».
+            max_pending = max(2, depth)
+            while finalizer.pending_depth() >= max_pending:
+                for batch_packets in finalizer.drain():
+                    _emit_packets(batch_packets)
+                if finalizer.pending_depth() >= max_pending:
+                    time.sleep(0.005)
+            finalizer.submit(result, frames_bgr)
+
+        finalizer: AsyncBatchFinalizer | None = None
+        if pipeline_cpu or reid_overlap or not serial_cuda:
+            finalizer = AsyncBatchFinalizer(_finalize_job, should_stop=should_stop)
+            finalizer.start()
+
+        self._pulse_infer_progress(
+            current_frame=0,
+            total=emit_kwargs["total"],
+            instances_peak=instances_peak,
+            start_ts=emit_kwargs["start_ts"],
+            on_progress=emit_kwargs.get("on_progress"),
+            gpu_monitor=emit_kwargs.get("gpu_monitor"),
+            phase="warmup",
+        )
 
         def _flush_before_window_spill() -> None:
             if reid_worker is not None:
@@ -1485,6 +1693,14 @@ class VideoProcessor:
                     force_finish()
                     continue
                 if _window_pipeline_idle():
+                    info = getattr(job_iter, "pending_spill_info", None)
+                    if info is not None:
+                        lo, hi = int(info.start_frame), int(info.end_frame)
+                        got = sum(1 for p in deferred_packets if lo <= int(p.frame_idx) < hi)
+                        if on_debug_log:
+                            on_debug_log(
+                                f"Window spill flush: {got}/{info.infer_count} pkts ready, force…"
+                            )
                     force_finish()
                     continue
                 if on_debug_log and time.monotonic() > deadline:
@@ -1493,20 +1709,7 @@ class VideoProcessor:
                     break
                 time.sleep(0.01)
 
-        finalizer: AsyncBatchFinalizer | None = None
-        if reid_overlap or not serial_cuda:
-            finalizer = AsyncBatchFinalizer(_finalize_job, should_stop=should_stop)
-            finalizer.start()
-
-        self._pulse_infer_progress(
-            current_frame=0,
-            total=emit_kwargs["total"],
-            instances_peak=instances_peak,
-            start_ts=emit_kwargs["start_ts"],
-            on_progress=emit_kwargs.get("on_progress"),
-            gpu_monitor=emit_kwargs.get("gpu_monitor"),
-            phase="warmup",
-        )
+        stall_log_ts = 0.0
 
         try:
             _prime()
@@ -1518,42 +1721,134 @@ class VideoProcessor:
                 try:
                     result = worker.get_result(timeout=0.05)
                 except queue_module.Empty:
+                    now = time.monotonic()
+                    if on_debug_log and now - stall_log_ts >= 15.0:
+                        stall_log_ts = now
+                        fin_q = finalizer.pending_depth() if finalizer is not None else 0
+                        fin_busy = (
+                            finalizer.is_busy()
+                            if finalizer is not None
+                            else False
+                        )
+                        job_note = ""
+                        if pending_jobs:
+                            pj = pending_jobs[0]
+                            if pj.frame_indices:
+                                pn = pj.infer_count
+                                idx_end = (
+                                    pj.frame_indices[pn - 1]
+                                    if pn > 0
+                                    else pj.frame_indices[0]
+                                )
+                                job_note = (
+                                    f" job=[{pj.frame_indices[0]}..{idx_end}]"
+                                    f" n={pn}"
+                                )
+                        on_debug_log(
+                            f"Waiting GPU: in_flight={in_flight} "
+                            f"pending_jobs={len(pending_jobs)} finalizer={fin_q}"
+                            f"{'+work' if fin_busy else ''} "
+                            f"infer_done={infer_done_ref[0]}/{n_process}{job_note}"
+                        )
+                    if not pending_jobs and in_flight > 0:
+                        if on_debug_log:
+                            on_debug_log(
+                                f"GPU queue reset: in_flight {in_flight}→0 "
+                                f"(нет pending_jobs, infer_done={infer_done_ref[0]})"
+                            )
+                        in_flight = 0
+                        break
                     self._pulse_infer_progress(
-                        current_frame=infer_done_ref[0],
+                        current_frame=max(infer_done_ref[0], gpu_done_ref[0]),
                         total=emit_kwargs["total"],
                         instances_peak=instances_peak,
                         start_ts=emit_kwargs["start_ts"],
                         on_progress=emit_kwargs.get("on_progress"),
                         gpu_monitor=emit_kwargs.get("gpu_monitor"),
+                    process_res_mon=emit_kwargs.get("process_res_mon"),
                         phase="gpu",
+                        fps_start_ts=emit_kwargs.get("infer_start_ts"),
+                        min_interval_sec=0.25,
                     )
                     continue
+
+                # Do NOT torch.cuda.synchronize() here — that serializes the GPU
+                # pipeline vs UI and kills overlap with CPU finalize / next submit.
 
                 job = pending_jobs.popleft()
                 frames_bgr = job.frames_bgr
                 in_flight -= 1
+                real_n = job.infer_count
+                frames_infer = frames_bgr[:real_n]
                 job.frames_bgr = []
+                gpu_done_ref[0] += real_n
+                self._pulse_infer_progress(
+                    current_frame=max(gpu_done_ref[0], infer_done_ref[0]),
+                    total=emit_kwargs["total"],
+                    instances_peak=instances_peak,
+                    start_ts=emit_kwargs["start_ts"],
+                    on_progress=emit_kwargs.get("on_progress"),
+                    gpu_monitor=emit_kwargs.get("gpu_monitor"),
+                    process_res_mon=emit_kwargs.get("process_res_mon"),
+                    phase="inference",
+                    fps_start_ts=emit_kwargs.get("infer_start_ts"),
+                    min_interval_sec=0.25,
+                )
+
+                is_tail = real_n < self._job_batch_size or len(frames_bgr) > real_n
+
+                def _post_log(msg: str) -> None:
+                    if on_debug_log and is_tail:
+                        on_debug_log(msg)
+
+                if on_debug_log and is_tail:
+                    idx_lo = job.frame_indices[0] if job.frame_indices else -1
+                    idx_hi = job.frame_indices[real_n - 1] if real_n > 0 else idx_lo
+                    pad_note = (
+                        f" (padded→{len(frames_bgr)})"
+                        if len(frames_bgr) > real_n
+                        else ""
+                    )
+                    on_debug_log(
+                        f"CPU post: {real_n} fr [{idx_lo}..{idx_hi}]{pad_note}…"
+                    )
 
                 if serial_cuda:
-                    packets = _finalize_job(result, frames_bgr)
-                    _emit_packets(packets)
+                    assert self.reid_engine is not None
+                    enriched = enrich_gpu_batch_reid(
+                        result,
+                        frames_infer,
+                        reid_engine=self.reid_engine,
+                        settings=self.settings,
+                        terms=terms,
+                        on_log=_post_log,
+                    )
+                    _post_log("CPU post: submit finalizer…")
+                    if finalizer is not None:
+                        _submit_finalize(enriched, frames_infer)
+                    else:
+                        packets = _finalize_job(enriched, frames_infer)
+                        _emit_packets(packets)
+                    _post_log("CPU post: done")
                     try:
                         next_job = next(job_iter)
                         worker.submit(next_job)
                         pending_jobs.append(next_job)
                         in_flight += 1
                     except StopIteration:
-                        pass
+                        if not pending_jobs:
+                            in_flight = 0
                 elif reid_overlap:
                     assert reid_worker is not None
-                    reid_worker.submit(result, frames_bgr)
+                    reid_worker.submit(result, frames_infer)
                     try:
                         next_job = next(job_iter)
                         worker.submit(next_job)
                         pending_jobs.append(next_job)
                         in_flight += 1
                     except StopIteration:
-                        pass
+                        if not pending_jobs:
+                            in_flight = 0
                 else:
                     try:
                         next_job = next(job_iter)
@@ -1561,9 +1856,10 @@ class VideoProcessor:
                         pending_jobs.append(next_job)
                         in_flight += 1
                     except StopIteration:
-                        pass
+                        if not pending_jobs:
+                            in_flight = 0
                     if finalizer is not None:
-                        finalizer.submit(result, frames_bgr)
+                        finalizer.submit(result, frames_infer)
 
                 _drain_pipeline()
                 _try_pending_window_spill()
@@ -1572,17 +1868,25 @@ class VideoProcessor:
 
             _drain_all_pending_windows()
 
+            if on_debug_log:
+                on_debug_log("GPU jobs done, draining finalizer…")
             worker.close()
+            _drain_pipeline()
             if reid_worker is not None:
                 for enriched, frames in reid_worker.finish():
                     if finalizer is not None:
                         finalizer.submit(enriched, frames)
             if finalizer is not None:
+                if on_debug_log:
+                    on_debug_log("Finalizer: draining remaining jobs…")
                 for batch_packets in finalizer.finish():
                     _emit_packets(batch_packets)
             _drain_all_pending_windows()
             drain_post()
             emit_kwargs["instances_peak"] = instances_peak
+            self._stage_timing["gpu_infer_sec"] = float(
+                self._stage_timing.get("gpu_infer_sec", 0.0)
+            ) + float(getattr(worker, "gpu_wall_sec", 0.0) or 0.0)
         finally:
             if spill_flush_hooks is not None:
                 spill_flush_hooks.clear()
@@ -1692,13 +1996,6 @@ class VideoProcessor:
                     start_frame=window.start_frame,
                     end_frame=window.end_frame,
                 )
-                if manual_encode:
-                    frames_payload.extend(
-                        self._frames_payload_from_packets(
-                            window_packets,
-                            prompt_id_lookup,
-                        )
-                    )
 
         spill_flush_hooks: list[Callable[[], None]] = []
         if use_gpu_pipe:
@@ -1739,6 +2036,9 @@ class VideoProcessor:
                 batch_feeder.close()
                 if on_debug_log:
                     on_debug_log("GPU pipeline idle.")
+            self._stage_timing["decode_sec"] = float(
+                self._stage_timing.get("decode_sec", 0.0)
+            ) + float(getattr(prefetcher, "decode_sec", 0.0) or 0.0)
         else:
             window_num = 0
             try:
@@ -1785,6 +2085,7 @@ class VideoProcessor:
                                 metrics_path=emit_kwargs["metrics_path"],
                                 on_progress=emit_kwargs.get("on_progress"),
                                 gpu_monitor=emit_kwargs.get("gpu_monitor"),
+                    process_res_mon=emit_kwargs.get("process_res_mon"),
                                 phase="inference",
                                 write_metrics=False,
                                 current_frame=infer_done_ref[0],
@@ -1804,6 +2105,9 @@ class VideoProcessor:
                     window_num += 1
             finally:
                 prefetcher.close()
+            self._stage_timing["decode_sec"] = float(
+                self._stage_timing.get("decode_sec", 0.0)
+            ) + float(getattr(prefetcher, "decode_sec", 0.0) or 0.0)
 
         return instances_peak, frame_idx_ref[0]
 
@@ -1817,6 +2121,8 @@ class VideoProcessor:
         on_progress: Callable[[VideoProgress], None] | None = None,
         on_preview: Callable[[np.ndarray], None] | None = None,
         on_debug_log: Callable[[str], None] | None = None,
+        on_progress_tick: Callable[[int, int, str], None] | None = None,
+        progress_slot: Any = None,
         should_stop: Callable[[], bool] | None = None,
         should_pause: Callable[[], bool] | None = None,
     ) -> ProcessVideoResult:
@@ -1824,10 +2130,26 @@ class VideoProcessor:
         if not cap.isOpened():
             raise RuntimeError(f"Cannot open video: {input_path}")
 
+        # Soft reset: clear BoT-SORT IDs only. Do NOT tear down TRT predictor
+        # (hard reset after API warmup reloads .engine and ~2× slows Pass1).
         self.detect_engine.reset_session()
         self.tracker.reset()
         self.motion_tracker.reset()
         self.cross_check_violations_total = 0
+        self._helmet_verdict_history.clear()
+        self._on_debug_log = on_debug_log
+        # Lightweight (current, total, phase) — no VideoProgress; used by API jobs.
+        self._on_progress_tick = on_progress_tick
+        self._progress_slot = progress_slot
+        self._stage_timing = {
+            "decode_sec": 0.0,
+            "gpu_infer_sec": 0.0,
+            "cpu_finalize_sec": 0.0,
+        }
+        if on_debug_log and getattr(self.settings, "reid_debug_log", False):
+            on_debug_log(
+                "ReID debug: ON (new_id, id_switch, iou_recover, motion_iou, dup)"
+            )
 
         fps = float(cap.get(cv2.CAP_PROP_FPS) or 30.0)
         total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
@@ -1847,6 +2169,9 @@ class VideoProcessor:
         run_id = datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:8]
         out_dir = Path(output_dir) / run_id
         out_dir.mkdir(parents=True, exist_ok=True)
+        input_path = self._persist_source_in_run(input_path, out_dir, run_id)
+        if on_debug_log:
+            on_debug_log(f"Source persisted for encode: {Path(input_path).name}")
         json_path = out_dir / f"{run_id}_result.json"
         video_path = out_dir / f"{run_id}_annotated.mp4"
         report_path = out_dir / f"{run_id}_report.txt"
@@ -1856,11 +2181,16 @@ class VideoProcessor:
 
         gpu_monitor = GpuMonitor(interval_sec=0.5)
         gpu_monitor.start()
+        process_res_mon = ProcessResourceMonitor(interval_sec=0.5)
+        process_res_mon.start()
+        self._gpu_monitor = gpu_monitor
+        self._process_res_mon = process_res_mon
         if on_debug_log:
             if gpu_monitor.available:
-                on_debug_log("GPU monitor: NVML active")
+                on_debug_log("GPU monitor: NVML (util + whole-GPU VRAM for reference)")
             else:
                 on_debug_log("GPU monitor: NVML unavailable (install nvidia-ml-py)")
+            on_debug_log("Process monitor: this PID RSS + torch.cuda allocated/reserved")
 
         terms = prompt_terms(prompt)
         prompt_id_lookup = prompt_id_lookup_from_prompt(prompt)
@@ -1868,6 +2198,10 @@ class VideoProcessor:
 
         deferred_encode = self.settings.encode_mode.strip().casefold() in ("deferred", "manual")
         manual_encode = self.settings.encode_mode.strip().casefold() == "manual"
+        # Keep a stable copy in run_dir for manual/deferred MP4 build (API staging dir is deleted).
+        manifest_input_path = str(input_path)
+        if deferred_encode or manual_encode:
+            manifest_input_path = self._archive_run_source(input_path, out_dir, run_id)
         encode_parallel = self.settings.encode_mode.strip().casefold() == "parallel"
         use_async_writer = bool(
             self.settings.async_encode and encode_parallel and not deferred_encode
@@ -1876,14 +2210,34 @@ class VideoProcessor:
         sync_writer = None
         async_writer: AsyncVideoWriter | None = None
         if encode_parallel and not use_async_writer:
+            enc_codec, enc_params, enc_exe = build_encode_writer_args(
+                codec=getattr(self.settings, "encode_codec", "auto"),
+                preset=getattr(self.settings, "encode_preset", "fast"),
+                crf=int(getattr(self.settings, "encode_crf", 23)),
+            )
+            if enc_exe:
+                import os
+
+                os.environ["IMAGEIO_FFMPEG_EXE"] = str(enc_exe)
             sync_writer = imageio.get_writer(
                 str(video_path),
                 fps=fps,
-                codec="libx264",
-                ffmpeg_params=["-crf", "18", "-preset", "medium"],
+                codec=enc_codec,
+                ffmpeg_params=enc_params,
             )
         elif use_async_writer:
-            async_writer = AsyncVideoWriter(str(video_path), fps)
+            enc_codec, enc_params, enc_exe = build_encode_writer_args(
+                codec=getattr(self.settings, "encode_codec", "auto"),
+                preset=getattr(self.settings, "encode_preset", "fast"),
+                crf=int(getattr(self.settings, "encode_crf", 23)),
+            )
+            async_writer = AsyncVideoWriter(
+                str(video_path),
+                fps,
+                codec=enc_codec,
+                ffmpeg_params=enc_params,
+                ffmpeg_exe=enc_exe,
+            )
 
         def video_sink():
             if async_writer is not None:
@@ -1907,6 +2261,10 @@ class VideoProcessor:
         start_ts = time.perf_counter()
         frame_idx_ref = [0]
         infer_done_ref = [0]
+        elapsed_preload_sec = 0.0
+        elapsed_pass2_sec = 0.0
+        elapsed_finalize_sec = 0.0
+        finalize_start_ts: float | None = None
         infer_ms_by_frame: dict[int, float] = {}
         packet_meta: dict[int, FramePacket] = {}
 
@@ -1937,6 +2295,9 @@ class VideoProcessor:
                 f"(длинное видео, max {self.settings.max_job_batch_size or 200})"
             )
         self._job_batch_size = capped_batch
+        # Do NOT clamp job batch to settings.tensorrt_max_batch (engine *build* profile,
+        # often 32). UI infer_batch_size (e.g. 64) is the job size; YOLO/TRT already
+        # chunks forwards to the loaded engine's max batch (e.g. b8).
 
         baseline_rss = current_process_rss_gb(collect_gc=True)
         ram_plan: RamBudgetPlan | None = resolve_smart_ram_plan(
@@ -1958,14 +2319,10 @@ class VideoProcessor:
                 for line in ram_plan.summary_lines():
                     on_debug_log(line)
 
-        use_streaming = resolve_use_streaming(
-            self.settings,
-            source_frame_count=source_frame_count,
-            width=width,
-            height=height,
-            max_preload_ram_gb=preload_cap,
-        )
-        frame_source_mode = resolve_frame_source(
+        frame_source_requested = str(
+            getattr(self.settings, "frame_source_mode", "auto") or "auto"
+        ).casefold().strip()
+        frame_source_mode, frame_source_reason = resolve_frame_source_ex(
             self.settings,
             source_frame_count=source_frame_count,
             width=width,
@@ -1974,6 +2331,19 @@ class VideoProcessor:
         )
         use_windowed = frame_source_mode == "windowed"
         use_streaming = frame_source_mode == "stream"
+        if on_debug_log:
+            on_debug_log(
+                f"Frame source resolve: requested={frame_source_requested!r} → "
+                f"{frame_source_mode} ({frame_source_reason})"
+            )
+            if (
+                frame_source_requested == "preload"
+                and frame_source_mode != "preload"
+            ):
+                on_debug_log(
+                    "WARNING: explicit preload was demoted before decode — "
+                    "this should not happen (bug)"
+                )
         effective_window_frames = int(self.settings.window_frames)
         infer_per_window = 0
         window_align_info: dict[str, int | float | bool] = {}
@@ -2060,25 +2430,69 @@ class VideoProcessor:
             try:
                 if on_debug_log:
                     on_debug_log("Preloading video frames into RAM…")
+                preload_total = max(1, int(total) if total > 0 else source_frame_count)
+                self._pulse_infer_progress(
+                    current_frame=0,
+                    total=preload_total,
+                    instances_peak=instances_peak,
+                    start_ts=start_ts,
+                    on_progress=on_progress,
+                    gpu_monitor=gpu_monitor,
+                    process_res_mon=process_res_mon,
+                    phase="preload",
+                )
                 t_pre = time.perf_counter()
+
+                def _preload_progress(loaded: int, total_src: int) -> None:
+                    self._pulse_infer_progress(
+                        current_frame=loaded,
+                        total=max(1, total_src if total_src > 0 else preload_total),
+                        instances_peak=instances_peak,
+                        start_ts=start_ts,
+                        on_progress=on_progress,
+                        gpu_monitor=gpu_monitor,
+                    process_res_mon=process_res_mon,
+                        phase="preload",
+                    )
+
                 all_frames = load_all_frames(
                     cap,
                     total,
                     max_ram_gb=self.settings.max_preload_ram_gb,
                     width=width,
                     height=height,
+                    on_progress=_preload_progress if on_progress is not None else None,
+                    progress_every=max(16, frame_stride * 8),
                 )
                 source_frame_count = len(all_frames)
                 process_indices = source_frame_indices(source_frame_count, frame_stride)
                 n_process = len(process_indices)
+                elapsed_preload_sec = time.perf_counter() - t_pre
                 if on_debug_log:
-                    elapsed_pre = time.perf_counter() - t_pre
-                    on_debug_log(f"Preloaded {source_frame_count} frames in {elapsed_pre:.2f}s")
+                    on_debug_log(
+                        f"Preloaded {source_frame_count} frames in {elapsed_preload_sec:.2f}s"
+                    )
+                # Clear preload total so clients don't treat 439/439 as infer done.
+                self._pulse_infer_progress(
+                    current_frame=0,
+                    total=max(1, n_process),
+                    instances_peak=instances_peak,
+                    start_ts=start_ts,
+                    on_progress=on_progress,
+                    gpu_monitor=gpu_monitor,
+                    process_res_mon=process_res_mon,
+                    phase="start",
+                )
             except MemoryError as exc:
                 if on_debug_log:
-                    on_debug_log(f"Preload skipped: {exc}")
+                    on_debug_log(
+                        "WARNING: OOM during explicit/auto preload — falling back to "
+                        f"stream decode (requested={frame_source_requested!r}): {exc}"
+                    )
                 all_frames = None
                 use_streaming = True
+                frame_source_mode = "stream"
+                elapsed_preload_sec = 0.0
         elif on_debug_log and not use_streaming:
             on_debug_log(f"Preload mode: {source_frame_count} кадр в RAM")
         cap.release()
@@ -2118,6 +2532,7 @@ class VideoProcessor:
             on_preview=on_preview,
             on_debug_log=on_debug_log,
             gpu_monitor=gpu_monitor,
+            process_res_mon=process_res_mon,
         )
 
         def drain_post() -> None:
@@ -2129,6 +2544,9 @@ class VideoProcessor:
                 self._emit_post_results(flushed, **emit_kwargs)
 
         infer_start_ts = time.perf_counter()
+        emit_kwargs["infer_start_ts"] = infer_start_ts
+        infer_end_ts: float | None = None
+        spill_manifest_path: Path | None = None
         try:
             n_frames_total = source_frame_count
 
@@ -2140,7 +2558,9 @@ class VideoProcessor:
                     start_ts=start_ts,
                     on_progress=on_progress,
                     gpu_monitor=gpu_monitor,
+                    process_res_mon=process_res_mon,
                     phase="start",
+                    fps_start_ts=infer_start_ts,
                 )
                 assert packet_spill is not None
                 instances_peak, frame_idx = self._drive_windowed_pipeline(
@@ -2198,7 +2618,9 @@ class VideoProcessor:
                     start_ts=start_ts,
                     on_progress=on_progress,
                     gpu_monitor=gpu_monitor,
+                    process_res_mon=process_res_mon,
                     phase="start",
+                    fps_start_ts=infer_start_ts,
                 )
 
                 if use_gpu_pipe:
@@ -2258,6 +2680,7 @@ class VideoProcessor:
                                 metrics_path=metrics_path,
                                 on_progress=on_progress,
                                 gpu_monitor=gpu_monitor,
+                    process_res_mon=process_res_mon,
                                 phase="inference",
                                 write_metrics=False,
                                 current_frame=infer_done_ref[0],
@@ -2335,11 +2758,24 @@ class VideoProcessor:
                     frame_idx = processed_count
 
             if deferred_encode:
-                spill_manifest_path = None
+                if packet_spill is not None and deferred_packets:
+                    tail_start = int(deferred_packets[0].frame_idx)
+                    tail_end = int(deferred_packets[-1].frame_idx) + 1
+                    if on_debug_log:
+                        on_debug_log(
+                            f"Tail spill: {len(deferred_packets)} pkts "
+                            f"(frames {tail_start}..{tail_end})…"
+                        )
+                    packet_spill.write_chunk(
+                        deferred_packets,
+                        start_frame=tail_start,
+                        end_frame=tail_end,
+                    )
+                    deferred_packets.clear()
                 if packet_spill is not None and packet_spill.chunk_count > 0:
                     spill_manifest_path = packet_spill.finalize(
                         fps=fps,
-                        input_path=str(input_path),
+                        input_path=manifest_input_path,
                         prompt=prompt,
                         overlay=self._overlay_snapshot(),
                         width=width,
@@ -2348,7 +2784,9 @@ class VideoProcessor:
                         source_frame_count=source_frame_count,
                         window_frames=int(window_align_info.get("source_span", effective_window_frames)),
                     )
-                # Pass 2: offline tracklet link before packets save / MP4 / JSON.
+                # End-of-YOLO timestamp before Pass 2 (OSNet link must not inflate infer FPS).
+                infer_end_ts = time.perf_counter()
+                t_pass2 = time.perf_counter()
                 self._apply_offline_tracklet_link(
                     deferred_packets=deferred_packets,
                     frames_payload=frames_payload,
@@ -2357,6 +2795,8 @@ class VideoProcessor:
                     input_path=str(input_path),
                     on_debug_log=on_debug_log,
                 )
+                elapsed_pass2_sec += time.perf_counter() - t_pass2
+                finalize_start_ts = time.perf_counter()
                 if manual_encode:
                     if on_debug_log:
                         on_debug_log(
@@ -2377,7 +2817,7 @@ class VideoProcessor:
                             run_id=run_id,
                             packets=deferred_packets,
                             fps=fps,
-                            input_path=str(input_path),
+                            input_path=manifest_input_path,
                             prompt=prompt,
                             overlay=self._overlay_snapshot(),
                             width=width,
@@ -2411,7 +2851,7 @@ class VideoProcessor:
                             fps=fps,
                             prompt=prompt,
                             overlay=self._overlay_snapshot(),
-                            input_path=str(input_path),
+                            input_path=manifest_input_path,
                             width=width,
                             height=height,
                             frame_stride=frame_stride,
@@ -2425,6 +2865,11 @@ class VideoProcessor:
                 remaining = post_exec.finish()
                 self._emit_post_results(remaining, **emit_kwargs)
         finally:
+            proc_mon = getattr(self, "_process_res_mon", None)
+            if proc_mon is not None:
+                proc_mon.stop()
+            self._process_res_mon = None
+            self._gpu_monitor = None
             gpu_monitor.stop()
             if model_runner is not None:
                 model_runner.shutdown()
@@ -2436,15 +2881,17 @@ class VideoProcessor:
                 async_writer.close()
             elif sync_writer is not None:
                 sync_writer.close()
-            freed = release_gpu_memory()
-            if on_debug_log and freed.get("freed_mb", 0) > 0.1:
-                on_debug_log(
-                    f"GPU cache cleared: {freed['before_mb']:.0f}→{freed['after_mb']:.0f} MB "
-                    f"(−{freed['freed_mb']:.0f} MB)"
-                )
+            # Drop hot-path callbacks so a later API silent job cannot inherit UI ticks.
+            self._on_progress_tick = None
+            self._progress_slot = None
+            self._on_debug_log = None
+            # Skip empty_cache between jobs: synchronize+empty_cache regresses fps_infer
+            # across API repeats (warmup→main→repeat). Models stay loaded.
 
         elapsed_total = time.perf_counter() - start_ts
-        elapsed_infer = time.perf_counter() - infer_start_ts
+        if infer_end_ts is None:
+            infer_end_ts = time.perf_counter()
+        elapsed_infer = max(0.0, infer_end_ts - infer_start_ts)
         if source_frame_count <= 0:
             source_frame_count = max(
                 int(frame_idx_ref[0]),
@@ -2453,15 +2900,22 @@ class VideoProcessor:
             )
         if n_process <= 0 and source_frame_count > 0:
             n_process = len(deferred_packets) or int(frame_idx)
-        n_frames = max(1, frame_idx)
-        stride_info = frame_stride_summary(source_frame_count, frame_stride, frame_idx)
+        # Infer frames actually run (stride-aware). Do NOT use frame_idx (source span).
+        n_frames = max(
+            1,
+            int(infer_done_ref[0]),
+            len(deferred_packets),
+            int(n_process) if int(n_process) > 0 else 0,
+        )
+        stride_info = frame_stride_summary(source_frame_count, frame_stride, n_frames)
         video_duration_sec = source_frame_count / fps if fps > 0 else 0.0
         if on_debug_log and video_duration_sec > 0:
-            speed_ratio = elapsed_infer / video_duration_sec
+            speed_ratio = elapsed_infer / video_duration_sec if video_duration_sec > 0 else 0.0
             on_debug_log(
                 f"Speed: inference {elapsed_infer:.1f}s / video {video_duration_sec:.1f}s = {speed_ratio:.2f}× "
                 f"(total wall {elapsed_total:.1f}s"
-                f"{f', preload {elapsed_total - elapsed_infer:.1f}s' if elapsed_total - elapsed_infer > 0.3 else ''}) "
+                f"{f', preload {elapsed_preload_sec:.1f}s' if elapsed_preload_sec > 0.05 else ''}"
+                f"{f', Pass2 {elapsed_pass2_sec:.1f}s' if elapsed_pass2_sec > 0.05 else ''}) "
                 f"({'~1× OK' if speed_ratio <= 1.15 else 'цель ~1× — включи Realtime или yolo26s/m'})"
             )
         stats_summary = stats_summary_from_counters(
@@ -2474,6 +2928,30 @@ class VideoProcessor:
             avg_total_ms=total_ms_acc[0] / n_frames,
         )
         stats_summary.update(stride_info)
+        stats_summary["elapsed_preload_sec"] = round(elapsed_preload_sec, 3)
+        stats_summary["elapsed_infer_sec"] = round(elapsed_infer, 3)
+        stats_summary["elapsed_pass2_sec"] = round(elapsed_pass2_sec, 3)
+        stats_summary["fps_infer"] = round(
+            (n_frames / elapsed_infer) if elapsed_infer > 0 else 0.0, 3
+        )
+
+        # Parallel / streaming encode: remap JSON IDs (MP4 may keep Pass-1 labels).
+        if (
+            not deferred_encode
+            and bool(getattr(self.settings, "use_offline_tracklet_link", False))
+            and frames_payload
+        ):
+            t_pass2 = time.perf_counter()
+            self._apply_offline_tracklet_link(
+                deferred_packets=deferred_packets,
+                frames_payload=frames_payload,
+                spill_manifest_path=spill_manifest_path,
+                out_dir=out_dir,
+                input_path=str(input_path),
+                on_debug_log=on_debug_log,
+            )
+            elapsed_pass2_sec += time.perf_counter() - t_pass2
+            stats_summary["elapsed_pass2_sec"] = round(elapsed_pass2_sec, 3)
 
         if manual_encode and deferred_packets and not frames_payload:
             if on_debug_log:
@@ -2483,24 +2961,12 @@ class VideoProcessor:
                 prompt_id_lookup,
             )
 
-        # Parallel / streaming encode: remap JSON IDs (MP4 may keep Pass-1 labels).
-        if (
-            not deferred_encode
-            and bool(getattr(self.settings, "use_offline_tracklet_link", False))
-            and frames_payload
-        ):
-            self._apply_offline_tracklet_link(
-                deferred_packets=deferred_packets,
-                frames_payload=frames_payload,
-                spill_manifest_path=None,
-                out_dir=out_dir,
-                input_path=str(input_path),
-                on_debug_log=on_debug_log,
-            )
+        if finalize_start_ts is None:
+            finalize_start_ts = time.perf_counter()
 
         payload = build_result_payload(
             schema="yolo_drt_video_data_v1",
-            input_path=str(input_path),
+            input_path=manifest_input_path,
             prompt=prompt,
             fps=fps,
             width=width,
@@ -2533,7 +2999,28 @@ class VideoProcessor:
             run_id=run_id,
             stats_summary=stats_summary,
         )
-        json_path.write_text(video_data_json_dumps(payload), encoding="utf-8")
+        if spill_manifest_path is not None and not frames_payload:
+            from app.core.packet_spill import load_packets_manifest
+
+            manifest = load_packets_manifest(spill_manifest_path)
+            total_pkts = int(manifest.get("total_packets") or 0)
+            payload["packets_manifest"] = spill_manifest_path.name
+            payload["frames"] = []
+            payload["frames_in_spill"] = True
+            payload["total_packets"] = total_pkts
+            if on_debug_log:
+                on_debug_log(
+                    f"Writing result JSON (metadata, {total_pkts} frames in spill chunks)…"
+                )
+            write_result_json(json_path, payload)
+            if on_debug_log:
+                on_debug_log(f"Result JSON saved: {json_path.name}")
+        else:
+            if on_debug_log and frames_payload:
+                on_debug_log(f"Writing result JSON ({len(frames_payload)} frames)…")
+            write_result_json(json_path, payload)
+            if on_debug_log and frames_payload:
+                on_debug_log(f"Result JSON saved: {json_path.name}")
 
         memory_info = build_memory_report(
             width=width,
@@ -2604,7 +3091,6 @@ class VideoProcessor:
             report_lines.append(f"Packets: {pkl_path}")
         elif spill_manifest is not None:
             report_lines.append(f"Packets manifest: {spill_manifest}")
-        report_path.write_text("\n".join(report_lines), encoding="utf-8")
 
         gpu_samples = gpu_monitor.samples_to_dicts()
         if gpu_samples:
@@ -2613,7 +3099,88 @@ class VideoProcessor:
                 encoding="utf-8",
             )
         gpu_stats = gpu_monitor.summary()
+        process_memory_stats = process_res_mon.summary()
+        proc_samples_path = out_dir / f"{run_id}_process_memory_samples.json"
+        proc_samples = process_res_mon.samples_to_dicts()
+        if proc_samples:
+            proc_samples_path.write_text(
+                json.dumps(proc_samples, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        if process_memory_stats:
+            stats_summary["process_memory"] = process_memory_stats
+            report_lines.append(
+                "Process RAM (this app): "
+                f"peak {process_memory_stats['process_rss_peak_mb']:.0f} MB "
+                f"(+{process_memory_stats['process_rss_delta_peak_mb']:.0f} vs job start)"
+            )
+            report_lines.append(
+                "CUDA (this process, torch): "
+                f"alloc peak {process_memory_stats['cuda_allocated_peak_mb']:.0f} MB, "
+                f"reserved peak {process_memory_stats['cuda_reserved_peak_mb']:.0f} MB"
+            )
+        if gpu_stats:
+            peak_dev = float(
+                gpu_stats.get("peak_gpu_device_used_mb")
+                or gpu_stats.get("peak_mem_used_mb")
+                or 0.0
+            )
+            report_lines.append(
+                f"GPU VRAM total on device (NVML, all processes): peak {peak_dev:.0f} MB"
+            )
+            if process_memory_stats:
+                gpu_stats = {**gpu_stats, "process_memory": process_memory_stats}
+        report_path.write_text("\n".join(report_lines), encoding="utf-8")
+        if on_debug_log and process_memory_stats:
+            on_debug_log(
+                "Memory peaks (this process): "
+                f"RAM {process_memory_stats['process_rss_peak_mb']:.0f} MB, "
+                f"CUDA alloc {process_memory_stats['cuda_allocated_peak_mb']:.0f} MB "
+                f"(device total NVML peak "
+                f"{float((gpu_stats or {}).get('peak_gpu_device_used_mb') or 0):.0f} MB)"
+            )
         metrics_rows = read_metrics_jsonl(metrics_path)
+        elapsed_finalize_sec = max(
+            0.0,
+            time.perf_counter() - (finalize_start_ts or time.perf_counter()),
+        )
+        wall_now = time.perf_counter() - start_ts
+        accounted = elapsed_preload_sec + elapsed_infer + elapsed_pass2_sec
+        if elapsed_finalize_sec < 0.01:
+            elapsed_finalize_sec = max(0.0, wall_now - accounted)
+        stats_summary["elapsed_preload_sec"] = round(elapsed_preload_sec, 3)
+        stats_summary["elapsed_infer_sec"] = round(elapsed_infer, 3)
+        stats_summary["elapsed_pass2_sec"] = round(elapsed_pass2_sec, 3)
+        stats_summary["elapsed_finalize_sec"] = round(elapsed_finalize_sec, 3)
+        stats_summary["video_duration_sec"] = round(video_duration_sec, 3)
+        # Recompute with n_frames (processed), not source span — same as early assign.
+        stats_summary["fps_infer"] = round(
+            (n_frames / elapsed_infer) if elapsed_infer > 0 else 0.0, 3
+        )
+        # Pure stage timers (may overlap; sum can exceed elapsed_infer).
+        stats_summary["stage_decode_sec"] = round(
+            float(self._stage_timing.get("decode_sec", 0.0)), 3
+        )
+        stats_summary["stage_gpu_infer_sec"] = round(
+            float(self._stage_timing.get("gpu_infer_sec", 0.0)), 3
+        )
+        stats_summary["stage_cpu_finalize_sec"] = round(
+            float(self._stage_timing.get("cpu_finalize_sec", 0.0)), 3
+        )
+        stats_summary["stage_pass2_sec"] = round(elapsed_pass2_sec, 3)
+        if on_debug_log:
+            on_debug_log(
+                "Stages: "
+                f"decode={stats_summary['stage_decode_sec']:.3f}s "
+                f"gpu_wall={stats_summary['stage_gpu_infer_sec']:.3f}s "
+                f"cpu_finalize={stats_summary['stage_cpu_finalize_sec']:.3f}s "
+                f"pass2={stats_summary['stage_pass2_sec']:.3f}s "
+                f"| infer_wall={elapsed_infer:.3f}s"
+            )
+        payload["stats_summary"] = stats_summary
+        json_path.write_text(video_data_json_dumps(payload), encoding="utf-8")
+        if on_debug_log:
+            on_debug_log("Building run charts…")
         chart_paths = generate_run_charts(
             out_dir,
             run_id,
@@ -2638,6 +3205,8 @@ class VideoProcessor:
             "gpu_queue_depth": self.settings.gpu_queue_depth,
             "batch_prefetch_depth": resolve_batch_prefetch_depth(self.settings),
             "frame_source_mode": frame_source_mode,
+            "frame_source_requested": frame_source_requested,
+            "frame_source_reason": frame_source_reason,
             "windowed_decode": use_windowed,
             "window_frames": int(window_align_info.get("source_span", effective_window_frames))
             if use_windowed
@@ -2670,6 +3239,15 @@ class VideoProcessor:
             "frame_stride": frame_stride,
             "source_frame_count": source_frame_count,
             "processed_frame_count": stride_info["processed_frame_count"],
+            "elapsed_preload_sec": round(elapsed_preload_sec, 3),
+            "elapsed_infer_sec": round(elapsed_infer, 3),
+            "elapsed_pass2_sec": round(elapsed_pass2_sec, 3),
+            "elapsed_finalize_sec": round(elapsed_finalize_sec, 3),
+            "video_duration_sec": round(video_duration_sec, 3),
+            "stage_decode_sec": stats_summary["stage_decode_sec"],
+            "stage_gpu_infer_sec": stats_summary["stage_gpu_infer_sec"],
+            "stage_cpu_finalize_sec": stats_summary["stage_cpu_finalize_sec"],
+            "stage_pass2_sec": stats_summary["stage_pass2_sec"],
         }
         if ram_plan is not None:
             pipeline_info["smart_ram_baseline_gb"] = round(ram_plan.baseline_rss_gb, 2)
@@ -2680,7 +3258,7 @@ class VideoProcessor:
         record = build_run_record(
             run_id=run_id,
             out_dir=out_dir,
-            input_path=str(input_path),
+            input_path=manifest_input_path,
             prompt=prompt,
             frames=frame_idx,
             source_frames=source_frame_count,
@@ -2698,9 +3276,11 @@ class VideoProcessor:
         )
         summary_path.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
         append_run_record(Path(output_dir), record)
+        if on_debug_log:
+            on_debug_log("Run complete.")
 
         if has_video:
-            self._mux_audio_if_possible(input_path, video_path)
+            self._mux_audio_if_possible(manifest_input_path, video_path)
         fps_proc = frame_idx / elapsed_total if elapsed_total > 0 else 0.0
         return ProcessVideoResult(
             out_dir=str(out_dir.resolve()),
@@ -2713,6 +3293,22 @@ class VideoProcessor:
             video_path=str(video_path.resolve()) if has_video else None,
             has_video=has_video,
         )
+
+    @staticmethod
+    def _archive_run_source(src_path: str, out_dir: Path, run_id: str) -> str:
+        """Copy source video into run folder so deferred/manual encode survives API staging cleanup."""
+        src = Path(src_path)
+        if not src.is_file():
+            return str(src_path)
+        suffix = src.suffix if src.suffix else ".mp4"
+        dest = out_dir / f"{run_id}_source{suffix}"
+        try:
+            if dest.is_file() and dest.stat().st_size == src.stat().st_size:
+                return str(dest.resolve())
+            shutil.copy2(src, dest)
+            return str(dest.resolve())
+        except OSError:
+            return str(src_path)
 
     @staticmethod
     def _mux_audio_if_possible(src_video: str, video_only: Path) -> None:

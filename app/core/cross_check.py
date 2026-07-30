@@ -128,11 +128,18 @@ def evaluate_cross_check_batch(
     frame_w: int = 0,
     frame_h: int = 0,
     warn_text: str = "NO HELMET",
+    helmet_min_conf: float = 0.0,
 ) -> list[CrossCheckVerdict]:
+    """helmet_min_conf: ignore accessory detections below this score."""
+    filtered_acc = (
+        [a for a in accessories if float(a.conf) >= float(helmet_min_conf)]
+        if helmet_min_conf > 0
+        else accessories
+    )
     return [
         evaluate_head_helmet_cross(
             p,
-            accessories,
+            filtered_acc,
             kpt_conf=kpt_conf,
             min_intersection_px=min_intersection_px,
             min_iou=min_iou,
@@ -142,6 +149,52 @@ def evaluate_cross_check_batch(
         )
         for p in persons
     ]
+
+
+def smooth_helmet_verdicts(
+    stable_ids: np.ndarray,
+    verdicts: list[CrossCheckVerdict],
+    history: dict[int, list[bool]],
+    *,
+    min_violation_streak: int = 2,
+    history_len: int = 5,
+) -> list[CrossCheckVerdict]:
+    """
+    Temporal filter per stable_id: need consecutive NO HELMET frames before violation.
+    Helmet detected → OK immediately (no flicker «был в каске → без» на одном кадре).
+    """
+    from dataclasses import replace
+
+    min_streak = max(1, int(min_violation_streak))
+    max_hist = max(min_streak + 1, int(history_len))
+    out: list[CrossCheckVerdict] = []
+    for i, verdict in enumerate(verdicts):
+        raw_ok = bool(verdict.ok)
+        sid = int(stable_ids[i]) if i < len(stable_ids) else i
+        h = history.setdefault(sid, [])
+        h.append(raw_ok)
+        if len(h) > max_hist:
+            del h[: len(h) - max_hist]
+        if raw_ok:
+            smoothed_ok = True
+        else:
+            streak = 0
+            for ok in reversed(h):
+                if ok:
+                    break
+                streak += 1
+            smoothed_ok = streak < min_streak
+        if smoothed_ok == raw_ok:
+            out.append(verdict)
+        else:
+            out.append(
+                replace(
+                    verdict,
+                    ok=smoothed_ok,
+                    warning="" if smoothed_ok else verdict.warning,
+                )
+            )
+    return out
 
 
 @dataclass(slots=True)

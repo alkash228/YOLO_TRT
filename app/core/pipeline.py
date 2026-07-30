@@ -7,7 +7,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from app.config.settings import TRT_DIR, PipelineSettings
+from app.config.settings import PipelineSettings
 from app.core.batch_utils import effective_speed_tuning
 from app.core.detect_engine import DetectEngine
 from app.core.reid_engine import ReidEngine
@@ -33,8 +33,6 @@ def _trt_kwargs(settings: PipelineSettings) -> dict:
         tensorrt_imgsz=int(settings.tensorrt_imgsz or settings.infer_imgsz or 640),
         tensorrt_max_batch=int(settings.tensorrt_max_batch),
         tensorrt_fp16=bool(settings.tensorrt_fp16),
-        tensorrt_engine_strategy=str(settings.tensorrt_engine_strategy),
-        tensorrt_central_dir=Path(settings.models_dir) / "TRT" if settings.models_dir else TRT_DIR,
     )
 
 
@@ -91,9 +89,6 @@ def build_processor(
         on_log("TensorRT пропущен: выбран CPU")
 
     if use_trt:
-        from app.core.sam_memory_tracker import needs_osnet_embed
-
-        central = Path(settings.models_dir) / "TRT"
         ready = engines_ready(
             detect_pt=Path(settings.detect_model),
             cross_pt=Path(settings.cross_check_model) if settings.cross_check_model else None,
@@ -102,9 +97,6 @@ def build_processor(
             max_batch=int(settings.tensorrt_max_batch),
             fp16=bool(settings.tensorrt_fp16),
             need_cross=bool(settings.cross_check_enabled),
-            need_reid=needs_osnet_embed(settings),
-            strategy=str(settings.tensorrt_engine_strategy),
-            central_dir=central,
         )
         if on_log:
             on_log(
@@ -127,6 +119,14 @@ def build_processor(
         on_log(
             f"Detect TRT: {detect.model_path} (imgsz={detect.imgsz}, batch={detect.trt_max_batch})"
         )
+        resolved_b = int(getattr(detect, "trt_max_batch", 0) or 0)
+        wanted_b = int(settings.tensorrt_max_batch)
+        if resolved_b > 0 and resolved_b < wanted_b:
+            on_log(
+                f"WARNING: Detect TRT engine is b{resolved_b}, settings.tensorrt_max_batch={wanted_b}. "
+                f"Stale/undersized engine — press «Собрать TensorRT engines» for "
+                f"…_b{wanted_b}_fp16.engine"
+            )
     elif on_log and settings.use_tensorrt:
         on_log(f"Detect PyTorch: {detect.source_model_path}")
 
@@ -146,28 +146,26 @@ def build_processor(
     reid = None
     from app.core.sam_memory_tracker import needs_osnet_embed, uses_sam_identity
 
-    # Load OSNet only when classic ReID or SAM long re-entry needs embeds every frame.
-    # Offline Pass 2 loads OSNet temporarily when tracklet_link_use_reid=True.
-    if needs_osnet_embed(settings):
+    load_osnet = needs_osnet_embed(settings)
+    if load_osnet:
         reid = ReidEngine(
             settings.reid_model,
             device=device,
             use_amp=half,
             use_tensorrt=use_trt,
             tensorrt_fp16=bool(settings.tensorrt_fp16),
-            tensorrt_engine_strategy=str(settings.tensorrt_engine_strategy),
-            tensorrt_central_dir=Path(settings.models_dir) / "TRT",
         )
         if on_log and getattr(reid, "using_tensorrt", False):
-            on_log("ReID TRT: OSNet engine active")
+            on_log(
+                f"ReID TRT: {Path(reid.model_path).name} (batch={reid.trt_max_batch})"
+            )
         elif on_log and settings.use_tensorrt:
-            on_log("ReID PyTorch: .engine не найден")
+            on_log("ReID PyTorch: .engine не найден / TRT load failed (см. warning)")
     elif on_log and uses_sam_identity(settings):
         on_log(
             "Identity: SAM masklet memory "
             f"(backend={getattr(settings, 'sam_identity_backend', 'memory')}; OSNet skipped)"
         )
-
     cross = None
     if settings.cross_check_enabled and settings.cross_check_model is not None:
         p = Path(settings.cross_check_model)
@@ -186,3 +184,64 @@ def build_processor(
     if warmup:
         warmup_engines(detect, seg, reid)
     return VideoProcessor(detect, seg, reid, settings, cross_check_engine=cross)
+
+
+def sync_processor_for_run(processor: VideoProcessor, settings: PipelineSettings) -> None:
+    """Push current PipelineSettings onto a loaded processor (desktop Run / API job)."""
+    from app.core.sam_memory_tracker import build_identity_tracker
+
+    processor.settings = settings
+    processor.detect_engine.conf = settings.detect_conf
+    if processor.seg_engine is not None:
+        processor.seg_engine.conf = settings.seg_conf
+    processor.tracker = build_identity_tracker(settings)
+
+
+def _engine_weights_path(engine) -> Path | None:
+    if engine is None:
+        return None
+    src = getattr(engine, "source_model_path", None)
+    if src:
+        return Path(src).resolve()
+    return Path(engine.model_path).resolve()
+
+
+def processor_needs_rebuild(processor: VideoProcessor, settings: PipelineSettings) -> bool:
+    """True when model topology changed — need Init/bootstrap, not just sync."""
+    from app.core.sam_memory_tracker import needs_osnet_embed
+
+    if settings.use_seg != (processor.seg_engine is not None):
+        return True
+    want_osnet = needs_osnet_embed(settings)
+    if want_osnet != (processor.reid_engine is not None):
+        return True
+    if settings.cross_check_enabled != (processor.cross_check_engine is not None):
+        return True
+
+    det_w = _engine_weights_path(processor.detect_engine)
+    if det_w is None or det_w != Path(settings.detect_model).resolve():
+        return True
+
+    if settings.use_seg and processor.seg_engine is not None:
+        seg_w = _engine_weights_path(processor.seg_engine)
+        if seg_w is None or seg_w != Path(settings.seg_model).resolve():
+            return True
+
+    if want_osnet and processor.reid_engine is not None:
+        reid_w = _engine_weights_path(processor.reid_engine)
+        if reid_w is None or reid_w != Path(settings.reid_model).resolve():
+            return True
+
+    if settings.cross_check_enabled and settings.cross_check_model:
+        if processor.cross_check_engine is None:
+            return True
+        cross_w = _engine_weights_path(processor.cross_check_engine)
+        if cross_w is None or cross_w != Path(settings.cross_check_model).resolve():
+            return True
+
+    dev = str(getattr(settings, "inference_device", "cuda") or "cuda").casefold()
+    if dev == "cpu" and getattr(processor.detect_engine, "using_tensorrt", False):
+        return True
+    if settings.use_tensorrt != getattr(processor.detect_engine, "using_tensorrt", False):
+        return True
+    return False

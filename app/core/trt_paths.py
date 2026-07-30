@@ -49,6 +49,52 @@ def engine_root_for_model(
     return central_dir or TRT_DIR
 
 
+def find_yolo_engine(
+    pt_path: Path,
+    *,
+    imgsz: int,
+    max_batch: int,
+    fp16: bool,
+    trt_dir: Path | None = None,
+) -> Path:
+    """Exact name first; иначе manifest или ближайший batch ≤ запрошенного."""
+    root = trt_dir or TRT_DIR
+    exact = root / yolo_engine_name(pt_path.stem, imgsz, max_batch, fp16)
+    if exact.exists():
+        return exact
+
+    src = str(pt_path.resolve())
+    best: tuple[int, Path] | None = None
+    for rec in load_manifest(root):
+        try:
+            same_src = Path(rec.source).resolve() == Path(src)
+        except OSError:
+            same_src = str(rec.source) == src
+        if not same_src or int(rec.imgsz) != int(imgsz) or bool(rec.fp16) != bool(fp16):
+            continue
+        eng = Path(rec.engine)
+        if not eng.is_file():
+            eng = root / eng.name
+        if eng.is_file() and int(rec.max_batch) <= int(max_batch):
+            if best is None or int(rec.max_batch) > best[0]:
+                best = (int(rec.max_batch), eng)
+
+    prec = "fp16" if fp16 else "fp32"
+    pattern = f"{pt_path.stem}_i{imgsz}_b*_{prec}.engine"
+    for eng in root.glob(pattern):
+        try:
+            part = eng.stem.split("_b", 1)[1].split("_", 1)[0]
+            b = int(part)
+        except (IndexError, ValueError):
+            continue
+        if b <= int(max_batch) and (best is None or b > best[0]):
+            best = (b, eng)
+
+    if best is not None:
+        return best[1]
+    return exact
+
+
 def resolve_yolo_engine(
     pt_path: Path,
     *,
@@ -62,7 +108,12 @@ def resolve_yolo_engine(
     root = trt_dir or engine_root_for_model(
         pt_path, strategy=strategy, central_dir=central_dir
     )
-    return root / yolo_engine_name(pt_path.stem, imgsz, max_batch, fp16)
+    exact = root / yolo_engine_name(pt_path.stem, imgsz, max_batch, fp16)
+    if exact.exists():
+        return exact
+    return find_yolo_engine(
+        pt_path, imgsz=imgsz, max_batch=max_batch, fp16=fp16, trt_dir=root
+    )
 
 
 def resolve_reid_engine(

@@ -45,7 +45,39 @@ class FramePacket:
 
 
 def compact_packet_for_cache(packet: FramePacket) -> FramePacket:
-    """Убрать полноразмерные пиксели из RAM-кэша; MP4/JSON подгружают кадр с диска."""
+    """Убрать полноразмерные пиксели из RAM-кэша; MP4/JSON подгружают кадр с диска.
+
+    Idempotent: повторный compact не должен затирать уже готовые masks_rle
+    (иначе JSON/instances становятся пустыми после double-compact в GPU path).
+    """
+    # Already compacted — keep RLE/meta, only ensure BGR stub.
+    if packet.masks_rle is not None and packet.n_inst > 0:
+        if packet.frame_bgr is PACKET_STUB_BGR or (
+            isinstance(packet.frame_bgr, np.ndarray) and packet.frame_bgr.size <= 3
+        ):
+            return packet
+        return FramePacket(
+            frame_idx=packet.frame_idx,
+            frame_bgr=PACKET_STUB_BGR,
+            stack=np.zeros((0, 1, 1), dtype=np.uint8),
+            stable_ids=packet.stable_ids,
+            scores=packet.scores,
+            labels=list(packet.labels),
+            n_inst=packet.n_inst,
+            detect_ms=packet.detect_ms,
+            seg_ms=packet.seg_ms,
+            reid_ms=packet.reid_ms,
+            infer_ms=packet.infer_ms,
+            reid_recoveries=packet.reid_recoveries,
+            cross_ms=packet.cross_ms,
+            keypoints_list=list(packet.keypoints_list or []),
+            cross_check_verdicts=list(packet.cross_check_verdicts or []),
+            cross_check_accessories=list(packet.cross_check_accessories or []),
+            masks_rle=list(packet.masks_rle),
+            mask_hw=packet.mask_hw,
+            instance_meta=list(packet.instance_meta or []) if packet.instance_meta else None,
+        )
+
     masks_rle: list[dict] | None = None
     mask_hw: tuple[int, int] | None = None
     instance_meta: list[dict[str, object]] | None = None
@@ -154,15 +186,23 @@ def load_all_frames(
     max_ram_gb: float = 8.0,
     width: int = 0,
     height: int = 0,
+    on_progress: Callable[[int, int], None] | None = None,
+    progress_every: int = 16,
 ) -> list[np.ndarray]:
     """Decode entire video (or up to max_frames) into RAM."""
     frames: list[np.ndarray] = []
     limit = max_frames if max_frames > 0 else 10**9
+    total_hint = limit if max_frames > 0 else 0
+    every = max(1, int(progress_every))
     while len(frames) < limit:
         ok, frame = cap.read()
         if not ok:
             break
         frames.append(frame)
+        if on_progress is not None and (
+            len(frames) % every == 0 or (total_hint > 0 and len(frames) >= total_hint)
+        ):
+            on_progress(len(frames), total_hint if total_hint > 0 else len(frames))
         if width > 0 and height > 0 and len(frames) % 100 == 0:
             used = estimate_video_ram_gb(width, height, len(frames))
             if used > max_ram_gb:
@@ -170,6 +210,8 @@ def load_all_frames(
                     f"Video preload exceeds max_preload_ram_gb={max_ram_gb:.1f} "
                     f"(estimated {used:.2f} GB after {len(frames)} frames)"
                 )
+    if on_progress is not None and frames:
+        on_progress(len(frames), total_hint if total_hint > 0 else len(frames))
     return frames
 
 
@@ -213,9 +255,14 @@ class AsyncVideoWriter:
         *,
         codec: str = "libx264",
         ffmpeg_params: list[str] | None = None,
+        ffmpeg_exe: str | None = None,
         queue_size: int = 64,
     ) -> None:
         self._queue: queue.Queue[np.ndarray | None] = queue.Queue(maxsize=max(8, queue_size))
+        if ffmpeg_exe:
+            import os
+
+            os.environ["IMAGEIO_FFMPEG_EXE"] = str(ffmpeg_exe)
         self._writer = imageio.get_writer(
             path,
             fps=fps,

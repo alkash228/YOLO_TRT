@@ -1,7 +1,6 @@
 """Windowed video decode: bounded RAM preload with optional decode-ahead."""
 from __future__ import annotations
 
-import gc
 import queue
 import threading
 import time
@@ -115,7 +114,9 @@ class WindowPrefetcher:
         self._next_start = 0
         self._done = False
         self._error: BaseException | None = None
-        depth = max(1, int(windows_ahead) + 1)
+        self.decode_sec: float = 0.0
+        # +2: next window can sit in queue while GPU finishes the current one; room for _STOP.
+        depth = max(2, int(windows_ahead) + 2)
         self._q: queue.Queue[VideoWindow | object] = queue.Queue(maxsize=depth)
         self._thread = threading.Thread(
             target=self._run,
@@ -137,39 +138,36 @@ class WindowPrefetcher:
             raise self._error
 
     def _send_stop(self, *, force: bool = False) -> None:
-        """Ensure EOF sentinel is queued; never block forever on a full bounded queue."""
+        """Queue EOF sentinel; never discard decoded VideoWindow buffers."""
         if not force and self._done:
             return
-        deadline = time.monotonic() + 30.0
+        deadline = time.monotonic() + 120.0
         while time.monotonic() < deadline:
             try:
                 self._q.put(_STOP, timeout=0.05)
                 return
             except queue.Full:
-                try:
-                    self._q.get_nowait()
-                except queue.Empty:
-                    time.sleep(0.001)
-        try:
-            self._q.put_nowait(_STOP)
-        except queue.Full:
-            pass
+                # Consumer still busy on previous window — wait, do not drop queued windows.
+                time.sleep(0.01)
+        # _done is already True; next_window() treats empty queue as EOF.
 
     def next_window(self) -> VideoWindow | None:
         if self._error is not None:
             raise self._error
-        # Prefetcher finished but _STOP not yet visible — don't block the GPU loop forever.
-        if self._done:
+        while True:
             try:
-                item = self._q.get_nowait()
+                if self._done:
+                    item = self._q.get_nowait()
+                else:
+                    item = self._q.get(timeout=0.25)
             except queue.Empty:
+                if self._done:
+                    return None
+                continue
+            if item is _STOP:
                 return None
-        else:
-            item = self._q.get()
-        if item is _STOP:
-            return None
-        assert isinstance(item, VideoWindow)
-        return item
+            assert isinstance(item, VideoWindow)
+            return item
 
     def _run(self) -> None:
         try:
@@ -182,6 +180,7 @@ class WindowPrefetcher:
                         break
                 if self._total_frames > 0 and self._next_start >= self._total_frames:
                     break
+                t_dec = time.perf_counter()
                 window = load_video_window(
                     self._input_path,
                     self._next_start,
@@ -189,6 +188,7 @@ class WindowPrefetcher:
                     frame_stride=self._frame_stride,
                     total_frames=self._total_frames,
                 )
+                self.decode_sec += max(0.0, time.perf_counter() - t_dec)
                 if not window.frames_bgr:
                     break
                 self._q.put(window)
@@ -294,10 +294,11 @@ class WindowedBatchJobs(Iterator[FrameBatchJob]):
             )
 
     def _release_window(self) -> None:
+        # Do NOT gc.collect() here — mid-pipeline full GC stalls the GIL and
+        # doubles wall time when uvicorn/Jupyter also contend for it.
         if self._current_window is not None:
             self._current_window.frames_bgr.clear()
             self._current_window = None
-        gc.collect()
 
     def close(self) -> None:
         self._prefetcher.close()

@@ -566,6 +566,7 @@ def build_all_engines(
             continue
 
         _log(log, f">>> [{role}] старт: {src.name} -> {out.parent}")
+        _release_cuda(log)
 
         if role == "reid":
             for step in export_reid_engine(
@@ -598,6 +599,7 @@ def build_all_engines(
             else:
                 last = results[-1] if results else None
                 _log(log, f">>> [{role}] ОШИБКА: {last.message[:200] if last else 'unknown'}")
+            _release_cuda(log)
             continue
 
         r = export_yolo_engine(
@@ -629,6 +631,7 @@ def build_all_engines(
                     notes=src.name,
                 )
             )
+        _release_cuda(log)
 
     if records:
         save_manifest(records, manifest_dir)

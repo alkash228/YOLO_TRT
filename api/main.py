@@ -52,6 +52,8 @@ def _bootstrap() -> None:
     _settings = load_settings_from_env()
     _log(f"Models dir: {_settings.models_dir}")
     _log(f"Output dir: {_settings.output_dir}")
+    _log(f"Work dir: {_settings.work_dir}")
+    _log(f"Upload dir: {_settings.resolve_upload_dir()}")
 
     if not torch.cuda.is_available():
         _app_status = "gpu_missing"
@@ -130,7 +132,22 @@ app = FastAPI(title="YOLO_DRT API", version="1.0.0", lifespan=lifespan)
 
 
 def _job_to_out(job) -> JobOut:
-    prog_raw = job.progress or {}
+    if getattr(job, "bench_mode", False) and job.status == "running":
+        return JobOut(
+            job_id=job.job_id,
+            status=job.status,
+            progress=ProgressOut(phase=str(getattr(job, "prog_phase", None) or "inference")),
+            result=None,
+            created_at=job.created_at,
+            started_at=job.started_at,
+            finished_at=job.finished_at,
+        )
+    if job.status == "running" and hasattr(job, "materialize_progress"):
+        prog_raw = job.materialize_progress()
+    else:
+        prog_raw = job.progress or {}
+        if not prog_raw and hasattr(job, "materialize_progress"):
+            prog_raw = job.materialize_progress()
     progress = ProgressOut(
         current=int(prog_raw.get("current", 0)),
         total=int(prog_raw.get("total", 0)),
@@ -138,10 +155,15 @@ def _job_to_out(job) -> JobOut:
         eta_seconds=float(prog_raw.get("eta_seconds", 0.0)),
         elapsed_sec=float(prog_raw.get("elapsed_sec", 0.0)),
         gpu_mem_mb=float(prog_raw.get("gpu_mem_mb", 0.0)),
+        cuda_allocated_mb=float(prog_raw.get("cuda_allocated_mb", prog_raw.get("gpu_mem_mb", 0.0))),
+        cuda_reserved_mb=float(prog_raw.get("cuda_reserved_mb", 0.0)),
+        process_rss_mb=float(prog_raw.get("process_rss_mb", 0.0)),
+        gpu_device_used_mb=float(prog_raw.get("gpu_device_used_mb", 0.0)),
         gpu_util_pct=float(prog_raw.get("gpu_util_pct", 0.0)),
         instances_current=int(prog_raw.get("instances_current", 0)),
         instances_peak=int(prog_raw.get("instances_peak", 0)),
         percent=float(prog_raw.get("percent", 0.0)),
+        phase=str(prog_raw.get("phase") or "inference"),
     )
     result_out = None
     if job.result is not None or job.error:
@@ -181,6 +203,8 @@ def _health_paths() -> dict[str, str]:
     paths = {
         "models_dir": str(s.models_dir),
         "output_dir": str(s.output_dir),
+        "work_dir": str(s.work_dir),
+        "upload_dir": str(s.resolve_upload_dir()),
         "trt_strategy": strategy,
         "trt_central_dir": str(central),
         "detect_weights": str(det_pt),
@@ -193,6 +217,9 @@ def _health_paths() -> dict[str, str]:
         "tracklet_link_use_reid": str(bool(s.tracklet_link_use_reid)),
         "sam_osnet_reentry": str(bool(s.sam_osnet_reentry)),
         "cross_check_enabled": str(bool(s.cross_check_enabled)),
+        "use_tensorrt": str(bool(s.use_tensorrt)),
+        "realtime_mode": str(bool(s.realtime_mode)),
+        "encode_mode": str(s.encode_mode),
     }
     det_eng = resolve_yolo_engine(
         det_pt, imgsz=imgsz, max_batch=max_batch, fp16=fp16,
@@ -245,7 +272,7 @@ async def create_job_upload(
     if _settings is None:
         raise HTTPException(503, "Settings not loaded")
 
-    uploads = Path(_settings.output_dir) / "uploads"
+    uploads = _settings.resolve_upload_dir()
     uploads.mkdir(parents=True, exist_ok=True)
     suffix = Path(file.filename or "video.mp4").suffix or ".mp4"
     dest = uploads / f"{int(time.time())}_{uuid.uuid4().hex[:8]}{suffix}"
@@ -273,8 +300,31 @@ def create_job_path(body: JobCreatePathBody) -> JobCreateResponse:
         str(path.resolve()),
         prompt=body.prompt,
         max_duration_seconds=body.max_duration_seconds,
+        bench=bool(getattr(body, "bench", False)),
     )
     return JobCreateResponse(job_id=job.job_id, status=job.status)
+
+
+@app.post("/v1/jobs/sync", response_model=JobOut)
+def create_job_path_sync(body: JobCreatePathBody) -> JobOut:
+    """Block until done — no client poll loop (fair UI A/B / GIL isolation)."""
+    if _app_status not in ("ready", "building_engines"):
+        raise HTTPException(503, f"Service not ready: {_app_status}")
+    path = Path(body.path)
+    if not path.is_file():
+        raise HTTPException(400, f"Video not found: {body.path}")
+    job = job_manager.create_job(
+        str(path.resolve()),
+        prompt=body.prompt,
+        max_duration_seconds=body.max_duration_seconds,
+        bench=True,
+    )
+    done = job_manager.wait_job(job.job_id, timeout=7200.0)
+    if done is None:
+        raise HTTPException(500, "Job disappeared")
+    if done.status == "running":
+        raise HTTPException(504, "Job timed out")
+    return _job_to_out(done)
 
 
 @app.get("/v1/jobs/{job_id}", response_model=JobOut)

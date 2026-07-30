@@ -20,10 +20,33 @@ from app.core.seg_engine import SegEngine, SegItem
 _STOP = object()
 
 
+def _boost_thread_priority(thread: threading.Thread | None = None) -> None:
+    """Raise OS priority for GPU worker so uvicorn/poll threads steal less CPU time."""
+    del thread  # current-thread boost only
+    try:
+        import sys
+
+        if sys.platform != "win32":
+            return
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        # THREAD_PRIORITY_ABOVE_NORMAL = 1
+        kernel32.SetThreadPriority(kernel32.GetCurrentThread(), 1)
+    except Exception:
+        pass
+
+
 @dataclass(slots=True)
 class FrameBatchJob:
     frame_indices: list[int]
     frames_bgr: list[np.ndarray]
+    # Реальных infer-кадров (хвост job дополнен до batch_size чёрными pad для TRT).
+    real_count: int | None = None
+
+    @property
+    def infer_count(self) -> int:
+        return int(self.real_count) if self.real_count is not None else len(self.frame_indices)
 
 
 @dataclass(slots=True)
@@ -226,13 +249,77 @@ class ReidEmbedWorker:
             self._out_q.put(exc)
 
 
+def enrich_gpu_batch_reid(
+    result: GpuBatchResult,
+    frames_bgr: list[np.ndarray],
+    *,
+    reid_engine: ReidEngine,
+    settings: PipelineSettings,
+    terms: list[str],
+    on_log: Callable[[str], None] | None = None,
+) -> GpuBatchResult:
+    """ReID embed на GPU; tracker/post — отдельно (можно параллелить с YOLO N+1)."""
+    if on_log:
+        on_log(f"ReID prep {len(frames_bgr)} fr…")
+    prepared, all_crops, crop_map = prepare_batch_frames(
+        detections=result.detections,
+        segments=result.segments,
+        cross_detections=result.cross_detections,
+        frames_bgr=frames_bgr,
+        terms=list(terms),
+        settings=settings,
+        motion_tracker=None,
+        use_motion_tracker=False,
+    )
+    reid_embeddings: np.ndarray | None = None
+    reid_ms = 0.0
+    if all_crops:
+        if on_log:
+            on_log(f"ReID embed {len(all_crops)} crops…")
+        t0 = time.perf_counter()
+        trt_cap = reid_engine.trt_max_batch if getattr(reid_engine, "using_tensorrt", False) else 0
+        chunk = resolve_reid_embed_chunk(
+            settings.reid_embed_chunk,
+            len(all_crops),
+            trt_max_batch=trt_cap,
+        )
+        if chunk <= 0:
+            reid_embeddings = reid_engine.embed_batch(all_crops)
+        else:
+            emb_parts: list[np.ndarray] = []
+            for i in range(0, len(all_crops), chunk):
+                emb_parts.append(reid_engine.embed_batch(all_crops[i : i + chunk]))
+            reid_embeddings = (
+                np.concatenate(emb_parts, axis=0)
+                if emb_parts
+                else np.zeros((0, 512), dtype=np.float32)
+            )
+        reid_ms = (time.perf_counter() - t0) * 1000.0
+        if on_log:
+            on_log(f"ReID embed done {reid_ms:.0f}ms")
+    return GpuBatchResult(
+        frame_indices=list(result.frame_indices),
+        detections=result.detections,
+        segments=result.segments,
+        cross_detections=result.cross_detections,
+        detect_ms=result.detect_ms,
+        seg_ms=result.seg_ms,
+        cross_ms=result.cross_ms,
+        prepared_frames=prepared,
+        reid_embeddings=reid_embeddings,
+        reid_crop_map=crop_map if all_crops else None,
+        reid_ms=reid_ms,
+    )
+
+
 def chunk_frame_jobs(
     frames: list[np.ndarray],
     *,
     batch_size: int,
     frame_indices: list[int] | None = None,
+    pad_last_job: bool = True,
 ) -> list[FrameBatchJob]:
-    """Split frames into inference batches; frame_indices = source video indices."""
+    """Split frames into inference batches; pad tail job to batch_size for fixed TRT batch."""
     bs = max(1, int(batch_size))
     if frame_indices is None:
         frame_indices = list(range(len(frames)))
@@ -240,9 +327,23 @@ def chunk_frame_jobs(
         raise ValueError("frames and frame_indices length mismatch")
     jobs: list[FrameBatchJob] = []
     for start in range(0, len(frames), bs):
-        chunk = frames[start : start + bs]
-        indices = frame_indices[start : start + len(chunk)]
-        jobs.append(FrameBatchJob(frame_indices=indices, frames_bgr=chunk))
+        chunk = list(frames[start : start + bs])
+        indices = list(frame_indices[start : start + len(chunk)])
+        real_n = len(chunk)
+        is_last = start + real_n >= len(frames)
+        if pad_last_job and is_last and real_n < bs:
+            # Repeat last real frame — black pads corrupt BoT-SORT if track ever sees them.
+            pad_frame = chunk[-1]
+            while len(chunk) < bs:
+                chunk.append(pad_frame.copy())
+                indices.append(-1)
+        jobs.append(
+            FrameBatchJob(
+                frame_indices=indices,
+                frames_bgr=chunk,
+                real_count=real_n,
+            )
+        )
     return jobs
 
 
@@ -451,14 +552,17 @@ class GpuInferWorker:
         seg_engine: SegEngine | None,
         cross_engine: DetectEngine | None,
         settings: PipelineSettings,
+        *,
+        on_batch_log: Callable[[str], None] | None = None,
     ) -> None:
         self._detect = detect_engine
         self._seg = seg_engine
         self._cross = cross_engine
         self._settings = settings
+        self._on_batch_log = on_batch_log
         self._use_seg = bool(settings.use_seg and seg_engine is not None)
         self._use_cross = bool(settings.cross_check_enabled and cross_engine is not None)
-        # Stable identity (SAM or OSNet) needs BoT-SORT track; predict_batch alone jumps IDs.
+        # ReID / SAM identity нужен BoT-SORT (track persist); predict_batch + MotionTracker даёт скачки ID.
         from app.core.sam_memory_tracker import uses_stable_identity
 
         if uses_stable_identity(settings):
@@ -472,6 +576,8 @@ class GpuInferWorker:
         self._out_q: queue.Queue[GpuBatchResult | BaseException] = queue.Queue()
         self._error: BaseException | None = None
         self._thread = threading.Thread(target=self._loop, name="yolo-drt-gpu", daemon=True)
+        # Wall-clock sum of detect+seg+cross inside this worker (includes GIL waits).
+        self.gpu_wall_sec: float = 0.0
 
     def start(self) -> None:
         self._thread.start()
@@ -497,13 +603,18 @@ class GpuInferWorker:
             raise self._error
 
     def _loop(self) -> None:
+        _boost_thread_priority()
         try:
             while True:
                 job = self._in_q.get()
                 if job is _STOP:
                     break
                 assert isinstance(job, FrameBatchJob)
+                # No torch.cuda.synchronize() here — YOLO/TRT already flush results.
+                # Extra sync serialized GPU vs CPU finalize and regressed API vs first Docker.
+                t0 = time.perf_counter()
                 result = self._infer_batch(job)
+                self.gpu_wall_sec += max(0.0, time.perf_counter() - t0)
                 self._out_q.put(result)
         except BaseException as exc:
             self._error = exc
@@ -527,6 +638,31 @@ class GpuInferWorker:
                 reid_ms=0.0,
             )
 
+        idx_lo = job.frame_indices[0] if job.frame_indices else -1
+        real_n = job.infer_count
+        idx_hi = (
+            job.frame_indices[real_n - 1]
+            if real_n > 0 and job.frame_indices
+            else idx_lo
+        )
+        trt_cap = max(1, int(getattr(self._detect, "trt_max_batch", 0) or 0))
+        padded_job = (
+            job.real_count is not None and len(frames) > int(job.real_count)
+        )
+        if padded_job and self._on_batch_log is not None:
+            self._on_batch_log(
+                f"GPU job {job.infer_count}→{n} fr [{idx_lo}..{idx_hi}] "
+                f"(pad tail to job batch, TRT b{trt_cap})"
+            )
+        partial_trt = trt_cap > 0 and (n % trt_cap) != 0
+        if partial_trt and self._on_batch_log is not None:
+            n_full = n // trt_cap
+            n_single = n % trt_cap
+            self._on_batch_log(
+                f"GPU job {n} fr [{idx_lo}..{idx_hi}]: "
+                f"{n_full}×TRT b{trt_cap} batched + {n_single} fr black-pad tail"
+            )
+
         t_det = time.perf_counter()
         max_batch = gpu_predict_chunk_size(
             n,
@@ -535,20 +671,21 @@ class GpuInferWorker:
         )
         if self._detect_use_track:
             t_det = time.perf_counter()
+            frames_track = frames[:real_n]
             if getattr(self._detect, "using_tensorrt", False):
-                detections = self._detect.track_batch(frames)
+                detections = self._detect.track_batch(frames_track)
             else:
                 detections = []
-                for frame in frames:
+                for frame in frames_track:
                     detections.append(self._detect.track(frame))
             detect_ms = (time.perf_counter() - t_det) * 1000.0
         else:
-            trt_cap = (
+            trt_detect_cap = (
                 self._detect.trt_max_batch
                 if getattr(self._detect, "using_tensorrt", False)
                 else max_batch
             )
-            detections = self._detect.predict_batch(frames, max_batch=trt_cap or max_batch)
+            detections = self._detect.predict_batch(frames, max_batch=trt_detect_cap or max_batch)
             detect_ms = (time.perf_counter() - t_det) * 1000.0
 
         segments: list[list[SegItem]] = [[] for _ in range(n)]
@@ -577,14 +714,25 @@ class GpuInferWorker:
                 if getattr(self._cross, "using_tensorrt", False)
                 else max_batch
             )
-            cross_detections = self._cross.predict_batch(frames, max_batch=cross_cap or max_batch)
+            # Skip TRT pad tails — they burn helmet-model time for nothing.
+            cross_frames = frames[:real_n] if real_n > 0 else frames
+            cross_detections = self._cross.predict_batch(
+                cross_frames, max_batch=cross_cap or max_batch
+            )
             cross_ms = (time.perf_counter() - t_cross) * 1000.0
 
+        if partial_trt and self._on_batch_log is not None:
+            self._on_batch_log(
+                f"GPU job [{idx_lo}..{idx_hi}]: done "
+                f"(track {detect_ms:.0f}ms seg {seg_ms:.0f}ms cross {cross_ms:.0f}ms)"
+            )
+
+        real_n = job.infer_count
         return GpuBatchResult(
-            frame_indices=list(job.frame_indices),
-            detections=detections,
-            segments=segments,
-            cross_detections=cross_detections,
+            frame_indices=list(job.frame_indices[:real_n]),
+            detections=detections[:real_n],
+            segments=segments[:real_n],
+            cross_detections=cross_detections[:real_n],
             detect_ms=detect_ms,
             seg_ms=seg_ms,
             cross_ms=cross_ms,

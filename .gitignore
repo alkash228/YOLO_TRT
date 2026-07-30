@@ -10,3 +10,11 @@ models/**/*.pt
 models/**/*.pth
 models/**/*.engine
 models/**/*.onnx
+WEB_app/
+notebooks/.ipynb_checkpoints/
+notebooks/anaconda_projects/
+notebooks/_nb_extract.txt
+videos/*
+!videos/.gitkeep
+notebooks/benchmark_results/*
+!notebooks/benchmark_results/.gitkeep

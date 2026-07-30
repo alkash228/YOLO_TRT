@@ -1,8 +1,10 @@
 """Encode annotated MP4 from saved FramePackets (manual / on-demand)."""
 from __future__ import annotations
 
+import os
 import pickle
 import queue
+import subprocess
 import threading
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -11,41 +13,28 @@ from pathlib import Path
 from typing import Any
 
 import cv2
-import imageio
 import numpy as np
 
+from app.core.ffmpeg_utils import (
+    build_encode_writer_args,
+    decode_vf_filter,
+    describe_encode_plan,
+    format_encode_plan,
+    list_hwaccel_decode_profiles,
+    resolve_ffmpeg_exe,
+)
 from app.core.frame_pipeline import AsyncVideoWriter, FramePacket, materialize_packet_for_render, post_process_frame
 from app.core.schema import prompt_id_lookup_from_prompt
 
 
 PACKETS_SUFFIX = "_packets.pkl"
 _PLACEHOLDER_MAX = 2  # legacy packets stored 1×1 stub frames
-_NVENC_PRESET = {
-    "ultrafast": "p1",
-    "superfast": "p2",
-    "veryfast": "p3",
-    "faster": "p4",
-    "fast": "p4",
-    "medium": "p5",
-    "slow": "p6",
-}
 
 
-def resolve_encode_codec(requested: str = "auto") -> str:
-    req = (requested or "auto").strip().lower()
-    if req in ("h264_nvenc", "nvenc"):
-        return "h264_nvenc"
-    if req == "libx264":
-        return "libx264"
-    try:
-        from imageio_ffmpeg._io import ffmpeg_test_encoder, get_compiled_h264_encoders
+def resolve_encode_codec(requested: str = "auto", *, ffmpeg_exe: str | None = None) -> str:
+    from app.core.ffmpeg_utils import resolve_encode_codec as _resolve
 
-        encoders = get_compiled_h264_encoders()
-        if "h264_nvenc" in encoders and ffmpeg_test_encoder("h264_nvenc"):
-            return "h264_nvenc"
-    except Exception:
-        pass
-    return "libx264"
+    return _resolve(requested, ffmpeg_exe=ffmpeg_exe)
 
 
 def build_encode_writer_args(
@@ -53,12 +42,11 @@ def build_encode_writer_args(
     codec: str = "auto",
     preset: str = "fast",
     crf: int = 23,
-) -> tuple[str, list[str]]:
-    resolved = resolve_encode_codec(codec)
-    if resolved == "h264_nvenc":
-        nv_preset = _NVENC_PRESET.get(preset.strip().lower(), "p4")
-        return resolved, ["-preset", nv_preset, "-rc", "vbr", "-cq", str(int(crf)), "-b:v", "0"]
-    return "libx264", ["-crf", str(int(crf)), "-preset", preset]
+    ffmpeg_exe: str | None = None,
+) -> tuple[str, list[str], str]:
+    from app.core.ffmpeg_utils import build_encode_writer_args as _build
+
+    return _build(codec=codec, preset=preset, crf=crf, ffmpeg_exe=ffmpeg_exe)
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,17 +56,164 @@ class _EncodeJob:
     frame_bgr: np.ndarray | None
 
 
+class _FfmpegHwVideoReader:
+    """Decode source video via ffmpeg with GPU hwaccel when available."""
+
+    def __init__(
+        self,
+        path: str,
+        *,
+        width: int,
+        height: int,
+        prefetch: int = 24,
+        ffmpeg_exe: str | None = None,
+        use_hwaccel: bool = True,
+        hw_name: str = "",
+        hw_args: list[str] | None = None,
+    ) -> None:
+        self._width = int(width)
+        self._height = int(height)
+        self._frame_bytes = self._width * self._height * 3
+        exe = ffmpeg_exe or resolve_ffmpeg_exe()
+        if use_hwaccel and hw_args is None:
+            profiles = list_hwaccel_decode_profiles(self._width, self._height, ffmpeg_exe=exe)
+            if not profiles:
+                raise OSError("No working ffmpeg hwaccel profile for bgr24 decode")
+            self._hw_name, hw_args = profiles[0]
+        else:
+            self._hw_name = hw_name or "cpu"
+            hw_args = list(hw_args or [])
+        vf = decode_vf_filter(self._hw_name, self._width, self._height, hw_args=hw_args)
+        from app.core.ffmpeg_utils import _popen_kwargs as popen_kwargs
+
+        cmd = [
+            exe,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            *hw_args,
+            "-i",
+            str(path),
+            "-an",
+            "-sn",
+            "-vf",
+            vf,
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "bgr24",
+            "pipe:1",
+        ]
+        self._proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            **popen_kwargs(),
+        )
+        self._q: queue.Queue[np.ndarray | None] = queue.Queue(maxsize=max(4, prefetch))
+        self._done = False
+        self._err: Exception | None = None
+        self._hold_first: np.ndarray | None = None
+        self._thread = threading.Thread(target=self._loop, name="yolo-drt-decode", daemon=True)
+        self._thread.start()
+
+    def _loop(self) -> None:
+        assert self._proc.stdout is not None
+        try:
+            while True:
+                raw = self._proc.stdout.read(self._frame_bytes)
+                if not raw or len(raw) < self._frame_bytes:
+                    self._q.put(None)
+                    break
+                frame = np.frombuffer(raw, dtype=np.uint8).reshape(self._height, self._width, 3)
+                self._q.put(frame.copy())
+        except Exception as exc:
+            self._err = exc
+            self._q.put(None)
+        finally:
+            if self._proc.poll() is None:
+                self._proc.terminate()
+            err = (self._proc.stderr.read() if self._proc.stderr else b"").decode(errors="replace").strip()
+            rc = self._proc.wait(timeout=30)
+            if rc != 0 and self._err is None:
+                self._err = RuntimeError(err or f"ffmpeg decode exit {rc}")
+
+    def read(self) -> np.ndarray | None:
+        if self._err is not None:
+            raise self._err
+        if self._hold_first is not None:
+            frame = self._hold_first
+            self._hold_first = None
+            return frame
+        frame = self._q.get()
+        if frame is None:
+            self._done = True
+        return frame
+
+    def close(self, *, raise_on_error: bool = True) -> None:
+        self._thread.join(timeout=120.0)
+        if raise_on_error and self._err is not None:
+            raise self._err
+
+
+def _open_decode_reader(
+    path: str,
+    *,
+    width: int,
+    height: int,
+    prefetch: int,
+    ffmpeg_exe: str,
+    on_log: Callable[[str], None] | None = None,
+) -> _FfmpegHwVideoReader | _PrefetchedVideoReader | None:
+    profiles = list_hwaccel_decode_profiles(width, height, ffmpeg_exe=ffmpeg_exe)
+    last_err: Exception | None = None
+    for name, hw_args in profiles:
+        reader: _FfmpegHwVideoReader | None = None
+        try:
+            reader = _FfmpegHwVideoReader(
+                path,
+                width=width,
+                height=height,
+                prefetch=prefetch,
+                ffmpeg_exe=ffmpeg_exe,
+                hw_name=name,
+                hw_args=hw_args,
+            )
+            frame = reader.read()
+            if frame is not None and reader._err is None:
+                reader._hold_first = frame
+                if on_log:
+                    on_log(f"Decode: ffmpeg {name}")
+                return reader
+        except (OSError, RuntimeError) as exc:
+            last_err = exc
+        if reader is not None:
+            try:
+                reader.close(raise_on_error=False)
+            except Exception:
+                pass
+    try:
+        reader = _PrefetchedVideoReader(path, prefetch=prefetch)
+        if on_log:
+            on_log("Decode: OpenCV (CPU fallback)")
+        return reader
+    except OSError as exc:
+        last_err = exc
+    if last_err is not None:
+        raise last_err
+    return None
+
+
 class _PrefetchedVideoReader:
-    """Decode ahead of overlay render (sequential cv2.read in a thread)."""
+    """CPU fallback decode (OpenCV) when ffmpeg hwaccel fails."""
 
     def __init__(self, path: str, *, prefetch: int = 24) -> None:
         self._cap = cv2.VideoCapture(str(path))
         if not self._cap.isOpened():
             raise OSError(f"Cannot open video: {path}")
         self._q: queue.Queue[np.ndarray | None] = queue.Queue(maxsize=max(4, prefetch))
-        self._done = False
         self._err: Exception | None = None
-        self._thread = threading.Thread(target=self._loop, name="yolo-drt-decode", daemon=True)
+        self._thread = threading.Thread(target=self._loop, name="yolo-drt-decode-cv2", daemon=True)
         self._thread.start()
 
     def _loop(self) -> None:
@@ -98,10 +233,7 @@ class _PrefetchedVideoReader:
     def read(self) -> np.ndarray | None:
         if self._err is not None:
             raise self._err
-        frame = self._q.get()
-        if frame is None:
-            self._done = True
-        return frame
+        return self._q.get()
 
     def close(self) -> None:
         self._thread.join(timeout=120.0)
@@ -246,10 +378,29 @@ def _packet_frame_bgr(
     if frame_bgr is not None and frame_bgr.size > 0:
         return frame_bgr
     if fb is not None and fb.size > 0:
+        if fb.shape[0] <= _PLACEHOLDER_MAX and fb.shape[1] <= _PLACEHOLDER_MAX:
+            raise ValueError(
+                f"Frame {packet.frame_idx}: no source video pixels "
+                "(input_path missing or deleted; re-run inference or restore source copy)"
+            )
         return fb
     raise ValueError(
         f"Frame {packet.frame_idx}: no image data (check input video path in run manifest)"
     )
+
+
+def _resolve_encode_input_path(input_path: str | None, run_dir: Path) -> str | None:
+    """Use manifest path when present; fall back to persisted {run_id}_source.* in run folder."""
+    if input_path:
+        path = Path(input_path)
+        if path.is_file():
+            return str(path.resolve())
+    run_dir = Path(run_dir)
+    for pattern in ("*_source.mp4", "*_source.mkv", "*_source.mov", "*_source.webm"):
+        matches = sorted(run_dir.glob(pattern), key=lambda p: p.stat().st_mtime, reverse=True)
+        if matches:
+            return str(matches[0].resolve())
+    return str(input_path) if input_path else None
 
 
 def _resolve_target_size(
@@ -344,11 +495,14 @@ def _encode_timeline_streaming(
     width: int,
     height: int,
     source_frame_count: int,
+    frame_stride: int = 1,
     post_workers: int = 6,
     encode_preset: str = "fast",
     encode_crf: int = 23,
     encode_codec: str = "auto",
     on_progress: Callable[[int, int], None] | None = None,
+    on_log: Callable[[str], None] | None = None,
+    encode_src_indices: set[int] | None = None,
 ) -> Path:
     if source_frame_count <= 0:
         raise ValueError("source_frame_count required for streaming encode")
@@ -358,6 +512,7 @@ def _encode_timeline_streaming(
     target_w, target_h = _resolve_target_size(width=width, height=height, input_path=input_path)
     prompt_lookup = prompt_id_lookup_from_prompt(prompt)
     n_src = int(source_frame_count)
+    encode_total = len(encode_src_indices) if encode_src_indices else n_src
     workers = max(1, int(post_workers))
     render_ctx = _RenderContext(
         target_w=target_w,
@@ -365,34 +520,61 @@ def _encode_timeline_streaming(
         prompt_lookup=prompt_lookup,
         overlay=overlay,
     )
-    codec, ffmpeg_params = build_encode_writer_args(
+    codec, ffmpeg_params, ffmpeg_exe = build_encode_writer_args(
         codec=encode_codec,
         preset=encode_preset,
         crf=encode_crf,
     )
+    if on_log:
+        plan = describe_encode_plan(
+            codec=encode_codec,
+            preset=encode_preset,
+            crf=encode_crf,
+            width=target_w,
+            height=target_h,
+        )
+        on_log(format_encode_plan(plan))
     writer = AsyncVideoWriter(
         str(video_path),
         float(fps),
         codec=codec,
         ffmpeg_params=ffmpeg_params,
+        ffmpeg_exe=ffmpeg_exe,
         queue_size=max(32, workers * 4),
     )
     executor = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="yolo-drt-encode-render")
 
-    reader: _PrefetchedVideoReader | None = None
+    reader: _FfmpegHwVideoReader | _PrefetchedVideoReader | None = None
     cap: cv2.VideoCapture | None = None
-    if input_path and Path(input_path).exists():
+    resolved_input = _resolve_encode_input_path(input_path, video_path.parent)
+    if resolved_input and Path(resolved_input).exists():
         try:
-            reader = _PrefetchedVideoReader(str(input_path), prefetch=max(16, workers * 3))
-        except OSError:
-            cap = cv2.VideoCapture(str(input_path))
+            reader = _open_decode_reader(
+                str(resolved_input),
+                width=target_w,
+                height=target_h,
+                prefetch=max(16, workers * 3),
+                ffmpeg_exe=ffmpeg_exe,
+                on_log=on_log,
+            )
+        except (OSError, RuntimeError):
+            cap = cv2.VideoCapture(str(resolved_input))
             if not cap.isOpened():
                 cap = None
+                if on_log:
+                    on_log("Decode: none (packets only)")
+            elif on_log:
+                on_log("Decode: OpenCV (sync)")
+    elif on_log and input_path:
+        on_log(f"Decode: source missing ({input_path})")
 
     carry: FramePacket | None = None
+    stride = max(1, int(frame_stride))
+    clip_mode = encode_src_indices is not None
     pending: dict[int, Future[tuple[int, np.ndarray]]] = {}
-    next_write: int | None = None
+    next_write: int | None = 0 if clip_mode else None
     written = 0
+    out_seq = 0
     max_inflight = max(8, workers * 3)
 
     def _read_frame_bgr() -> np.ndarray | None:
@@ -413,7 +595,7 @@ def _encode_timeline_streaming(
             written += 1
             next_write += 1
             if on_progress is not None:
-                on_progress(written, n_src)
+                on_progress(written, encode_total)
 
     try:
         for src_i in range(n_src):
@@ -421,18 +603,32 @@ def _encode_timeline_streaming(
             if frame_bgr is None and (reader is not None or cap is not None):
                 break
 
-            keyframe = lookup.keyframe_at(src_i)
-            if keyframe is not None:
-                carry = keyframe
-            if carry is None:
+            if encode_src_indices is not None and src_i not in encode_src_indices:
                 continue
 
+            if clip_mode:
+                keyframe = lookup.keyframe_at(src_i)
+                if keyframe is None:
+                    continue
+                carry = keyframe
+            else:
+                keyframe = lookup.keyframe_at(src_i)
+                if keyframe is not None:
+                    carry = keyframe
+                elif carry is not None and (int(src_i) - int(carry.frame_idx)) >= stride:
+                    carry = None
+                if carry is None:
+                    continue
+
+            seq = out_seq if clip_mode else src_i
+            if clip_mode:
+                out_seq += 1
             if next_write is None:
-                next_write = src_i
+                next_write = seq
 
             fb_copy = frame_bgr.copy() if frame_bgr is not None else None
             job = _EncodeJob(src_i=src_i, carry=replace(carry), frame_bgr=fb_copy)
-            pending[src_i] = executor.submit(_render_encode_job, job, render_ctx)
+            pending[seq] = executor.submit(_render_encode_job, job, render_ctx)
 
             _flush_ready(block=False)
             while len(pending) >= max_inflight:
@@ -474,8 +670,8 @@ def encode_packets_to_video(
     frame_stride: int = 1,
     source_frame_count: int = 0,
     on_progress: Callable[[int, int], None] | None = None,
+    on_log: Callable[[str], None] | None = None,
 ) -> Path:
-    del frame_stride
     if not packets:
         raise ValueError("No frames to encode")
     ordered = sorted(packets, key=lambda p: p.frame_idx)
@@ -491,11 +687,13 @@ def encode_packets_to_video(
         width=width,
         height=height,
         source_frame_count=n_src,
+        frame_stride=frame_stride,
         post_workers=post_workers,
         encode_preset=encode_preset,
         encode_crf=encode_crf,
         encode_codec=encode_codec,
         on_progress=on_progress,
+        on_log=on_log,
     )
 
 
@@ -510,6 +708,7 @@ def encode_manifest_to_video(
     encode_crf: int = 23,
     encode_codec: str = "auto",
     on_progress: Callable[[int, int], None] | None = None,
+    on_log: Callable[[str], None] | None = None,
 ) -> Path:
     overlay = dict(manifest.get("overlay") or {})
     if overlay_override:
@@ -525,11 +724,13 @@ def encode_manifest_to_video(
         width=int(manifest.get("width") or 0),
         height=int(manifest.get("height") or 0),
         source_frame_count=int(manifest.get("source_frame_count") or 0),
+        frame_stride=int(manifest.get("frame_stride") or 1),
         post_workers=post_workers,
         encode_preset=encode_preset,
         encode_crf=encode_crf,
         encode_codec=encode_codec,
         on_progress=on_progress,
+        on_log=on_log,
     )
 
 
@@ -544,6 +745,7 @@ def encode_run_folder(
     encode_codec: str = "auto",
     overlay_override: dict[str, Any] | None = None,
     on_progress: Callable[[int, int], None] | None = None,
+    on_log: Callable[[str], None] | None = None,
 ) -> Path:
     run_dir = Path(run_dir)
     data, base_dir = resolve_run_packets(run_dir, run_id=run_id)
@@ -563,6 +765,7 @@ def encode_run_folder(
         encode_crf=encode_crf,
         encode_codec=encode_codec,
         on_progress=on_progress,
+        on_log=on_log,
     )
 
     if data.get("format") == "chunked" and "chunks" in data:
@@ -606,7 +809,7 @@ def expand_packets_to_timeline(
     frame_source: list[np.ndarray] | None = None,
 ) -> list[FramePacket]:
     """Hold-forward expand (legacy; prefer streaming encode)."""
-    del frame_stride
+    stride = max(1, int(frame_stride))
     if not packets:
         return []
     ordered = sorted(packets, key=lambda p: p.frame_idx)
@@ -617,6 +820,8 @@ def expand_packets_to_timeline(
     for i in range(n_src):
         if i in by_idx:
             carry = by_idx[i]
+        elif carry is not None and (i - int(carry.frame_idx)) >= stride:
+            carry = None
         if carry is None:
             continue
         stub = replace(carry, frame_idx=i)

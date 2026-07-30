@@ -86,6 +86,9 @@ class GpuMonitor:
         return {
             "avg_gpu_util_pct": round(sum(gpu) / len(gpu), 2),
             "peak_gpu_util_pct": round(max(gpu), 2),
+            # NVML: memory used on the whole GPU (all processes + desktop).
+            "avg_gpu_device_used_mb": round(sum(mem) / len(mem), 2),
+            "peak_gpu_device_used_mb": round(max(mem), 2),
             "avg_mem_used_mb": round(sum(mem) / len(mem), 2),
             "peak_mem_used_mb": round(max(mem), 2),
             "samples": float(len(self._samples)),

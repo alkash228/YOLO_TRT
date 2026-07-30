@@ -17,20 +17,19 @@ def resolve_infer_batch_size(
     max_job_batch: int = 0,
 ) -> int:
     """
-    requested <= 0 + gpu_full_batch → весь ролик одним job.
-    requested <= 0 без full batch → 16 кадров.
-    При ReID (detect=track) job > max_job_batch режется — иначе нет overlap CPU/GPU.
+    Fixed-size GPU jobs only (YouTube-style). ``gpu_full_batch`` is ignored —
+    never expand to the whole video in one job.
+    requested <= 0 → 64 (or max_cap if set).
     """
-    if frame_count > 0 and gpu_full_batch and int(requested) <= 0:
-        req = int(frame_count)
-    elif int(requested) <= 0:
-        req = 16
+    _ = gpu_full_batch  # deprecated: full-video GPU job removed
+    if int(requested) <= 0:
+        req = 64
     else:
         req = max(1, int(requested))
 
     if use_reid and int(max_job_batch) > 0:
         req = min(req, int(max_job_batch))
-    elif not gpu_full_batch and int(max_cap) > 0:
+    if int(max_cap) > 0:
         req = min(req, int(max_cap))
     if frame_count > 0:
         req = min(req, int(frame_count))
@@ -43,12 +42,10 @@ def gpu_predict_chunk_size(
     gpu_full_batch: bool,
     max_cap: int,
 ) -> int:
-    """Размер YOLO forward (seg/cross/predict). max_cap>0 всегда ограничивает пик VRAM."""
-    if int(max_cap) > 0:
-        return max(1, int(max_cap))
-    if gpu_full_batch:
-        return 0
-    return max(1, int(n_frames)) if int(n_frames) > 0 else 0
+    """Chunk size for seg/cross predict_batch. Never 'whole video'."""
+    _ = gpu_full_batch
+    cap = max(1, int(max_cap) if int(max_cap) > 0 else 64)
+    return min(max(1, int(n_frames)), cap)
 
 
 def resolve_batch_prefetch_depth(settings: PipelineSettings) -> int:
@@ -84,22 +81,47 @@ def resolve_frame_source(
 ) -> str:
     """
     Источник кадров: preload | stream | windowed.
-    auto: preload если влезает в max_preload_ram_gb, иначе windowed (не stream — GPU speed).
+
+    Explicit ``preload`` / ``windowed`` / ``stream`` are honored as-is.
+    Only ``auto`` may pick: always windowed (YouTube-style batch stream), unless
+    preload_video=True and the whole clip fits RAM.
     """
+    mode, _reason = resolve_frame_source_ex(
+        settings,
+        source_frame_count=source_frame_count,
+        width=width,
+        height=height,
+        max_preload_ram_gb=max_preload_ram_gb,
+    )
+    return mode
+
+
+def resolve_frame_source_ex(
+    settings: PipelineSettings,
+    *,
+    source_frame_count: int,
+    width: int,
+    height: int,
+    max_preload_ram_gb: float | None = None,
+) -> tuple[str, str]:
+    """Like resolve_frame_source, but also returns a human reason string."""
     from app.core.frame_pipeline import estimate_video_ram_gb
 
-    mode = str(getattr(settings, "frame_source_mode", "auto")).casefold()
-    if mode in ("windowed", "window"):
-        return "windowed"
-    if mode == "stream":
-        return "stream"
-    if mode == "preload":
-        return "preload"
-    # auto
+    requested = str(getattr(settings, "frame_source_mode", "auto") or "auto").casefold().strip()
+    if requested in ("windowed", "window"):
+        return "windowed", "explicit frame_source_mode=windowed"
+    if requested == "stream":
+        return "stream", "explicit frame_source_mode=stream"
+    if requested == "preload":
+        # Never silently demote explicit preload (OOM fallback is handled at call site).
+        return "preload", "explicit frame_source_mode=preload"
+
+    # auto only below — YouTube-style: stream windows to GPU, do not preload whole clip
+    # unless preload_video is explicitly enabled and the clip fits.
     if int(source_frame_count) <= 0:
-        return "stream"
-    if not bool(getattr(settings, "preload_video", True)):
-        return "windowed"
+        return "stream", "auto: unknown frame count → stream"
+    if not bool(getattr(settings, "preload_video", False)):
+        return "windowed", "auto: YouTube-style windowed (no full preload)"
     if width > 0 and height > 0:
         est_gb = estimate_video_ram_gb(width, height, int(source_frame_count))
         budget = float(
@@ -108,8 +130,15 @@ def resolve_frame_source(
             else getattr(settings, "max_preload_ram_gb", 12.0)
         )
         if est_gb > budget:
-            return "windowed"
-    return "preload"
+            return (
+                "windowed",
+                f"auto: est preload {est_gb:.2f} GB > budget {budget:.2f} GB → windowed",
+            )
+        return (
+            "preload",
+            f"auto: preload_video + est {est_gb:.2f} GB ≤ budget {budget:.2f} GB → preload",
+        )
+    return "windowed", "auto: no size info → windowed"
 
 
 def resolve_use_streaming(
@@ -120,7 +149,7 @@ def resolve_use_streaming(
     height: int,
     max_preload_ram_gb: float | None = None,
 ) -> bool:
-    """True только для frame_source=stream (OpenCV read в hot path)."""
+    """True только для frame_source=stream (OpenCV read in hot path)."""
     return resolve_frame_source(
         settings,
         source_frame_count=source_frame_count,
@@ -226,7 +255,7 @@ def resolve_reid_embed_chunk(
 ) -> int:
     """
     0 в настройках → без явного чанка (TRT runner сам режет по max batch engine).
-    trt_max_batch>0 ограничивает ручной chunk под профиль OSNet engine.
+    trt_max_batch>0 ограничивает ручной/auto chunk под профиль OSNet engine.
     """
     chunk = int(setting)
     cap = max(0, int(trt_max_batch))
@@ -234,8 +263,12 @@ def resolve_reid_embed_chunk(
         chunk = cap
     if chunk > 0:
         return chunk
-    if n_crops <= 200:
+    # Auto: small jobs — one call (TRT self-chunks). Large jobs — chunk at engine
+    # max batch when TRT, else 200 for PyTorch host memory.
+    if n_crops <= 200 and cap <= 0:
         return 0
+    if cap > 0:
+        return cap if n_crops > cap else 0
     return 200
 
 
@@ -280,13 +313,19 @@ def frame_stride_summary(
     }
 
 
+def _realtime_auto_infer_batch(settings: PipelineSettings) -> int:
+    """Авто-batch в realtime: max(tensorrt_max_batch, 64), никогда не 200 втихую."""
+    trt_b = int(getattr(settings, "tensorrt_max_batch", 32) or 32)
+    return max(64, trt_b)
+
+
 def effective_speed_tuning(settings: PipelineSettings) -> dict[str, int | bool]:
     """Параметры job/YOLO с учётом realtime_mode (~1× длительности видео)."""
     if not bool(getattr(settings, "realtime_mode", False)):
         imgsz = int(getattr(settings, "infer_imgsz", 0) or 0)
         return {
-            "infer_batch": int(settings.infer_batch_size),
-            "gpu_full_batch": bool(settings.gpu_full_batch),
+            "infer_batch": int(settings.infer_batch_size) if int(settings.infer_batch_size) > 0 else 64,
+            "gpu_full_batch": False,
             "max_job_batch": int(settings.max_job_batch_size),
             "max_infer_batch": int(settings.max_infer_batch_size),
             "imgsz": imgsz,
@@ -294,8 +333,10 @@ def effective_speed_tuning(settings: PipelineSettings) -> dict[str, int | bool]:
             "frame_stride": resolve_frame_stride(settings),
         }
     req_batch = int(settings.infer_batch_size)
+    # Explicit >0 always wins. Auto (0) → TRT engine batch, not hardcoded 200.
+    infer_batch = req_batch if req_batch > 0 else _realtime_auto_infer_batch(settings)
     return {
-        "infer_batch": req_batch if req_batch > 0 else 200,
+        "infer_batch": infer_batch,
         "gpu_full_batch": False,
         "max_job_batch": max(96, int(settings.max_job_batch_size)),
         "max_infer_batch": max(48, int(settings.max_infer_batch_size)),

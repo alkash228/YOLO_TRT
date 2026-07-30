@@ -30,10 +30,8 @@ class DetectEngine:
         imgsz: int = 0,
         use_tensorrt: bool = False,
         tensorrt_imgsz: int = 640,
-        tensorrt_max_batch: int = 16,
+        tensorrt_max_batch: int = 200,
         tensorrt_fp16: bool = True,
-        tensorrt_engine_strategy: str = "central",
-        tensorrt_central_dir: Path | None = None,
     ) -> None:
         from ultralytics import YOLO
 
@@ -48,15 +46,23 @@ class DetectEngine:
                 imgsz=int(tensorrt_imgsz),
                 max_batch=int(tensorrt_max_batch),
                 fp16=bool(tensorrt_fp16),
-                strategy=tensorrt_engine_strategy,
-                central_dir=tensorrt_central_dir,
             )
             if eng.exists():
                 load_path = eng
                 self.using_tensorrt = True
+                # Фактический batch из имени engine (manifest fallback может быть меньше settings).
+                try:
+                    part = eng.stem.split("_b", 1)[1].split("_", 1)[0]
+                    self._resolved_trt_batch = int(part)
+                except (IndexError, ValueError):
+                    self._resolved_trt_batch = int(tensorrt_max_batch)
+            else:
+                self._resolved_trt_batch = int(tensorrt_max_batch)
+        else:
+            self._resolved_trt_batch = 0
         self.model_path = str(load_path)
         self.source_model_path = str(p)
-        self.trt_max_batch = int(tensorrt_max_batch) if self.using_tensorrt else 0
+        self.trt_max_batch = int(self._resolved_trt_batch) if self.using_tensorrt else 0
         self.trt_imgsz = int(tensorrt_imgsz) if self.using_tensorrt else 0
         self._trt_names: dict[int, str] = {}
         self.conf = float(conf)
@@ -73,8 +79,12 @@ class DetectEngine:
 
             device = "cuda" if torch.cuda.is_available() else "cpu"
         self.device = device
-        self.model = YOLO(self.model_path)
-        self.is_pose = str(getattr(self.model, "task", "") or "").casefold() == "pose"
+        pose_hint = "pose" in p.stem.casefold()
+        if self.using_tensorrt and pose_hint:
+            self.model = YOLO(self.model_path, task="pose")
+        else:
+            self.model = YOLO(self.model_path)
+        self.is_pose = pose_hint or str(getattr(self.model, "task", "") or "").casefold() == "pose"
         if self.using_tensorrt:
             self._setup_trt_runtime(p)
 
@@ -84,9 +94,10 @@ class DetectEngine:
         try:
             from ultralytics import YOLO
 
-            src = YOLO(str(source_pt))
+            src = YOLO(str(source_pt), task="pose" if "pose" in source_pt.stem.casefold() else None)
             self._trt_names = {int(k): str(v) for k, v in dict(src.names).items()}
-            if self.is_pose:
+            if self.is_pose or "pose" in source_pt.stem.casefold():
+                self.is_pose = True
                 head = src.model.model[-1] if hasattr(src.model, "model") else None
                 if head is not None and hasattr(head, "kpt_shape"):
                     kpt_shape = tuple(int(x) for x in head.kpt_shape)
@@ -118,15 +129,25 @@ class DetectEngine:
             kw["imgsz"] = self.imgsz
         return kw
 
-    def _pad_trt_batch(self, frames: list[np.ndarray]) -> tuple[list[np.ndarray], int]:
-        """Fixed-batch TRT engine: дополнить до trt_max_batch (повтор последнего кадра)."""
+    def _pad_trt_batch(
+        self,
+        frames: list[np.ndarray],
+        *,
+        pad_mode: str = "repeat",
+    ) -> tuple[list[np.ndarray], int]:
+        """Fixed-batch TRT: дополнить до trt_max_batch. partial tail — black (не dup last)."""
         n = len(frames)
         cap = self.trt_max_batch
         if n <= 0 or cap <= 0:
             return frames, n
         if n >= cap:
-            return frames[:cap], cap
-        return frames + [frames[-1]] * (cap - n), n
+            return frames[:cap], min(n, cap)
+        need = cap - n
+        if pad_mode == "black":
+            h, w = frames[0].shape[:2]
+            blank = np.zeros((h, w, 3), dtype=np.uint8)
+            return frames + [blank] * need, n
+        return frames + [frames[-1]] * need, n
 
     def track(self, frame_bgr: np.ndarray) -> list[DetectItem]:
         if self.using_tensorrt:
@@ -146,13 +167,23 @@ class DetectEngine:
         out: list[list[DetectItem]] = []
         for start in range(0, len(frames_bgr), cap):
             chunk = frames_bgr[start : start + cap]
-            padded, n_real = self._pad_trt_batch(chunk)
-            results = self.model.track(
-                source=padded,
-                persist=True,
-                batch=cap,
-                **self._yolo_kwargs(),
-            )
+            n_real = len(chunk)
+            if n_real < cap:
+                # Fixed-batch TRT: pad to cap (repeat last — black ломает BoT-SORT меньше, чем batch=1).
+                padded, n_real = self._pad_trt_batch(chunk, pad_mode="repeat")
+                results = self.model.track(
+                    source=padded,
+                    persist=True,
+                    batch=cap,
+                    **self._yolo_kwargs(),
+                )
+            else:
+                results = self.model.track(
+                    source=chunk,
+                    persist=True,
+                    batch=cap,
+                    **self._yolo_kwargs(),
+                )
             if not isinstance(results, list):
                 results = [results]
             out.extend(self._parse_single_result(res) for res in results[:n_real])
@@ -180,8 +211,12 @@ class DetectEngine:
             out: list[list[DetectItem]] = []
             for start in range(0, len(frames_bgr), cap):
                 chunk = frames_bgr[start : start + cap]
-                padded, n_real = self._pad_trt_batch(chunk)
-                results = self.model.predict(source=padded, batch=cap, **self._yolo_kwargs())
+                n_real = len(chunk)
+                if n_real < cap:
+                    padded, n_real = self._pad_trt_batch(chunk, pad_mode="black")
+                    results = self.model.predict(source=padded, batch=cap, **self._yolo_kwargs())
+                else:
+                    results = self.model.predict(source=chunk, batch=cap, **self._yolo_kwargs())
                 if not isinstance(results, list):
                     results = [results]
                 out.extend(self._parse_single_result(res) for res in results[:n_real])
@@ -199,7 +234,13 @@ class DetectEngine:
             out.extend(self._parse_single_result(res) for res in results)
         return out
 
-    def reset_session(self) -> None:
+    def reset_session(self, *, hard: bool = False) -> None:
+        """Reset BoT-SORT between videos. Keep TRT predictor by default.
+
+        hard=True tears down the Ultralytics predictor (reloads .engine next call).
+        That leaks/doubles TensorRT contexts after warmup and ~2× slows Pass1 —
+        never use on the hot path (process_video). dispose_processor nulls models.
+        """
         pred = getattr(self.model, "predictor", None)
         if pred is not None:
             try:
@@ -209,6 +250,8 @@ class DetectEngine:
                         reset_fn()
             except Exception:
                 pass
+        if not hard:
+            return
         if hasattr(self.model, "predictor"):
             try:
                 self.model.predictor = None
