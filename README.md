@@ -96,6 +96,11 @@ curl -X POST http://localhost:8080/v1/jobs \
 
 Статус job: `GET /v1/jobs/{job_id}`. Артефакты: `GET /v1/jobs/{job_id}/artifacts`. Список прогонов — в `/data/output` на хосте.
 
+**Длинные ролики (часы):** не гоняй через upload — клади файл в `YOLO_DOCKER/videos/` и path `/data/videos/...`. API **не копирует** файлы с `/data/videos` и файлы &gt; `YOLO_DRT_STAGE_MAX_COPY_GB` (по умолчанию 2 GiB) в volume — иначе «не грузится» из‑за копирования/диска.
+
+**Админка (человекочитаемо):** http://localhost:8080/admin  
+JSON: `GET /v1/admin/status`, отмена `POST /v1/admin/jobs/latest/cancel`, рестарт контейнера `POST /v1/admin/restart` (`{"mode":"docker"}` или `"exit"`). Для Docker-рестарта смонтирован `/var/run/docker.sock`.
+
 Сборка итогового MP4 из контейнера по умолчанию **выключена** (`YOLO_DRT_ENCODE_MODE=manual`); JSON и manifest пишутся в run-папку.
 
 ---

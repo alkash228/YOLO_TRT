@@ -105,3 +105,51 @@ class ModelsOut(BaseModel):
     detect: list[str] = Field(default_factory=list)
     seg: list[str] = Field(default_factory=list)
     reid: list[str] = Field(default_factory=list)
+
+
+class RestartBody(BaseModel):
+    mode: Literal["docker", "exit"] = "docker"
+
+
+class RestartOut(BaseModel):
+    ok: bool = True
+    mode: str = "docker"
+    container: str = ""
+    message: str = ""
+    docker_status: int | None = None
+    fallback_from: str | None = None
+    docker_error: str | None = None
+
+
+class JobSummaryOut(BaseModel):
+    job_id: str
+    status: str
+    status_ru: str = ""
+    phase: str = ""
+    phase_ru: str = ""
+    percent: float = 0.0
+    prompt: str = ""
+    input_path: str = ""
+    input_size_human: str = ""
+    created_at: float = 0.0
+    started_at: float | None = None
+    finished_at: float | None = None
+    elapsed_human: str = "—"
+    eta_human: str = "—"
+    error: str | None = None
+    progress: ProgressOut = Field(default_factory=ProgressOut)
+
+
+class AdminStatusOut(BaseModel):
+    service_status: str
+    service_status_ru: str = ""
+    container_name: str = ""
+    docker_sock: bool = False
+    uptime_sec: float = 0.0
+    uptime_human: str = ""
+    last_job: JobSummaryOut | None = None
+    active_job: JobSummaryOut | None = None
+    recent_jobs: list[JobSummaryOut] = Field(default_factory=list)
+    recent_requests: list[dict[str, Any]] = Field(default_factory=list)
+    disks: list[dict[str, Any]] = Field(default_factory=list)
+    tip: str = ""

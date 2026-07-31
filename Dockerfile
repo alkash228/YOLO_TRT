@@ -51,4 +51,5 @@ COPY config ./config
 
 EXPOSE 8080
 
-CMD ["python3.11", "-m", "uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8080"]
+# Long keep-alive helps multi‑GB uploads; processing itself is async jobs.
+CMD ["python3.11", "-m", "uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8080", "--timeout-keep-alive", "120"]

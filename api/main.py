@@ -5,18 +5,30 @@ import os
 import shutil
 import time
 import uuid
-import time as _time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
 import torch
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 
+from api.admin_html import ADMIN_HTML
+from api.admin_ops import (
+    container_name,
+    disk_info,
+    docker_available,
+    fmt_bytes,
+    fmt_sec,
+    phase_ru,
+    restart_container,
+    status_ru,
+)
 from api.env import load_settings_from_env
 from api.jobs import job_manager
+from api.request_log import RequestRecord, request_log
 from api.schemas import (
+    AdminStatusOut,
     ArtifactsOut,
     ArtifactItem,
     HealthOut,
@@ -24,7 +36,10 @@ from api.schemas import (
     JobCreateResponse,
     JobOut,
     JobResultOut,
+    JobSummaryOut,
     ProgressOut,
+    RestartBody,
+    RestartOut,
     RunsOut,
 )
 from app.config.settings import PipelineSettings
@@ -39,6 +54,7 @@ _app_status: str = "starting"
 _engines_ready_map: dict[str, bool] = {}
 _settings: PipelineSettings | None = None
 _processor: VideoProcessor | None = None
+_started_at: float = time.time()
 
 
 def _log(msg: str) -> None:
@@ -123,12 +139,47 @@ async def lifespan(app: FastAPI):
         service="YOLO_DRT Docker API",
         host="0.0.0.0",
         port=api_port,
-        extra_lines=("Swagger: /docs · Health: /health",),
+        extra_lines=(
+            "Swagger: /docs · Health: /health · Admin: /admin",
+        ),
     )
     yield
 
 
-app = FastAPI(title="YOLO_DRT API", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="YOLO_DRT API", version="1.1.0", lifespan=lifespan)
+
+
+@app.middleware("http")
+async def _timing_middleware(request: Request, call_next):  # type: ignore[no-untyped-def]
+    t0 = time.perf_counter()
+    err = ""
+    status_code = 500
+    try:
+        response = await call_next(request)
+        status_code = int(response.status_code)
+        return response
+    except Exception as exc:  # noqa: BLE001
+        err = str(exc)
+        raise
+    finally:
+        path = request.url.path
+        # Skip noisy admin polling of static assets if any
+        if not path.startswith("/assets"):
+            ms = (time.perf_counter() - t0) * 1000.0
+            client = ""
+            if request.client:
+                client = request.client.host or ""
+            request_log.add(
+                RequestRecord(
+                    method=request.method,
+                    path=path,
+                    status_code=status_code,
+                    duration_ms=ms,
+                    ts=time.time(),
+                    client=client,
+                    error=err,
+                )
+            )
 
 
 def _job_to_out(job) -> JobOut:
@@ -261,6 +312,14 @@ def health() -> HealthOut:
     )
 
 
+def _sync_timeout_sec() -> float:
+    raw = os.environ.get("YOLO_DRT_SYNC_TIMEOUT_SEC", "86400").strip() or "86400"
+    try:
+        return max(60.0, float(raw))
+    except ValueError:
+        return 86400.0
+
+
 @app.post("/v1/jobs/upload", response_model=JobCreateResponse)
 async def create_job_upload(
     file: UploadFile = File(...),
@@ -274,11 +333,41 @@ async def create_job_upload(
 
     uploads = _settings.resolve_upload_dir()
     uploads.mkdir(parents=True, exist_ok=True)
+    disk = disk_info(str(uploads))
+    free = int(disk.get("free_bytes") or 0)
+    if free and free < 2 * (1024**3):
+        raise HTTPException(
+            507,
+            f"Мало места на upload-диске ({disk.get('free_human')}). "
+            "Для длинных роликов положи файл в ./videos и используй path "
+            "/data/videos/... (без upload).",
+        )
+
     suffix = Path(file.filename or "video.mp4").suffix or ".mp4"
     dest = uploads / f"{int(time.time())}_{uuid.uuid4().hex[:8]}{suffix}"
-    with dest.open("wb") as out:
-        shutil.copyfileobj(file.file, out)
+    written = 0
+    chunk = 8 * 1024 * 1024
+    try:
+        with dest.open("wb") as out:
+            while True:
+                buf = await file.read(chunk)
+                if not buf:
+                    break
+                out.write(buf)
+                written += len(buf)
+    except OSError as exc:
+        dest.unlink(missing_ok=True)
+        raise HTTPException(
+            507,
+            f"Не удалось сохранить upload ({written} bytes): {exc}. "
+            "Для 5ч видео используй path /data/videos/... вместо upload.",
+        ) from exc
 
+    if written <= 0:
+        dest.unlink(missing_ok=True)
+        raise HTTPException(400, "Пустой файл upload")
+
+    _log(f"Upload saved {fmt_bytes(written)} → {dest}")
     job = job_manager.create_job(
         str(dest),
         prompt=prompt,
@@ -319,11 +408,15 @@ def create_job_path_sync(body: JobCreatePathBody) -> JobOut:
         max_duration_seconds=body.max_duration_seconds,
         bench=True,
     )
-    done = job_manager.wait_job(job.job_id, timeout=7200.0)
+    done = job_manager.wait_job(job.job_id, timeout=_sync_timeout_sec())
     if done is None:
         raise HTTPException(500, "Job disappeared")
     if done.status == "running":
-        raise HTTPException(504, "Job timed out")
+        raise HTTPException(
+            504,
+            f"Job timed out after {_sync_timeout_sec():.0f}s "
+            "(увеличь YOLO_DRT_SYNC_TIMEOUT_SEC для длинных роликов)",
+        )
     return _job_to_out(done)
 
 
@@ -388,3 +481,110 @@ def list_runs() -> RunsOut:
         raise HTTPException(503, "Settings not loaded")
     data = load_runs_index(_settings.output_dir)
     return RunsOut(version=int(data.get("version", 1)), runs=list(data.get("runs", [])))
+
+
+def _job_summary(job) -> JobSummaryOut:
+    out = _job_to_out(job)
+    prog = out.progress
+    size_h = "—"
+    try:
+        p = Path(job.input_path)
+        if p.is_file():
+            size_h = fmt_bytes(p.stat().st_size)
+    except OSError:
+        pass
+    elapsed = None
+    if job.started_at is not None:
+        end = job.finished_at if job.finished_at is not None else time.time()
+        elapsed = max(0.0, float(end) - float(job.started_at))
+    return JobSummaryOut(
+        job_id=job.job_id,
+        status=job.status,
+        status_ru=status_ru(job.status),
+        phase=str(prog.phase or ""),
+        phase_ru=phase_ru(str(prog.phase or "")),
+        percent=float(prog.percent or 0.0),
+        prompt=str(job.prompt or ""),
+        input_path=str(job.input_path or ""),
+        input_size_human=size_h,
+        created_at=float(job.created_at or 0.0),
+        started_at=job.started_at,
+        finished_at=job.finished_at,
+        elapsed_human=fmt_sec(elapsed),
+        eta_human=fmt_sec(float(prog.eta_seconds or 0.0) or None),
+        error=job.error or (out.result.error if out.result else None),
+        progress=prog,
+    )
+
+
+@app.get("/admin", response_class=HTMLResponse)
+def admin_page() -> HTMLResponse:
+    return HTMLResponse(ADMIN_HTML)
+
+
+@app.get("/v1/admin/status", response_model=AdminStatusOut)
+def admin_status() -> AdminStatusOut:
+    up = max(0.0, time.time() - _started_at)
+    last = job_manager.latest()
+    active = job_manager.active_job()
+    disks: list[dict[str, Any]] = []
+    if _settings is not None:
+        for p in (
+            str(_settings.work_dir),
+            str(_settings.output_dir),
+            str(_settings.resolve_upload_dir()),
+            "/data/videos",
+        ):
+            disks.append(disk_info(p))
+    tip = (
+        "Длинное видео (несколько часов): положи в ./videos на хосте и создай job "
+        'POST /v1/jobs {"path":"/data/videos/name.mp4"} — без HTTP upload и без '
+        "копирования в volume. Upload годится для коротких роликов."
+    )
+    return AdminStatusOut(
+        service_status=_app_status,
+        service_status_ru=status_ru(_app_status),
+        container_name=container_name(),
+        docker_sock=docker_available(),
+        uptime_sec=round(up, 1),
+        uptime_human=fmt_sec(up),
+        last_job=_job_summary(last) if last else None,
+        active_job=_job_summary(active) if active else None,
+        recent_jobs=[_job_summary(j) for j in job_manager.list_jobs(limit=15)],
+        recent_requests=request_log.recent(40),
+        disks=disks,
+        tip=tip,
+    )
+
+
+@app.get("/v1/admin/jobs/latest", response_model=JobSummaryOut)
+def admin_latest_job() -> JobSummaryOut:
+    job = job_manager.active_job() or job_manager.latest()
+    if job is None:
+        raise HTTPException(404, "Нет jobs")
+    return _job_summary(job)
+
+
+@app.post("/v1/admin/jobs/latest/cancel", response_model=JobSummaryOut)
+def admin_cancel_latest() -> JobSummaryOut:
+    job = job_manager.active_job() or job_manager.latest()
+    if job is None:
+        raise HTTPException(404, "Нет jobs для отмены")
+    job_manager.cancel(job.job_id)
+    refreshed = job_manager.get(job.job_id) or job
+    return _job_summary(refreshed)
+
+
+@app.post("/v1/admin/restart", response_model=RestartOut)
+def admin_restart(body: RestartBody | None = None) -> RestartOut:
+    mode = (body.mode if body else "docker")
+    try:
+        info = restart_container(mode=mode)
+    except Exception as exc:
+        raise HTTPException(500, f"Рестарт не удался: {exc}") from exc
+    return RestartOut(**info)
+
+
+@app.get("/v1/admin/requests")
+def admin_requests(limit: int = 50) -> JSONResponse:
+    return JSONResponse({"requests": request_log.recent(limit)})

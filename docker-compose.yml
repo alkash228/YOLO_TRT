@@ -21,6 +21,12 @@ services:
               capabilities: [gpu]
     environment:
       NVIDIA_VISIBLE_DEVICES: all
+      YOLO_DRT_CONTAINER_NAME: yolo-drt-api
+      # Skip staging-copy for files larger than this (GiB). 5h videos decode in place.
+      YOLO_DRT_STAGE_MAX_COPY_GB: "2"
+      YOLO_DRT_VIDEOS_DIR: /data/videos
+      # Sync job wait (seconds). 5h video needs many hours of wall time.
+      YOLO_DRT_SYNC_TIMEOUT_SEC: "86400"
       YOLO_DRT_DETECT_MODEL: /data/models/YOLO/yolo26x-pose.pt
       YOLO_DRT_CROSS_MODEL: /data/models/YOLO/Helmet/helmet-26m.pt
       YOLO_DRT_REID_MODEL: /data/models/RD/osnet_ain_x1_0_msmt17_256x128_amsgrad_ep50_lr0.0015_coslr_b64_fb10_softmax_labsmth_flip_jitter.pth
@@ -85,9 +91,10 @@ services:
       # Named volume lives in the Linux VM: fast random read for video decode.
       # Uploads + staged path-job copies go here (not to ../output).
       - yolo_work:/data/work
-      # Optional: pre-place files for path jobs (POST /v1/jobs {"path":"/data/videos/..."}).
-      # Still a host bind — API copies into /data/work before decode when possible.
+      # Pre-place long videos here; path jobs decode in place (no multi‑GB copy).
       - ./videos:/data/videos:ro
+      # Allow POST /v1/admin/restart to restart THIS container via Docker Engine.
+      - /var/run/docker.sock:/var/run/docker.sock
 
 volumes:
   yolo_work:
