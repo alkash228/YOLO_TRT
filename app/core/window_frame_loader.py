@@ -39,6 +39,72 @@ class PendingWindowSpill:
     infer_count: int
 
 
+def load_video_window_from_cap(
+    cap: cv2.VideoCapture,
+    start_frame: int,
+    infer_target: int,
+    *,
+    frame_stride: int = 1,
+    total_frames: int = 0,
+    current_pos: int | None = None,
+) -> tuple[VideoWindow, int]:
+    """
+    Decode until infer_target inference frames (or EOF).
+
+    Prefer sequential reads. CAP_PROP_POS_FRAMES seek is avoided when possible —
+    on HEVC (H.265) random seeks cause «Could not find ref with POC / Error
+    constructing the frame RPS» storms and broken frames.
+
+    Returns (window, new_pos_after_read).
+    """
+    start = max(0, int(start_frame))
+    target = max(1, int(infer_target))
+    stride = max(1, int(frame_stride))
+    total = max(0, int(total_frames))
+    pos = int(current_pos) if current_pos is not None else start
+
+    # Catch up by reading forward (keeps HEVC reference chain). Seek only if we
+    # somehow need to go backwards (should not happen in windowed prefetch).
+    if pos > start:
+        # Already past requested start — reopen caller should avoid this.
+        pos = start
+    while pos < start:
+        ok, _ = cap.read()
+        if not ok:
+            break
+        pos += 1
+    if pos < start:
+        # EOF before start
+        return (
+            VideoWindow(start_frame=start, end_frame=pos, frame_indices=[], frames_bgr=[]),
+            pos,
+        )
+
+    frames: list[np.ndarray] = []
+    indices: list[int] = []
+    src_idx = pos
+    while len(frames) < target:
+        if total > 0 and src_idx >= total:
+            break
+        ok, frame = cap.read()
+        if not ok:
+            break
+        if src_idx % stride == 0:
+            indices.append(src_idx)
+            frames.append(frame)
+        src_idx += 1
+
+    return (
+        VideoWindow(
+            start_frame=start,
+            end_frame=src_idx,
+            frame_indices=indices,
+            frames_bgr=frames,
+        ),
+        src_idx,
+    )
+
+
 def load_video_window(
     input_path: str,
     start_frame: int,
@@ -50,42 +116,39 @@ def load_video_window(
     """
     Decode until infer_target inference-кадров или конец ролика.
     При stride>1 в RAM только кадры для infer (без «лишних» между stride).
+
+    For start_frame>0 on HEVC this still may warn if seek is used as fallback;
+    WindowPrefetcher uses a persistent capture without seek.
     """
     cap = cv2.VideoCapture(input_path)
     if not cap.isOpened():
         raise RuntimeError(f"Cannot open video: {input_path}")
 
     start = max(0, int(start_frame))
-    target = max(1, int(infer_target))
-    stride = max(1, int(frame_stride))
-    total = max(0, int(total_frames))
-
-    if start > 0:
-        cap.set(cv2.CAP_PROP_POS_FRAMES, start)
-
-    frames: list[np.ndarray] = []
-    indices: list[int] = []
-    src_idx = start
     try:
-        while len(frames) < target:
-            if total > 0 and src_idx >= total:
-                break
-            ok, frame = cap.read()
-            if not ok:
-                break
-            if src_idx % stride == 0:
-                indices.append(src_idx)
-                frames.append(frame)
-            src_idx += 1
+        if start > 0:
+            # Last resort for one-shot loads. Prefetch path avoids this.
+            cap.set(cv2.CAP_PROP_POS_FRAMES, start)
+            window, _ = load_video_window_from_cap(
+                cap,
+                start,
+                infer_target,
+                frame_stride=frame_stride,
+                total_frames=total_frames,
+                current_pos=start,
+            )
+        else:
+            window, _ = load_video_window_from_cap(
+                cap,
+                0,
+                infer_target,
+                frame_stride=frame_stride,
+                total_frames=total_frames,
+                current_pos=0,
+            )
+        return window
     finally:
         cap.release()
-
-    return VideoWindow(
-        start_frame=start,
-        end_frame=src_idx,
-        frame_indices=indices,
-        frames_bgr=frames,
-    )
 
 
 class WindowPrefetcher:
@@ -170,7 +233,15 @@ class WindowPrefetcher:
             return item
 
     def _run(self) -> None:
+        cap: cv2.VideoCapture | None = None
+        pos = 0
         try:
+            # One capture for the whole video — sequential decode only.
+            # Re-open + CAP_PROP_POS_FRAMES per window breaks HEVC (POC / RPS errors).
+            cap = cv2.VideoCapture(self._input_path)
+            if not cap.isOpened():
+                raise RuntimeError(f"Cannot open video: {self._input_path}")
+
             while self._total_frames <= 0 or self._next_start < self._total_frames:
                 if self._should_stop and self._should_stop():
                     break
@@ -181,12 +252,13 @@ class WindowPrefetcher:
                 if self._total_frames > 0 and self._next_start >= self._total_frames:
                     break
                 t_dec = time.perf_counter()
-                window = load_video_window(
-                    self._input_path,
+                window, pos = load_video_window_from_cap(
+                    cap,
                     self._next_start,
                     self._infer_per_window,
                     frame_stride=self._frame_stride,
                     total_frames=self._total_frames,
+                    current_pos=pos,
                 )
                 self.decode_sec += max(0.0, time.perf_counter() - t_dec)
                 if not window.frames_bgr:
@@ -198,6 +270,8 @@ class WindowPrefetcher:
         except BaseException as exc:
             self._error = exc
         finally:
+            if cap is not None:
+                cap.release()
             self._done = True
             self._send_stop(force=True)
 
