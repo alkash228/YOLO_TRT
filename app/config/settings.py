@@ -48,6 +48,8 @@ class PipelineSettings:
     seg_model: Path = field(default_factory=lambda: YOLO_SEG_DIR / "yolo26x-seg.pt")
     reid_model: Path = field(default_factory=lambda: RD_DIR / OSNET_FILENAME)
     output_dir: Path = field(default_factory=lambda: OUTPUT_DIR)
+    # Docker: /data/models; host: PROJECT_ROOT/models
+    models_dir: Path = field(default_factory=lambda: MODELS_DIR)
     # Uploads / temp inputs (host: TEMP on Windows; Docker: named volume).
     work_dir: Path = field(default_factory=lambda: WORK_DIR)
     upload_dir: Path = field(default_factory=_default_upload_dir)
@@ -220,6 +222,9 @@ class PipelineSettings:
     tensorrt_fp16: bool = True
     tensorrt_workspace_gb: float = 2.0
     tensorrt_autocast_fast: bool = False
+    tensorrt_engine_strategy: str = "central"  # central | beside_weights
+    tensorrt_rebuild_policy: str = "missing_only"  # missing_only | always
+    tensorrt_manifest_dir: Path = field(default_factory=lambda: TRT_DIR)
 
     cross_check_enabled: bool = False
     cross_check_model: Path | None = field(default_factory=lambda: DEFAULT_HELMET_MODEL)
@@ -243,11 +248,13 @@ class PipelineSettings:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         Path(self.work_dir).mkdir(parents=True, exist_ok=True)
         self.resolve_upload_dir().mkdir(parents=True, exist_ok=True)
-        YOLO_DIR.mkdir(parents=True, exist_ok=True)
-        YOLO_SEG_DIR.mkdir(parents=True, exist_ok=True)
-        RD_DIR.mkdir(parents=True, exist_ok=True)
-        TRT_DIR.mkdir(parents=True, exist_ok=True)
-        YOLO_HELMET_DIR.mkdir(parents=True, exist_ok=True)
+        root = Path(self.models_dir)
+        (root / "YOLO").mkdir(parents=True, exist_ok=True)
+        (root / "YOLO" / "seg").mkdir(parents=True, exist_ok=True)
+        (root / "YOLO" / "Helmet").mkdir(parents=True, exist_ok=True)
+        (root / "RD").mkdir(parents=True, exist_ok=True)
+        (root / "TRT").mkdir(parents=True, exist_ok=True)
+        Path(self.tensorrt_manifest_dir).mkdir(parents=True, exist_ok=True)
 
 
 DEFAULT_SETTINGS = PipelineSettings()
