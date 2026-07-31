@@ -11,13 +11,14 @@ from typing import Any
 
 import torch
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 
 from api.admin_html import ADMIN_HTML
 from api.admin_ops import (
     container_name,
     disk_info,
     docker_available,
+    fetch_container_logs,
     fmt_bytes,
     fmt_sec,
     phase_ru,
@@ -588,3 +589,36 @@ def admin_restart(body: RestartBody | None = None) -> RestartOut:
 @app.get("/v1/admin/requests")
 def admin_requests(limit: int = 50) -> JSONResponse:
     return JSONResponse({"requests": request_log.recent(limit)})
+
+
+@app.get("/v1/admin/logs")
+def admin_container_logs(
+    tail: int = 2000,
+    timestamps: bool = True,
+    download: bool = True,
+) -> Response:
+    """
+    Логи Docker-контейнера как text/plain (.txt).
+
+    Нужен volume /var/run/docker.sock (уже в compose).
+    Пример: GET /v1/admin/logs?tail=5000 → скачать yolo-drt-api_logs_….txt
+    """
+    try:
+        filename, text = fetch_container_logs(tail=tail, timestamps=timestamps)
+    except Exception as exc:
+        # Fallback: хотя бы bootstrap/build_logs из процесса
+        stamp = time.strftime("%Y%m%d_%H%M%S", time.gmtime())
+        filename = f"{container_name()}_app_logs_{stamp}.txt"
+        text = (
+            f"# WARN: Docker logs недоступны: {exc}\n"
+            f"# Ниже — in-process build_logs (не полный docker log).\n"
+            f"# ---\n" + "\n".join(_build_logs[-max(50, min(tail, 2000)) :])
+        )
+    headers = {}
+    if download:
+        headers["Content-Disposition"] = f'attachment; filename="{filename}"'
+    return Response(
+        content=text,
+        media_type="text/plain; charset=utf-8",
+        headers=headers,
+    )

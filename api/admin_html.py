@@ -82,11 +82,13 @@ ADMIN_HTML = """<!DOCTYPE html>
       <h2>Действия</h2>
       <div class="actions">
         <button class="danger" onclick="cancelLatest()">Принудительно завершить последнюю / активную job</button>
+        <a class="btn primary" href="/v1/admin/logs?tail=3000&download=true">Скачать логи контейнера (.txt)</a>
         <button class="primary" onclick="restart('docker')">Рестарт контейнера (Docker)</button>
         <button onclick="restart('exit')">Рестарт через exit (fallback)</button>
       </div>
       <p class="tip">
-        Docker-рестарт нужен volume <code>/var/run/docker.sock</code>.
+        Docker-рестарт и логи контейнера нужен volume <code>/var/run/docker.sock</code>.
+        Логи: <code>GET /v1/admin/logs?tail=5000</code> → файл <code>.txt</code>.
         Длинные ролики клади в <code>./videos</code> и шли path
         <code>/data/videos/…</code> — без копирования в volume (иначе 5ч видео «не грузится»).
       </p>
