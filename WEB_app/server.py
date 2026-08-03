@@ -54,25 +54,37 @@ def _probe_api(url: str) -> tuple[bool, str]:
 
 def _resolve_api_url(explicit: str | None = None) -> str:
     """Resolve API base; re-probes live ports (not frozen at import)."""
+    candidates: list[str] = []
     if explicit:
-        return explicit.rstrip("/")
+        candidates.append(explicit.rstrip("/"))
     env = os.environ.get("YOLO_DRT_API_URL", "").strip()
     if env:
-        return env.rstrip("/")
+        candidates.append(env.rstrip("/"))
+    for port in _API_PROBE_PORTS:
+        candidates.append(f"http://127.0.0.1:{port}")
+
+    # Dedupe, keep order
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for u in candidates:
+        if u not in seen:
+            seen.add(u)
+            ordered.append(u)
 
     ready_url: str | None = None
     alive_url: str | None = None
-    for port in _API_PROBE_PORTS:
-        url = f"http://127.0.0.1:{port}"
+    for url in ordered:
         ok, status = _probe_api(url)
         if not ok:
             continue
         if status == "ready":
-            ready_url = url
-            break
+            return url
         if alive_url is None:
             alive_url = url
-    return ready_url or alive_url or "http://127.0.0.1:8080"
+        if ready_url is None and status:
+            ready_url = url
+    # Prefer a live non-ready API over a dead env default (old bat forced :8765).
+    return alive_url or ready_url or "http://127.0.0.1:8080"
 
 
 def api_base() -> str:
