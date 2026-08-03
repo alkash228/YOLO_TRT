@@ -125,6 +125,34 @@ app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 _build_lock = threading.Lock()
 _build_jobs: dict[str, dict[str, Any]] = {}
 
+# Docker API returns container paths (/data/output/...); WEB runs on the host.
+_DOCKER_OUTPUT_PREFIXES = ("/data/output",)
+
+
+def _host_output_root() -> Path:
+    raw = os.environ.get("YOLO_DRT_HOST_OUTPUT_DIR", "").strip()
+    if raw:
+        return Path(raw)
+    return ROOT / "output"
+
+
+def _resolve_host_run_dir(run_dir: str | Path) -> Path:
+    """Map Docker /data/output/... to the Windows host bind-mount path."""
+    raw = str(run_dir or "").strip().replace("\\", "/")
+    if not raw:
+        return Path(raw)
+    p = Path(raw)
+    if p.is_dir():
+        return p
+    for prefix in _DOCKER_OUTPUT_PREFIXES:
+        if raw == prefix or raw.startswith(prefix + "/"):
+            rel = raw[len(prefix) :].lstrip("/")
+            mapped = _host_output_root() / rel if rel else _host_output_root()
+            if mapped.is_dir():
+                return mapped
+            return mapped
+    return p
+
 
 def _run_dir_query(run_dir: str) -> str:
     """Normalize Windows paths for URL query (?run_dir=)."""
@@ -406,9 +434,12 @@ def _run_build(
 
 @app.post("/build-video", response_model=BuildVideoResponse)
 def build_video(body: BuildVideoBody) -> BuildVideoResponse:
-    run_dir = Path(body.run_dir)
+    run_dir = _resolve_host_run_dir(body.run_dir)
     if not run_dir.is_dir():
-        raise HTTPException(400, f"Run directory not found: {body.run_dir}")
+        raise HTTPException(
+            400,
+            f"Run directory not found: {body.run_dir} (resolved: {run_dir})",
+        )
 
     build_id = uuid.uuid4().hex[:12]
     with _build_lock:
@@ -438,9 +469,12 @@ def report_violators(run_dir: str, run_id: str) -> dict[str, Any]:
         resolve_run_packets,
     )
 
-    run_path = Path(run_dir)
+    run_path = _resolve_host_run_dir(run_dir)
     if not run_path.is_dir():
-        raise HTTPException(400, f"Run directory not found: {run_dir}")
+        raise HTTPException(
+            400,
+            f"Run directory not found: {run_dir} (resolved: {run_path})",
+        )
     data, _ = resolve_run_packets(run_path, run_id=run_id)
     ids, vcounts, pcounts, threshold = collect_qualified_violator_ids(data, run_path)
     if not ids:
@@ -468,9 +502,12 @@ def report_companies() -> dict[str, list[str]]:
 
 @app.post("/report/word", response_model=WordReportResponse)
 def create_word_report(body: WordReportBody) -> WordReportResponse:
-    run_dir = Path(body.run_dir)
+    run_dir = _resolve_host_run_dir(body.run_dir)
     if not run_dir.is_dir():
-        raise HTTPException(400, f"Run directory not found: {body.run_dir}")
+        raise HTTPException(
+            400,
+            f"Run directory not found: {body.run_dir} (resolved: {run_dir})",
+        )
 
     from WEB_app.word_report import build_word_report, parse_incident_datetime
 
@@ -498,7 +535,8 @@ def create_word_report(body: WordReportBody) -> WordReportResponse:
 def download_report(filename: str, run_dir: str) -> FileResponse:
     if ".." in filename or ".." in run_dir:
         raise HTTPException(400, "Invalid path")
-    path = (Path(run_dir) / "reports" / filename).resolve()
+    host_run = _resolve_host_run_dir(run_dir)
+    path = (host_run / "reports" / filename).resolve()
     if not path.is_file():
         raise HTTPException(404, f"Report not found: {filename}")
     return FileResponse(
@@ -543,7 +581,8 @@ def build_status(build_id: str) -> dict[str, Any]:
 def download_video(filename: str, run_dir: str) -> FileResponse:
     if ".." in filename or ".." in run_dir:
         raise HTTPException(400, "Invalid path")
-    path = (Path(run_dir) / filename).resolve()
+    host_run = _resolve_host_run_dir(run_dir)
+    path = (host_run / filename).resolve()
     if not path.is_file():
         raise HTTPException(404, f"Video not found: {filename}")
     return FileResponse(

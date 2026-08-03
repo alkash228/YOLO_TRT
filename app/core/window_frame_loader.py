@@ -117,36 +117,50 @@ def load_video_window(
     Decode until infer_target inference-кадров или конец ролика.
     При stride>1 в RAM только кадры для infer (без «лишних» между stride).
 
-    For start_frame>0 on HEVC this still may warn if seek is used as fallback;
-    WindowPrefetcher uses a persistent capture without seek.
+    Never uses CAP_PROP_POS_FRAMES — sequential skip keeps HEVC (H.265) RPS intact.
+    Prefer WindowPrefetcher for multi-window jobs (one persistent capture).
     """
     cap = cv2.VideoCapture(input_path)
     if not cap.isOpened():
         raise RuntimeError(f"Cannot open video: {input_path}")
 
-    start = max(0, int(start_frame))
     try:
-        if start > 0:
-            # Last resort for one-shot loads. Prefetch path avoids this.
-            cap.set(cv2.CAP_PROP_POS_FRAMES, start)
-            window, _ = load_video_window_from_cap(
-                cap,
-                start,
-                infer_target,
-                frame_stride=frame_stride,
-                total_frames=total_frames,
-                current_pos=start,
-            )
-        else:
-            window, _ = load_video_window_from_cap(
-                cap,
-                0,
-                infer_target,
-                frame_stride=frame_stride,
-                total_frames=total_frames,
-                current_pos=0,
-            )
+        window, _ = load_video_window_from_cap(
+            cap,
+            max(0, int(start_frame)),
+            infer_target,
+            frame_stride=frame_stride,
+            total_frames=total_frames,
+            current_pos=0,
+        )
         return window
+    finally:
+        cap.release()
+
+
+def read_frame_bgr_sequential(
+    input_path: str,
+    frame_idx: int,
+    *,
+    max_skip: int = 500_000,
+) -> np.ndarray | None:
+    """Read one frame by sequential decode (HEVC-safe; no POS_FRAMES seek)."""
+    target = max(0, int(frame_idx))
+    if target > int(max_skip):
+        return None
+    cap = cv2.VideoCapture(str(input_path))
+    if not cap.isOpened():
+        return None
+    try:
+        idx = 0
+        while idx <= target:
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                return None
+            if idx == target:
+                return frame
+            idx += 1
+        return None
     finally:
         cap.release()
 

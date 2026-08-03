@@ -79,17 +79,10 @@ def middle_presence_frame(
 
 
 def read_source_frame_bgr(input_path: str, frame_idx: int) -> np.ndarray | None:
-    cap = cv2.VideoCapture(str(input_path))
-    if not cap.isOpened():
-        return None
-    try:
-        cap.set(cv2.CAP_PROP_POS_FRAMES, int(frame_idx))
-        ok, frame = cap.read()
-        if not ok or frame is None or frame.size == 0:
-            return None
-        return frame
-    finally:
-        cap.release()
+    """Grab one source frame. Sequential decode — HEVC-safe (no POS_FRAMES seek)."""
+    from app.core.window_frame_loader import read_frame_bgr_sequential
+
+    return read_frame_bgr_sequential(str(input_path), int(frame_idx))
 
 
 def render_person_frame_rgb(

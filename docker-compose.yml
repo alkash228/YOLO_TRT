@@ -91,6 +91,8 @@ services:
       # Named volume lives in the Linux VM: fast random read for video decode.
       # Uploads + staged path-job copies go here (not to ../output).
       - yolo_work:/data/work
+      # TRT engines persist across rebuilds (Linux engines ≠ Windows host .engine files).
+      - yolo_trt:/data/models/TRT
       # Pre-place long videos here; path jobs decode in place (no multi‑GB copy).
       - ./videos:/data/videos:ro
       # Allow POST /v1/admin/restart to restart THIS container via Docker Engine.
@@ -98,3 +100,4 @@ services:
 
 volumes:
   yolo_work:
+  yolo_trt:

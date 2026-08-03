@@ -712,6 +712,7 @@ class VideoProcessor:
         metrics_path: Path,
         on_progress: Callable[[VideoProgress], None] | None,
         gpu_monitor: GpuMonitor | None,
+        process_res_mon: ProcessResourceMonitor | None = None,
         phase: str = "inference",
         infer_ms: float | None = None,
         write_metrics: bool = True,
@@ -735,6 +736,13 @@ class VideoProcessor:
             latest = gpu_monitor.latest()
             if latest is not None:
                 gpu_util = latest.gpu_util_pct
+        gpu_mem = 0.0
+        if process_res_mon is not None:
+            proc = process_res_mon.latest()
+            if proc is not None:
+                gpu_mem = float(proc.cuda_allocated_mb)
+        if gpu_mem <= 0.0:
+            gpu_mem = self._gpu_mem_mb()
         infer_ms_val = (
             float(infer_ms)
             if infer_ms is not None
@@ -745,7 +753,7 @@ class VideoProcessor:
             total_frames=total_out,
             fps=proc_fps,
             eta_sec=eta,
-            gpu_mem_mb=self._gpu_mem_mb(),
+            gpu_mem_mb=gpu_mem,
             instances_current=packet.n_inst,
             instances_peak=instances_peak,
             id_switches=self.tracker.total_id_switches,
