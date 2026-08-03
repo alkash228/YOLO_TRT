@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Контроль касок — YOLO_DRT</title>
+  <link rel="stylesheet" href="/static/css/app.css" />
+</head>
+<body>
+  <div class="page">
+    <header class="header">
+      <div class="header-main">
+        <h1>Контроль касок</h1>
+        <p class="subtitle">Загрузите видео — система найдёт нарушения и соберёт клипы</p>
+      </div>
+      <div class="status-pill" id="status-pill" aria-live="polite">
+        <span class="status-dot" id="status-dot"></span>
+        <span id="status-text">Проверка…</span>
+      </div>
+    </header>
+
+    <main class="flow">
+      <section class="card" id="card-job">
+        <div class="step-label">Шаг 1</div>
+        <h2>Загрузить и обработать</h2>
+        <div class="dropzone" id="dropzone">
+          <input type="file" id="file-input" accept="video/*" hidden />
+          <div class="dropzone-icon" aria-hidden="true">
+            <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+              <path d="M12 16V4m0 0L8 8m4-4 4 4M4 17v2a1 1 0 001 1h14a1 1 0 001-1v-2"/>
+            </svg>
+          </div>
+          <p class="dropzone-title">Перетащите видео сюда</p>
+          <p class="dropzone-or">или <button type="button" class="link" id="pick-file">выберите файл</button></p>
+          <p class="file-name" id="file-name">Файл не выбран</p>
+        </div>
+        <button type="button" class="btn btn-primary btn-lg" id="btn-run" disabled>Начать анализ</button>
+        <div class="progress-wrap hidden" id="job-progress-wrap">
+          <div class="progress-bar"><div class="progress-fill" id="job-progress"></div></div>
+          <p class="progress-text" id="job-status">—</p>
+        </div>
+      </section>
+
+      <section class="card hidden" id="card-video">
+        <div class="step-label">Шаг 2</div>
+        <h2>Клипы нарушений</h2>
+        <dl class="meta" id="run-meta"></dl>
+        <p class="warn hidden" id="cross-warn"></p>
+        <p class="hint">Фрагменты по каждому нарушителю — моменты без каски выделены на видео</p>
+        <div class="report-panel" id="report-panel">
+          <h3 class="report-panel-title">Параметры отчёта Word</h3>
+          <div class="report-grid">
+            <label class="field">
+              <span>Компания (тест)</span>
+              <select id="report-company">
+                <option value='ООО «Обнал»'>ООО «Обнал»</option>
+                <option value='ООО «Рога и копыта»'>ООО «Рога и копыта»</option>
+              </select>
+            </label>
+            <label class="field">
+              <span>Организация в отчёте</span>
+              <input type="text" id="report-organization" placeholder="Название организации" />
+            </label>
+            <label class="field">
+              <span>Дата инцидента</span>
+              <input type="date" id="report-date" class="input-date" />
+            </label>
+            <label class="field">
+              <span>Время инцидента</span>
+              <input type="time" id="report-time" class="input-time" step="60" />
+            </label>
+          </div>
+          <p class="hint report-hint">В отчёт попадёт средний кадр присутствия нарушителя с разметкой NO HELMET</p>
+          <div class="report-violators hidden" id="report-violators-wrap">
+            <label class="field">
+              <span>Нарушитель (ID)</span>
+              <select id="report-violator-id"></select>
+            </label>
+            <button type="button" class="btn btn-primary btn-lg" id="btn-report-one">Сформировать отчёт Word</button>
+          </div>
+        </div>
+        <button type="button" class="btn btn-accent btn-lg" id="btn-build">Собрать клипы NO HELMET</button>
+        <div class="progress-wrap hidden" id="build-progress-wrap">
+          <div class="progress-bar"><div class="progress-fill" id="build-progress"></div></div>
+          <p class="progress-text" id="build-status">—</p>
+        </div>
+        <div class="video-list hidden" id="video-list"></div>
+      </section>
+    </main>
+
+    <footer class="footer">
+      <span>YOLO_DRT · автоматический контроль СИЗ</span>
+    </footer>
+  </div>
+  <div class="toast-stack" id="toast-stack" aria-live="polite" aria-atomic="true"></div>
+  <script src="/static/js/app.js"></script>
+</body>
+</html>

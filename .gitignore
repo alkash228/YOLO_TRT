@@ -11,7 +11,7 @@ models/**/*.pth
 models/**/*.engine
 models/**/*.onnx
 docker-build.log
-WEB_app/
+# WEB_app is host-side UI (not in Docker image) — keep in git for sync.
 notebooks/.ipynb_checkpoints/
 notebooks/anaconda_projects/
 notebooks/_nb_extract.txt

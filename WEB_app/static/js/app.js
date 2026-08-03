@@ -1,0 +1,719 @@
+(() => {
+  const $ = (sel) => document.querySelector(sel);
+
+  const statusPill = $("#status-pill");
+  const statusText = $("#status-text");
+  const dropzone = $("#dropzone");
+  const fileInput = $("#file-input");
+  const pickFile = $("#pick-file");
+  const fileName = $("#file-name");
+  const btnRun = $("#btn-run");
+  const jobProgressWrap = $("#job-progress-wrap");
+  const jobProgress = $("#job-progress");
+  const jobStatus = $("#job-status");
+  const cardVideo = $("#card-video");
+  const runMeta = $("#run-meta");
+  const crossWarn = $("#cross-warn");
+  const btnBuild = $("#btn-build");
+  const buildProgressWrap = $("#build-progress-wrap");
+  const buildProgress = $("#build-progress");
+  const buildStatus = $("#build-status");
+  const videoList = $("#video-list");
+  const toastStack = $("#toast-stack");
+  const reportCompany = $("#report-company");
+  const reportOrganization = $("#report-organization");
+  const reportDate = $("#report-date");
+  const reportTime = $("#report-time");
+  const reportViolatorsWrap = $("#report-violators-wrap");
+  const reportViolatorId = $("#report-violator-id");
+  const btnReportOne = $("#btn-report-one");
+
+  let selectedFile = null;
+  let currentJob = null;
+  let currentRunDir = null;
+  let currentRunId = null;
+  let pollTimer = null;
+  let pollJobId = null;
+  let buildPollTimer = null;
+  let apiReady = false;
+  let currentSettings = null;
+
+  /** Poll interval — progress reads throttled slot; 2s avoids GIL noise with infer. */
+  const JOB_POLL_MS = 2000;
+
+  /** Baked fast profile — same as app/config/ui_fast_profile.json */
+  const FAST_PROFILE = {
+    use_reid: false,
+    use_sam_identity: true,
+    use_offline_tracklet_link: true,
+    tracklet_link_use_reid: true,
+    gpu_full_batch: false,
+    preload_video: false,
+    frame_source_mode: "windowed",
+    infer_batch_size: 64,
+    realtime_mode: true,
+    use_seg: false,
+    sam_osnet_reentry: false,
+    encode_mode: "manual",
+    cross_check_enabled: true,
+    cross_check_conf: 0.35,
+    cross_check_min_intersection_px: 20,
+    cross_check_min_iou: 0.03,
+    cross_check_helmet_min_conf: 0.30,
+    cross_check_min_violation_streak: 2,
+    cross_check_verdict_history: 5,
+    pose_kpt_conf: 0.30,
+    default_prompt: "person",
+  };
+
+  function initReportDefaults() {
+    const now = new Date();
+    const pad = (n) => String(n).padStart(2, "0");
+    if (reportDate && !reportDate.value) {
+      reportDate.value = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
+    }
+    if (reportTime && !reportTime.value) {
+      reportTime.value = `${pad(now.getHours())}:${pad(now.getMinutes())}`;
+    }
+    if (reportOrganization && !reportOrganization.value && reportCompany) {
+      reportOrganization.value = reportCompany.value;
+    }
+  }
+
+  function getReportDatetimeIso() {
+    const d = reportDate?.value || "";
+    const t = reportTime?.value || "12:00";
+    return d ? `${d}T${t}` : new Date().toISOString();
+  }
+
+  function getReportPayload(stableId) {
+    return {
+      run_dir: currentRunDir,
+      run_id: currentRunId,
+      stable_id: Number(stableId),
+      company: reportCompany?.value || "",
+      organization: (reportOrganization?.value || reportCompany?.value || "").trim(),
+      incident_datetime: getReportDatetimeIso(),
+    };
+  }
+
+  async function downloadWordReport(stableId, btn) {
+    if (!currentRunDir || !currentRunId) {
+      showToast("Ошибка", "Сначала выполните анализ видео", "error");
+      return;
+    }
+    const prevText = btn?.textContent;
+    if (btn) {
+      btn.disabled = true;
+      btn.textContent = "Формирование…";
+    }
+    try {
+      const r = await fetch("/report/word", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(getReportPayload(stableId)),
+      });
+      if (!r.ok) throw new Error(await r.text());
+      const data = await r.json();
+      const a = document.createElement("a");
+      a.href = data.download_url;
+      a.download = data.filename || "report.docx";
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      showToast("Отчёт готов", `Word-акт для нарушителя №${stableId}`);
+    } catch (e) {
+      showToast("Ошибка отчёта", String(e.message || e), "error", 8000);
+    } finally {
+      if (btn) {
+        btn.disabled = false;
+        btn.textContent = prevText || "Скачать отчёт Word";
+      }
+    }
+  }
+
+  if (reportCompany && reportOrganization) {
+    reportCompany.addEventListener("change", () => {
+      if (!reportOrganization.value.trim() || reportOrganization.dataset.auto === "1") {
+        reportOrganization.value = reportCompany.value;
+        reportOrganization.dataset.auto = "1";
+      }
+    });
+    reportOrganization.addEventListener("input", () => {
+      reportOrganization.dataset.auto = "0";
+    });
+  }
+
+  if (btnReportOne) {
+    btnReportOne.addEventListener("click", () => {
+      const sid = reportViolatorId?.value;
+      if (!sid) {
+        showToast("Выберите нарушителя", "Список ID появится после анализа", "error");
+        return;
+      }
+      downloadWordReport(sid, btnReportOne);
+    });
+  }
+
+  async function loadReportViolators(runDir, runId) {
+    if (!reportViolatorsWrap || !reportViolatorId) return;
+    try {
+      const q = new URLSearchParams({ run_dir: runDir, run_id: runId });
+      const r = await fetch(`/report/violators?${q}`);
+      if (!r.ok) throw new Error(await r.text());
+      const data = await r.json();
+      const list = data.violators || [];
+      if (!list.length) {
+        reportViolatorsWrap.classList.add("hidden");
+        return;
+      }
+      reportViolatorId.innerHTML = list
+        .map(
+          (v) =>
+            `<option value="${v.stable_id}">№ ${v.stable_id} — ${v.violation_count} без каски, ${v.presence_frames} кадр.</option>`
+        )
+        .join("");
+      reportViolatorsWrap.classList.remove("hidden");
+    } catch {
+      reportViolatorsWrap.classList.add("hidden");
+    }
+  }
+
+  async function fetchSettings() {
+    const r = await fetch("/proxy/settings");
+    if (!r.ok) throw new Error(await r.text());
+    const data = await r.json();
+    currentSettings = { ...FAST_PROFILE, ...(data.settings || {}) };
+    return currentSettings;
+  }
+
+  function fastProfilePatch(base) {
+    return { ...FAST_PROFILE, ...(base || {}) };
+  }
+
+  async function applyFastProfile() {
+    // Docker API has no /v1/settings — use baked FAST_PROFILE and continue to upload.
+    try {
+      if (!currentSettings) await fetchSettings();
+    } catch {
+      currentSettings = { ...FAST_PROFILE };
+    }
+    const patch = fastProfilePatch(currentSettings);
+    try {
+      const r = await fetch("/proxy/settings", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          settings: patch,
+          reload_processor: false,
+          ui_equivalent: true,
+        }),
+      });
+      if (r.ok) {
+        const data = await r.json();
+        currentSettings = data.settings || patch;
+        return currentSettings;
+      }
+    } catch {
+      /* ignore — Docker / offline settings */
+    }
+    currentSettings = patch;
+    return currentSettings;
+  }
+
+  async function ensureProcessorReady() {
+    // Desktop: POST bootstrap. Docker: endpoint missing — just re-check /health.
+    try {
+      const r = await fetch("/proxy/admin/bootstrap", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ force: false }),
+      });
+      if (r.ok) return r.json();
+    } catch {
+      /* fall through */
+    }
+    return null;
+  }
+
+  function formatDuration(sec) {
+    const s = Math.max(0, Number(sec) || 0);
+    if (s <= 0) return "";
+    if (s < 60) return `${Math.round(s)} с`;
+    const m = Math.floor(s / 60);
+    const r = Math.round(s % 60);
+    return r > 0 ? `${m} мин ${r} с` : `${m} мин`;
+  }
+
+  function formatEta(sec) {
+    const text = formatDuration(sec);
+    return text ? `осталось ~${text}` : "";
+  }
+
+  function showToast(title, detail, type = "success", durationMs = 6000) {
+    if (!toastStack) return;
+    const toast = document.createElement("div");
+    toast.className = `toast ${type}`;
+    toast.innerHTML = `
+      <div class="toast-icon" aria-hidden="true">${type === "success" ? "✓" : "!"}</div>
+      <div class="toast-body">
+        <strong>${title}</strong>
+        ${detail ? `<span>${detail}</span>` : ""}
+      </div>`;
+    toastStack.appendChild(toast);
+    setTimeout(() => {
+      toast.classList.add("toast-hide");
+      toast.addEventListener("animationend", () => toast.remove(), { once: true });
+    }, durationMs);
+  }
+
+  function notifyBrowser(title, body) {
+    if (!("Notification" in window) || Notification.permission !== "granted") return;
+    try {
+      new Notification(title, { body, icon: "/static/favicon.ico" });
+    } catch {
+      /* ignore */
+    }
+  }
+
+  async function requestNotifyPermission() {
+    if (!("Notification" in window) || Notification.permission !== "default") return;
+    try {
+      await Notification.requestPermission();
+    } catch {
+      /* ignore */
+    }
+  }
+
+  function formatJobStatusLine(job) {
+    const p = job.progress || {};
+    const status = job.status || "?";
+    const total = Number(p.total) || 0;
+    const current = Number(p.current) || 0;
+    const pct =
+      p.percent != null && Number(p.percent) > 0
+        ? Number(p.percent)
+        : total > 0
+          ? (100 * current) / total
+          : 0;
+    const elapsed = Number(p.elapsed_sec) || 0;
+    const fps = Number(p.fps) || 0;
+
+    if (status === "queued") return "В очереди…";
+    if (status === "error" || status === "cancelled") {
+      return job.result?.error || job.error || "Ошибка обработки";
+    }
+    if (status === "done") return formatJobDoneLine(job);
+
+    const parts = [];
+    if (total > 0) {
+      parts.push(`${current} / ${total} кадров`);
+      if (pct > 0) parts.push(`${pct.toFixed(0)}%`);
+    } else {
+      parts.push("Подготовка…");
+    }
+    if (elapsed > 0) parts.push(`прошло ${formatDuration(elapsed)}`);
+    const etaSec = Number(p.eta_seconds) || 0;
+    if (etaSec > 0) parts.push(`осталось ~${formatDuration(etaSec)}`);
+    if (fps > 0) parts.push(`${fps.toFixed(1)} кадр/с`);
+    return parts.join(" · ");
+  }
+
+  function formatJobDoneLine(job) {
+    const p = job.progress || {};
+    const res = job.result || {};
+    const rec = res.record || {};
+    const st = rec.stats_summary || {};
+    const inferSec =
+      Number(st.elapsed_infer_sec) ||
+      Number(st.stage_gpu_infer_sec) ||
+      Number(res.elapsed_sec) ||
+      Number(p.elapsed_sec) ||
+      0;
+    const pass2Sec = Number(st.elapsed_pass2_sec) || 0;
+    const wallSec = Number(res.elapsed_sec) || Number(rec.elapsed_sec) || Number(p.elapsed_sec) || 0;
+    const frames = st.processed_frame_count || st.source_frame_count || res.frames;
+    const parts = ["Готово"];
+    if (frames) parts.push(`${frames} кадров`);
+    if (inferSec > 0) parts.push(`анализ ${formatDuration(inferSec)}`);
+    if (pass2Sec > 0.05) parts.push(`склейка ${formatDuration(pass2Sec)}`);
+    if (wallSec > inferSec + 0.3) parts.push(`всего ${formatDuration(wallSec)}`);
+    const fpsVid = rec.fps || st.video_fps;
+    if (inferSec > 0 && fpsVid > 0 && st.source_frame_count) {
+      const vidSec = st.source_frame_count / fpsVid;
+      parts.push(`${(inferSec / vidSec).toFixed(1)}× от видео`);
+    }
+    const violations = st.cross_check_violations;
+    if (violations != null && Number(violations) >= 0) {
+      parts.push(`${violations} нарушений`);
+    }
+    return parts.join(" · ");
+  }
+
+  function setJobProgressBar(p, status) {
+    const total = Number(p.total) || 0;
+    const current = Number(p.current) || 0;
+    const pct =
+      p.percent != null && Number(p.percent) > 0
+        ? Number(p.percent)
+        : total > 0
+          ? (100 * current) / total
+          : 0;
+    const phase = String(p.phase || "").toLowerCase();
+    const indeterminate =
+      status === "queued" ||
+      status === "running" &&
+        (total <= 0 || phase === "staging" || phase === "warmup" || (current <= 0 && pct <= 0));
+
+    jobProgressWrap.classList.remove("hidden");
+    jobProgress.classList.toggle("indeterminate", Boolean(indeterminate && status === "running" && pct < 1));
+    if (!indeterminate || pct > 0) {
+      jobProgress.style.width = `${Math.min(100, Math.max(0, pct))}%`;
+    } else {
+      jobProgress.style.width = "30%";
+    }
+    return { total, current, pct, phase };
+  }
+
+  function stopJobPoll() {
+    if (pollTimer) {
+      clearTimeout(pollTimer);
+      pollTimer = null;
+    }
+    pollJobId = null;
+    jobProgress.classList.remove("indeterminate");
+  }
+
+  function scheduleJobPoll(jobId) {
+    pollJobId = jobId;
+    if (pollTimer) clearTimeout(pollTimer);
+    pollTimer = setTimeout(() => pollJob(jobId), JOB_POLL_MS);
+  }
+
+  function setStatus(state, text) {
+    if (!statusPill || !statusText) return;
+    statusPill.classList.remove("ready", "busy", "error");
+    if (state) statusPill.classList.add(state);
+    statusText.textContent = text;
+  }
+
+  function setRunEnabled(on) {
+    btnRun.disabled = !on || !selectedFile;
+  }
+
+  async function checkHealth() {
+    setStatus("busy", "Проверка…");
+    try {
+      let r = await fetch("/proxy/health");
+      if (!r.ok) throw new Error(await r.text());
+      let data = await r.json();
+      if (data.status !== "ready") {
+        setStatus("busy", "Загрузка моделей…");
+        await ensureProcessorReady();
+        // Docker may stay in building_engines a while — poll health a few times.
+        for (let i = 0; i < 15 && data.status !== "ready"; i++) {
+          await new Promise((res) => setTimeout(res, 2000));
+          r = await fetch("/proxy/health");
+          if (!r.ok) throw new Error(await r.text());
+          data = await r.json();
+          if (data.status === "building_engines" || data.status === "starting") {
+            setStatus("busy", "Сборка TensorRT / загрузка…");
+          }
+        }
+      }
+      const ok = data.status === "ready";
+      apiReady = ok;
+      const target = data.api_proxy_target ? ` · ${data.api_proxy_target}` : "";
+      setStatus(
+        ok ? "ready" : "error",
+        ok ? `Готово к работе${target}` : `Система недоступна (${data.status || "?"})`
+      );
+      setRunEnabled(ok);
+      if (ok && !currentSettings) {
+        try {
+          await fetchSettings();
+        } catch {
+          currentSettings = { ...FAST_PROFILE };
+        }
+      }
+    } catch (e) {
+      apiReady = false;
+      setStatus("error", "Нет подключения к серверу");
+      setRunEnabled(false);
+      console.warn("checkHealth failed:", e);
+    }
+  }
+
+  function onFile(f) {
+    if (!f) return;
+    selectedFile = f;
+    fileName.textContent = f.name;
+    btnRun.disabled = !apiReady;
+    if (!apiReady) checkHealth();
+  }
+
+  pickFile.addEventListener("click", () => fileInput.click());
+  fileInput.addEventListener("change", () => onFile(fileInput.files[0]));
+
+  dropzone.addEventListener("dragover", (e) => {
+    e.preventDefault();
+    dropzone.classList.add("drag");
+  });
+  dropzone.addEventListener("dragleave", () => dropzone.classList.remove("drag"));
+  dropzone.addEventListener("drop", (e) => {
+    e.preventDefault();
+    dropzone.classList.remove("drag");
+    const f = e.dataTransfer.files[0];
+    if (f) onFile(f);
+  });
+
+  async function pollJob(jobId) {
+    if (pollJobId && pollJobId !== jobId) return;
+    try {
+      const r = await fetch(`/proxy/jobs/${jobId}`);
+      if (!r.ok) throw new Error(await r.text());
+      const job = await r.json();
+      const p = job.progress || {};
+      setJobProgressBar(p, job.status);
+      jobStatus.textContent = formatJobStatusLine(job);
+
+      if (job.status === "running") {
+        const elapsed = Number(p.elapsed_sec) || 0;
+        const eta = Number(p.eta_seconds) || 0;
+        let pill = "Анализ видео…";
+        if (elapsed > 0 && eta > 0) {
+          pill = `${formatDuration(elapsed)} · ${formatEta(eta)}`;
+        } else if (elapsed > 0) {
+          pill = `прошло ${formatDuration(elapsed)}`;
+        }
+        setStatus("busy", pill);
+      }
+
+      if (job.status === "done") {
+        stopJobPoll();
+        jobProgress.style.width = "100%";
+        jobStatus.textContent = formatJobDoneLine(job);
+        currentJob = job;
+        showVideoSection(job);
+        btnRun.disabled = false;
+        btnRun.textContent = "Начать анализ";
+        setStatus("ready", "Готово");
+        const doneDetail = formatJobDoneLine(job).replace(/^Готово · /, "");
+        showToast("Анализ завершён", doneDetail || "Можно перейти к сборке клипов");
+        notifyBrowser("Анализ завершён", doneDetail || "Видео обработано");
+        cardVideo?.scrollIntoView({ behavior: "smooth", block: "start" });
+        return;
+      }
+      if (job.status === "error" || job.status === "cancelled") {
+        stopJobPoll();
+        jobStatus.textContent = job.result?.error || job.error || "Ошибка обработки";
+        btnRun.disabled = false;
+        btnRun.textContent = "Начать анализ";
+        setStatus("error", "Ошибка при обработке");
+        showToast("Ошибка обработки", job.result?.error || job.error || "", "error", 8000);
+        return;
+      }
+      scheduleJobPoll(jobId);
+    } catch (e) {
+      jobStatus.textContent = String(e);
+      scheduleJobPoll(jobId);
+    }
+  }
+
+  function showVideoSection(job) {
+    const res = job.result || {};
+    const record = res.record || {};
+    const stats = record.stats_summary || {};
+    const pipeline = record.pipeline || {};
+    const inferSec =
+      Number(stats.elapsed_infer_sec) ||
+      Number(res.elapsed_sec) ||
+      0;
+    const pass2Sec = Number(stats.elapsed_pass2_sec) || 0;
+    const violations = stats.cross_check_violations ?? pipeline.cross_check_violations ?? "—";
+
+    cardVideo.classList.remove("hidden");
+    initReportDefaults();
+    currentRunDir = res.out_dir || null;
+    currentRunId = res.run_id || null;
+    if (currentRunDir && currentRunId) {
+      loadReportViolators(currentRunDir, currentRunId);
+    }
+    runMeta.innerHTML = `
+      <dt>Кадров обработано</dt><dd>${res.frames ?? stats.processed_frame_count ?? "—"}</dd>
+      <dt>Нарушений (без каски)</dt><dd>${violations}</dd>
+      <dt>Время анализа (YOLO)</dt><dd>${inferSec > 0 ? formatDuration(inferSec) : "—"}</dd>
+      <dt>Склейка ID (Pass2)</dt><dd>${pass2Sec > 0.05 ? formatDuration(pass2Sec) : "—"}</dd>
+      <dt>Файл</dt><dd>${record.input_path ? record.input_path.split(/[/\\]/).pop() : selectedFile?.name || "—"}</dd>
+    `;
+
+    const cc = pipeline.cross_check_enabled;
+    const overlayCc = (record.pipeline || {}).cross_check_enabled;
+    const hasCc = cc || overlayCc;
+    if (!hasCc) {
+      crossWarn.textContent =
+        "Проверка касок была отключена в этом прогоне. Запустите анализ заново.";
+      crossWarn.classList.remove("hidden");
+    } else {
+      crossWarn.classList.add("hidden");
+    }
+
+    btnBuild.onclick = () => startBuild(res.out_dir, res.run_id);
+  }
+
+  btnRun.addEventListener("click", async () => {
+    if (!selectedFile) return;
+    requestNotifyPermission();
+    stopJobPoll();
+    btnRun.disabled = true;
+    btnRun.textContent = "Подготовка…";
+    setStatus("busy", "Подготовка…");
+    jobProgressWrap.classList.remove("hidden");
+    jobProgress.classList.remove("indeterminate");
+    jobProgress.style.width = "0%";
+    jobStatus.textContent = "Настройка профиля…";
+
+    try {
+      await applyFastProfile();
+      await checkHealth();
+      if (!apiReady) throw new Error("Сервер недоступен");
+
+      btnRun.textContent = "Загрузка…";
+      jobStatus.textContent = "Загрузка видео…";
+
+      const patch = fastProfilePatch(currentSettings);
+      const prompt = (patch.default_prompt || "person").trim() || "person";
+      const fd = new FormData();
+      fd.append("file", selectedFile);
+      fd.append("prompt", prompt);
+      const maxSec = patch.max_duration_seconds;
+      if (maxSec != null && Number(maxSec) > 0) {
+        fd.append("max_duration_seconds", String(maxSec));
+      }
+
+      const r = await fetch("/proxy/jobs/upload", { method: "POST", body: fd });
+      if (!r.ok) throw new Error(await r.text());
+      const { job_id } = await r.json();
+      jobStatus.textContent = "Анализ видео…";
+      jobProgress.classList.add("indeterminate");
+      jobProgress.style.width = "30%";
+      pollJobId = job_id;
+      pollJob(job_id);
+    } catch (e) {
+      stopJobPoll();
+      jobStatus.textContent = String(e);
+      btnRun.disabled = false;
+      btnRun.textContent = "Начать анализ";
+    }
+  });
+
+  function renderVideoPlayers(videos) {
+    if (!videos || !videos.length) {
+      videoList.classList.add("hidden");
+      videoList.innerHTML = "";
+      return;
+    }
+    videoList.classList.remove("hidden");
+    videoList.innerHTML = videos
+      .map(
+        (v) => `
+      <article class="video-card" data-stable-id="${v.stable_id}">
+        <h3>Нарушитель #${v.stable_id}${v.violation_count != null ? ` · ${v.violation_count} без каски` : ""}${v.presence_frames != null ? ` · ${v.presence_frames} кадр. в кадре` : ""}</h3>
+        <video controls preload="metadata" playsinline src="${encodeURI(v.video_url)}"></video>
+        <a class="btn btn-download" href="${encodeURI(v.video_url)}" download="${v.video_name}">Скачать MP4</a>
+        <button type="button" class="btn btn-report" data-report-id="${v.stable_id}">Скачать отчёт Word</button>
+      </article>`
+      )
+      .join("");
+    videoList.querySelectorAll(".btn-report").forEach((btn) => {
+      btn.addEventListener("click", () => downloadWordReport(btn.dataset.reportId, btn));
+    });
+  }
+
+  function finishBuildPoll(data, ok, message) {
+    clearInterval(buildPollTimer);
+    buildPollTimer = null;
+    buildStatus.textContent = message;
+    if (ok && (data.videos || []).length) {
+      renderVideoPlayers(data.videos);
+      showToast("Клипы готовы", `Собрано ${data.videos.length} видео`);
+      notifyBrowser("Клипы готовы", `Собрано ${data.videos.length} видео`);
+    }
+    btnBuild.disabled = false;
+    btnBuild.textContent = "Собрать клипы NO HELMET";
+  }
+
+  async function pollBuild(buildId) {
+    try {
+      const r = await fetch(`/build-video/${buildId}`);
+      const data = await r.json();
+      const prog = data.progress || {};
+      const logs = data.logs || [];
+
+      if (data.status === "running") {
+        if (prog.total > 0) {
+          buildProgress.style.width = `${Math.min(100, (100 * prog.done) / prog.total)}%`;
+          buildStatus.textContent = `Encode ${prog.done}/${prog.total}`;
+        } else if (logs.length) {
+          buildStatus.textContent = logs[logs.length - 1];
+        }
+        return;
+      }
+
+      if (data.status === "done" && (data.videos || []).length) {
+        finishBuildPoll(
+          data,
+          true,
+          `Готово: ${data.videos.length} клип(ов)`
+        );
+        return;
+      }
+
+      if (data.status === "done") {
+        finishBuildPoll(
+          data,
+          false,
+          "Нарушений не найдено — клипы не созданы"
+        );
+        return;
+      }
+
+      if (data.status === "error") {
+        const err = data.error || logs[logs.length - 1] || "Encode error";
+        finishBuildPoll(data, false, err);
+      }
+    } catch (e) {
+      finishBuildPoll({}, false, String(e));
+    }
+  }
+
+  async function startBuild(runDir, runId) {
+    if (!runDir || !runId) return;
+    btnBuild.disabled = true;
+    btnBuild.textContent = "Сборка…";
+    buildProgressWrap.classList.remove("hidden");
+    videoList.classList.add("hidden");
+    videoList.innerHTML = "";
+    buildProgress.style.width = "0%";
+    buildStatus.textContent = "Старт…";
+
+    try {
+      const r = await fetch("/build-video", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ run_dir: runDir, run_id: runId }),
+      });
+      if (!r.ok) throw new Error(await r.text());
+      const { build_id } = await r.json();
+      buildPollTimer = setInterval(() => pollBuild(build_id), 1200);
+      pollBuild(build_id);
+    } catch (e) {
+      buildStatus.textContent = String(e);
+      btnBuild.disabled = false;
+      btnBuild.textContent = "Собрать клипы NO HELMET";
+    }
+  }
+
+  checkHealth();
+  initReportDefaults();
+})();
