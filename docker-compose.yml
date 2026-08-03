@@ -65,9 +65,10 @@ services:
       YOLO_DRT_PRELOAD_VIDEO: "false"
       YOLO_DRT_FRAME_SOURCE_MODE: windowed
       YOLO_DRT_FRAME_STRIDE: "0"
-      YOLO_DRT_INFER_BATCH_SIZE: "64"
-      YOLO_DRT_GPU_QUEUE_DEPTH: "4"
-      YOLO_DRT_DECODE_PREFETCH: "4"
+      # Keep job batch moderate; TRT engine profile must fit laptop VRAM at build time.
+      YOLO_DRT_INFER_BATCH_SIZE: "32"
+      YOLO_DRT_GPU_QUEUE_DEPTH: "2"
+      YOLO_DRT_DECODE_PREFETCH: "2"
       YOLO_DRT_TRACK_BUFFER: "300"
       YOLO_DRT_DETECT_CONF: "0.20"
       YOLO_DRT_APPEARANCE_THRESH: "0.55"
@@ -80,9 +81,10 @@ services:
       YOLO_DRT_TRT_REBUILD_POLICY: missing_only
       YOLO_DRT_TRT_MANIFEST_DIR: /data/models/TRT
       YOLO_DRT_TRT_IMGSZ: "640"
-      YOLO_DRT_TRT_MAX_BATCH: "32"
+      # batch=32 pose TRT failed on 5070 Ti laptop (insufficient tactic memory).
+      YOLO_DRT_TRT_MAX_BATCH: "8"
       YOLO_DRT_TRT_FP16: "true"
-      YOLO_DRT_TRT_WORKSPACE_GB: "2.0"
+      YOLO_DRT_TRT_WORKSPACE_GB: "4.0"
       YOLO_DRT_TRT_AUTOCAST_FAST: "true"
       YOLO_DRT_INFERENCE_DEVICE: cuda
     volumes:

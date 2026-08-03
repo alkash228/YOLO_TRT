@@ -183,7 +183,8 @@ ADMIN_HTML = """<!DOCTYPE html>
       setTimeout(refresh, 4000);
     }
     refresh();
-    setInterval(refresh, 3000);
+    // Soft poll — aggressive /admin refresh GIL-starves the single uvicorn worker.
+    setInterval(refresh, 8000);
   </script>
 </body>
 </html>
