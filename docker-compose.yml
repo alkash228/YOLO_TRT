@@ -6,7 +6,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: yolo-drt-api:latest
+    image: yolo-drt-api:V0.5
     container_name: yolo-drt-api
     restart: unless-stopped
     runtime: nvidia

@@ -2,6 +2,8 @@
 
 Один контейнер **`yolo-drt-api`**: FastAPI + ядро пайплайна (`api/` + `app/`). GPU inference, очередь job'ов, результаты на диск.
 
+Образ: **`yolo-drt-api:V0.5`** (тег в `docker-compose.yml`).
+
 ---
 
 ## Что внутри образа
