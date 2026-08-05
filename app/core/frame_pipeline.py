@@ -477,6 +477,8 @@ def post_process_frame(
     cross_check_enabled: bool = False,
     cross_check_draw_head_box: bool = True,
     cross_check_draw_boxes: bool = True,
+    pose_point_radius: int = 4,
+    pose_line_thickness: int = 2,
 ) -> PostResult:
     t0 = time.perf_counter()
     kpts = packet.keypoints_list or []
@@ -510,6 +512,8 @@ def post_process_frame(
             colors,
             kpt_conf=pose_kpt_conf,
             draw_skeleton=True,
+            point_radius=int(max(3, pose_point_radius)),
+            line_thickness=int(max(2, pose_line_thickness)),
         )
     accessories = packet.cross_check_accessories or []
     if cross_check_enabled and cross_check_draw_boxes and accessories:

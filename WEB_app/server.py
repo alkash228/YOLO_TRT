@@ -603,10 +603,13 @@ def _run_dir_query(run_dir: str) -> str:
 
 def _video_item(stable_id: int | str, video_name: str, run_dir: str) -> dict[str, str | int]:
     run_q = _run_dir_query(run_dir)
+    # Bust browser cache after rebuild (same filename otherwise keeps old MP4).
+    vpath = Path(run_dir) / str(video_name)
+    ver = int(vpath.stat().st_mtime) if vpath.is_file() else 0
     return {
         "stable_id": int(stable_id) if str(stable_id).isdigit() else stable_id,
         "video_name": video_name,
-        "video_url": f"/videos/{quote(video_name)}?run_dir={run_q}",
+        "video_url": f"/videos/{quote(video_name)}?run_dir={run_q}&v={ver}",
     }
 
 

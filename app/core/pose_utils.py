@@ -112,6 +112,8 @@ def draw_pose_on_frame(
                 if 0 <= xi < w and 0 <= yi < h:
                     pts.append((xi, yi))
                     cv2.circle(out, (xi, yi), point_radius, color, -1, lineType=cv2.LINE_AA)
+                    # Dark outline so skeleton stays readable on busy construction frames.
+                    cv2.circle(out, (xi, yi), point_radius + 1, (0, 0, 0), 1, lineType=cv2.LINE_AA)
                 else:
                     pts.append(None)
             else:
@@ -121,5 +123,6 @@ def draw_pose_on_frame(
                 continue
             pa, pb = pts[a], pts[b]
             if pa is not None and pb is not None:
+                cv2.line(out, pa, pb, (0, 0, 0), line_thickness + 2, lineType=cv2.LINE_AA)
                 cv2.line(out, pa, pb, color, line_thickness, lineType=cv2.LINE_AA)
     return out

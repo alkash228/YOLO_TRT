@@ -20,6 +20,8 @@ from WEB_app.video_builder import (
     load_run_metadata,
     resolve_overlay,
     stamp_all_people_boxes_rgb,
+    stamp_all_poses_rgb,
+    stamp_debug_hud_rgb,
     web_debug_show_all_dets,
 )
 
@@ -268,6 +270,15 @@ def render_person_frame_rgb(
     job = _EncodeJob(src_i=int(frame_idx), carry=draw_packet, frame_bgr=frame_bgr)
     _, rgb = _render_encode_job(job, ctx)
     if debug_all:
+        rgb = stamp_all_poses_rgb(
+            rgb,
+            replace(draw_packet, frame_idx=int(frame_idx)),
+            target_w=ctx.target_w,
+            target_h=ctx.target_h,
+            pose_kpt_conf=float(overlay.get("pose_kpt_conf", 0.25)),
+            pose_point_radius=int(overlay.get("pose_point_radius", 6) or 6),
+            pose_line_thickness=int(overlay.get("pose_line_thickness", 3) or 3),
+        )
         rgb = stamp_all_people_boxes_rgb(
             rgb,
             replace(draw_packet, frame_idx=int(frame_idx)),
@@ -283,6 +294,11 @@ def render_person_frame_rgb(
             target_h=ctx.target_h,
             frame_bgr=frame_bgr,
             force=force_hl,
+        )
+        rgb = stamp_debug_hud_rgb(
+            rgb,
+            replace(draw_packet, frame_idx=int(frame_idx)),
+            draw_pose=bool(overlay.get("draw_pose", True)),
         )
     return _annotate_stable_id(rgb, int(stable_id), int(frame_idx))
 

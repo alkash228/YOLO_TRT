@@ -271,6 +271,8 @@ def _render_encode_job(job: _EncodeJob, ctx: _RenderContext) -> tuple[int, np.nd
         cross_check_enabled=bool(ctx.overlay.get("cross_check_enabled", False)),
         cross_check_draw_head_box=bool(ctx.overlay.get("cross_check_draw_head_box", True)),
         cross_check_draw_boxes=bool(ctx.overlay.get("cross_check_draw_boxes", True)),
+        pose_point_radius=int(ctx.overlay.get("pose_point_radius", 4) or 4),
+        pose_line_thickness=int(ctx.overlay.get("pose_line_thickness", 2) or 2),
     )
     rgb = _rgb_to_size(result.rgb, ctx.target_w, ctx.target_h)
     return job.src_i, rgb
@@ -614,10 +616,12 @@ def _encode_timeline_streaming(
     on_log: Callable[[str], None] | None = None,
     encode_src_indices: set[int] | None = None,
     run_id: str | None = None,
+    render_job_fn: Callable[[_EncodeJob, _RenderContext], tuple[int, np.ndarray]] | None = None,
 ) -> Path:
     if source_frame_count <= 0:
         raise ValueError("source_frame_count required for streaming encode")
 
+    render_one = render_job_fn or _render_encode_job
     video_path = Path(video_path)
     video_path.parent.mkdir(parents=True, exist_ok=True)
     recorded_input = input_path
@@ -741,7 +745,7 @@ def _encode_timeline_streaming(
             next_write = seq
         fb_copy = frame_bgr.copy() if frame_bgr is not None else None
         pending[seq] = executor.submit(
-            _render_encode_job,
+            render_one,
             _EncodeJob(src_i=src_i, carry=replace(carry_local), frame_bgr=fb_copy),
             render_ctx,
         )
@@ -791,7 +795,7 @@ def _encode_timeline_streaming(
 
                 fb_copy = frame_bgr.copy() if frame_bgr is not None else None
                 job = _EncodeJob(src_i=src_i, carry=replace(carry), frame_bgr=fb_copy)
-                pending[seq] = executor.submit(_render_encode_job, job, render_ctx)
+                pending[seq] = executor.submit(render_one, job, render_ctx)
 
                 _flush_ready(block=False)
                 while len(pending) >= max_inflight:

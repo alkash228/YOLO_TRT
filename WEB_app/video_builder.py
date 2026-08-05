@@ -194,10 +194,46 @@ def resolve_overlay(
         overlay["cross_check_enabled"] = True
         overlay["cross_check_draw_head_box"] = True
         overlay["cross_check_draw_boxes"] = True
+        overlay["pose_point_radius"] = 6
+        overlay["pose_line_thickness"] = 3
     else:
         # Production violation clips: don't spam accessory boxes of bystanders.
         overlay["cross_check_draw_boxes"] = False
     return overlay
+
+
+def stamp_debug_hud_rgb(
+    rgb: np.ndarray,
+    packet: FramePacket,
+    *,
+    draw_pose: bool,
+) -> np.ndarray:
+    """Visible proof that new WEB debug render ran (not a cached old clip)."""
+    kpts = packet.keypoints_list or []
+    n_kpt = sum(
+        1
+        for k in kpts
+        if k is not None and getattr(k, "size", 0) > 0
+    )
+    label = (
+        f"DBG full-scene  people={int(packet.n_inst)}  "
+        f"pose={'ON' if draw_pose else 'off'}  kpts={n_kpt}"
+    )
+    out = np.ascontiguousarray(rgb.copy())
+    bgr = cv2.cvtColor(out, cv2.COLOR_RGB2BGR)
+    h, w = bgr.shape[:2]
+    cv2.rectangle(bgr, (0, h - 36), (w, h), (0, 0, 0), -1)
+    cv2.putText(
+        bgr,
+        label,
+        (12, h - 12),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.65,
+        (0, 255, 255),
+        2,
+        cv2.LINE_AA,
+    )
+    return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
 
 
 def iter_run_packets(data: dict[str, Any], run_dir: Path) -> Iterator[FramePacket]:
@@ -705,6 +741,69 @@ def highlight_no_helmet_on_rgb(
     return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
 
 
+def stamp_all_poses_rgb(
+    rgb: np.ndarray,
+    packet: FramePacket,
+    *,
+    target_w: int,
+    target_h: int,
+    pose_kpt_conf: float = 0.25,
+    pose_point_radius: int = 6,
+    pose_line_thickness: int = 3,
+) -> np.ndarray:
+    """
+    Draw YOLO pose skeletons for EVERY instance in the packet.
+    Independent of mask overlay / single-id filter — fixes 'skeleton only on violator'.
+    """
+    from app.core.exporter import pose_overlay_colors
+    from app.core.frame_pipeline import _scale_keypoints_list
+    from app.core.pose_utils import draw_pose_on_frame
+
+    kpts = list(packet.keypoints_list or [])
+    if not kpts:
+        return rgb
+
+    tw, th = int(target_w), int(target_h)
+    src_h = src_w = 0
+    if packet.mask_hw:
+        src_h, src_w = int(packet.mask_hw[0]), int(packet.mask_hw[1])
+    elif packet.stack is not None and packet.stack.ndim == 3 and packet.stack.shape[0] > 0:
+        src_h, src_w = int(packet.stack.shape[1]), int(packet.stack.shape[2])
+    if src_h > 0 and src_w > 0 and (src_h != th or src_w != tw):
+        kpts = _scale_keypoints_list(kpts, float(tw) / float(src_w), float(th) / float(src_h))
+
+    # Also scale if image size differs from requested target (letterbox / resize).
+    ih, iw = int(rgb.shape[0]), int(rgb.shape[1])
+    if (ih, iw) != (th, tw) and ih > 0 and iw > 0:
+        kpts = _scale_keypoints_list(kpts, float(iw) / float(tw), float(ih) / float(th))
+
+    out = np.ascontiguousarray(rgb.copy())
+    bgr = cv2.cvtColor(out, cv2.COLOR_RGB2BGR)
+    # High-contrast BGR colors so bystander skeletons are not lost on concrete/sun.
+    palette = [
+        (0, 255, 255),  # cyan
+        (255, 0, 255),  # magenta
+        (0, 255, 0),  # green
+        (255, 255, 0),  # yellow
+        (255, 128, 0),  # orange
+        (255, 0, 128),  # pink
+    ]
+    n = max(int(packet.n_inst or 0), len(kpts), 1)
+    colors = [palette[i % len(palette)] for i in range(n)]
+    # Keep default distinct palette as fallback length pad.
+    colors = colors + pose_overlay_colors(n)[len(colors) :]
+    bgr = draw_pose_on_frame(
+        bgr,
+        kpts,
+        colors,
+        kpt_conf=float(pose_kpt_conf),
+        draw_skeleton=True,
+        point_radius=int(max(4, pose_point_radius)),
+        line_thickness=int(max(3, pose_line_thickness)),
+    )
+    return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+
+
 def _render_full_scene_highlight(
     job: _EncodeJob,
     ctx: _RenderContext,
@@ -716,6 +815,16 @@ def _render_full_scene_highlight(
     work = replace(carry, frame_idx=job.src_i)
     src_i, rgb = _render_encode_job(
         replace(job, carry=work, frame_bgr=job.frame_bgr), ctx
+    )
+    # Force skeletons for all people (even if base render was single-id somehow).
+    rgb = stamp_all_poses_rgb(
+        rgb,
+        work,
+        target_w=ctx.target_w,
+        target_h=ctx.target_h,
+        pose_kpt_conf=float(ctx.overlay.get("pose_kpt_conf", 0.25)),
+        pose_point_radius=int(ctx.overlay.get("pose_point_radius", 6) or 6),
+        pose_line_thickness=int(ctx.overlay.get("pose_line_thickness", 3) or 3),
     )
     # Always stamp meta boxes so bystanders stay visible even if mask overlay failed.
     rgb = stamp_all_people_boxes_rgb(
@@ -733,6 +842,11 @@ def _render_full_scene_highlight(
         target_h=ctx.target_h,
         frame_bgr=job.frame_bgr,
         force=force_highlight,
+    )
+    rgb = stamp_debug_hud_rgb(
+        rgb,
+        work,
+        draw_pose=bool(ctx.overlay.get("draw_pose", True)),
     )
     return src_i, rgb
 
@@ -822,38 +936,44 @@ def _encode_one_violator(
     violation_frames: set[int] | None = None,
     violations_only: bool = True,
 ) -> Path:
-    import app.core.video_encode as ve
+    if on_log and web_debug_show_all_dets():
+        on_log(
+            "WEB debug overlay ON: full scene + pose + NO HELMET highlight "
+            f"(id={stable_id})"
+        )
+    # Force rewrite so players/browsers cannot keep a stale same-name MP4.
+    try:
+        if Path(video_path).is_file():
+            Path(video_path).unlink()
+    except OSError:
+        pass
 
     render_fn = (
         _make_violator_render_fn(stable_id)
         if violations_only
         else _make_person_render_fn(stable_id)
     )
-    orig_render = ve._render_encode_job
-    try:
-        ve._render_encode_job = render_fn
-        path = _encode_timeline_streaming(
-            lookup,
-            video_path=video_path,
-            fps=float(meta["fps"]),
-            prompt=str(meta["prompt"]),
-            overlay=overlay,
-            input_path=str(meta["input_path"]) or None,
-            width=int(meta["width"]),
-            height=int(meta["height"]),
-            source_frame_count=int(meta["source_frame_count"]),
-            frame_stride=int(meta.get("frame_stride") or 1),
-            post_workers=post_workers,
-            encode_preset=encode_preset,
-            encode_crf=encode_crf,
-            encode_codec=encode_codec,
-            on_progress=on_progress,
-            on_log=on_log,
-            encode_src_indices=violation_frames,
-            run_id=str(run_id),
-        )
-    finally:
-        ve._render_encode_job = orig_render
+    path = _encode_timeline_streaming(
+        lookup,
+        video_path=video_path,
+        fps=float(meta["fps"]),
+        prompt=str(meta["prompt"]),
+        overlay=overlay,
+        input_path=str(meta["input_path"] or "") or None,
+        width=int(meta["width"]),
+        height=int(meta["height"]),
+        source_frame_count=int(meta["source_frame_count"]),
+        frame_stride=int(meta.get("frame_stride") or 1),
+        post_workers=post_workers,
+        encode_preset=encode_preset,
+        encode_crf=encode_crf,
+        encode_codec=encode_codec,
+        on_progress=on_progress,
+        on_log=on_log,
+        encode_src_indices=violation_frames,
+        run_id=str(run_id),
+        render_job_fn=render_fn,
+    )
 
     # Violation clips are short — skip full-length audio mux.
     if not violation_frames:
