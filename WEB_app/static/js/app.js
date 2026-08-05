@@ -356,6 +356,7 @@
       const list = data.violators || [];
       if (!list.length) {
         reportViolatorsWrap.classList.add("hidden");
+        showToast("Нарушителей нет", "В этом прогоне нет NO HELMET (или порог отсёк всех)", "error", 7000);
         return;
       }
       reportViolatorId.innerHTML = list
@@ -727,7 +728,17 @@
     }
   }
 
-  function showVideoSection(job) {
+  async function resolveHostRun(runDir, runId) {
+    const r = await fetch("/local/select-run", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ run_dir: runDir, run_id: runId || null }),
+    });
+    if (!r.ok) throw new Error(await r.text());
+    return r.json();
+  }
+
+  async function showVideoSection(job) {
     const res = job.result || {};
     const record = res.record || {};
     const stats = record.stats_summary || {};
@@ -741,13 +752,35 @@
 
     cardVideo.classList.remove("hidden");
     initReportDefaults();
-    currentRunDir = res.out_dir || null;
-    currentRunId = res.run_id || null;
-    if (currentRunDir && currentRunId) {
+
+    let runDir = res.out_dir || null;
+    let runId = res.run_id || null;
+    let resolveErr = "";
+    if (runDir) {
+      try {
+        const mapped = await resolveHostRun(runDir, runId);
+        runDir = mapped.run_dir || runDir;
+        runId = mapped.run_id || runId;
+      } catch (e) {
+        resolveErr = String(e);
+        showToast(
+          "Папка прогона не найдена на диске",
+          "Docker пишет в output рядом с репо. Открой прогон вручную в шаге 2.",
+          "error",
+          12000
+        );
+      }
+    }
+
+    currentRunDir = runDir;
+    currentRunId = runId;
+    if (currentRunDir && currentRunId && !resolveErr) {
       loadReportViolators(currentRunDir, currentRunId);
     }
     runMeta.innerHTML = `
       <dt>Job ID</dt><dd><code>${currentJob?.job_id || pollJobId || "—"}</code></dd>
+      <dt>Run ID</dt><dd><code>${currentRunId || "—"}</code></dd>
+      <dt>Папка на диске</dt><dd><code>${currentRunDir || "—"}</code></dd>
       <dt>Кадров обработано</dt><dd>${res.frames ?? stats.processed_frame_count ?? "—"}</dd>
       <dt>Нарушений (без каски)</dt><dd>${violations}</dd>
       <dt>Время анализа (YOLO)</dt><dd>${inferSec > 0 ? formatDuration(inferSec) : "—"}</dd>
@@ -758,7 +791,10 @@
     const cc = pipeline.cross_check_enabled;
     const overlayCc = (record.pipeline || {}).cross_check_enabled;
     const hasCc = cc || overlayCc;
-    if (!hasCc) {
+    if (resolveErr) {
+      crossWarn.textContent = resolveErr;
+      crossWarn.classList.remove("hidden");
+    } else if (!hasCc) {
       crossWarn.textContent =
         "Проверка касок была отключена в этом прогоне. Запустите анализ заново.";
       crossWarn.classList.remove("hidden");
@@ -766,7 +802,7 @@
       crossWarn.classList.add("hidden");
     }
 
-    btnBuild.onclick = () => startBuild(res.out_dir, res.run_id);
+    btnBuild.onclick = () => startBuild(currentRunDir, currentRunId);
   }
 
   btnRun.addEventListener("click", async () => {

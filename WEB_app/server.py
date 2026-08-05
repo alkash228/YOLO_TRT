@@ -205,15 +205,27 @@ _DOCKER_OUTPUT_PREFIXES = ("/data/output",)
 
 
 def _host_output_candidates() -> list[Path]:
-    """Host folders that may contain run dirs. Prefer WEB_app/output."""
+    """
+    Host folders that may contain run dirs.
+
+    Docker compose bind is ``../output:/data/output`` relative to YOLO_DOCKER —
+    that is repo ``output/`` when WEB lives in ``YOLO_DRT/WEB_app``, or
+    ``<parent>/output`` when the git clone root is YOLO_DOCKER itself.
+    Prefer those over empty ``WEB_app/output``.
+    """
     out: list[Path] = []
     raw = os.environ.get("YOLO_DRT_HOST_OUTPUT_DIR", "").strip()
     if raw:
         out.append(Path(raw))
-    out.append(WEB_OUTPUT_DIR)
-    # Legacy: repo root / parent
     out.append(ROOT / "output")
     out.append(ROOT.parent / "output")
+    # WEB started from YOLO_DOCKER tree while compose mounts ../output
+    if (ROOT / "docker-compose.yml").is_file() or (ROOT / "Dockerfile").is_file():
+        out.append(ROOT.parent / "output")
+    docker_compose = ROOT / "YOLO_DOCKER" / "docker-compose.yml"
+    if docker_compose.is_file():
+        out.append((ROOT / "YOLO_DOCKER").parent / "output")
+    out.append(WEB_OUTPUT_DIR)
     out.append(Path.cwd() / "output")
     seen: set[str] = set()
     uniq: list[Path] = []
@@ -230,17 +242,35 @@ def _host_output_candidates() -> list[Path]:
 
 
 def ensure_web_output_dir() -> Path:
-    """Canonical output inside WEB_app/ (create if missing)."""
+    """Ensure WEB_app/output exists (manual drop folder); not the Docker bind."""
     WEB_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     return WEB_OUTPUT_DIR
 
 
-def _host_output_root() -> Path:
+def _primary_host_output() -> Path:
+    """Folder where Docker runs actually land (has run dirs), else ROOT/output."""
     ensure_web_output_dir()
+    best: Path | None = None
+    best_n = -1
     for p in _host_output_candidates():
-        if p.is_dir():
-            return p
-    return WEB_OUTPUT_DIR
+        if not p.is_dir():
+            continue
+        try:
+            n = sum(1 for c in p.iterdir() if _is_run_dir(c))
+        except OSError:
+            n = 0
+        if n > best_n:
+            best_n = n
+            best = p
+    if best is not None and best_n > 0:
+        return best
+    preferred = ROOT / "output"
+    preferred.mkdir(parents=True, exist_ok=True)
+    return preferred
+
+
+def _host_output_root() -> Path:
+    return _primary_host_output()
 
 
 def _is_run_dir(path: Path) -> bool:
@@ -275,7 +305,10 @@ def list_local_runs(limit: int = 80) -> list[dict[str, Any]]:
         for child in kids:
             if not _is_run_dir(child):
                 continue
-            key = str(child.resolve())
+            try:
+                key = str(child.resolve())
+            except OSError:
+                key = str(child)
             if key in found:
                 continue
             try:
@@ -290,53 +323,70 @@ def list_local_runs(limit: int = 80) -> list[dict[str, Any]]:
                 "run_dir": key,
                 "run_id": rid,
                 "name": child.name,
-                "root": str(root.resolve()),
+                "root": str(root.resolve()) if root.exists() else str(root),
                 "mtime": mtime,
             }
-            if len(found) >= max(1, int(limit)):
-                break
-        if len(found) >= max(1, int(limit)):
-            break
     rows = list(found.values())
     rows.sort(key=lambda r: float(r.get("mtime") or 0), reverse=True)
-    return rows
+    return rows[: max(1, int(limit))]
 
 
 def _resolve_host_run_dir(run_dir: str | Path) -> Path:
-    """Map Docker /data/output/... to the Windows host bind-mount path."""
+    """Map Docker /data/output/... (or bare run id) to the Windows host bind-mount path."""
     raw = str(run_dir or "").strip().replace("\\", "/")
     if not raw:
         return Path(raw)
     p = Path(raw)
+    if p.is_dir() and _is_run_dir(p):
+        return p
     if p.is_dir():
         return p
 
+    name = Path(raw.rstrip("/")).name
     rel = ""
     for prefix in _DOCKER_OUTPUT_PREFIXES:
         if raw == prefix or raw.startswith(prefix + "/"):
             rel = raw[len(prefix) :].lstrip("/")
             break
 
-    tried: list[Path] = []
+    search_rels: list[str] = []
     if rel:
+        search_rels.append(rel)
+    if name and name not in search_rels:
+        search_rels.append(name)
+
+    for sn in search_rels:
         for root in _host_output_candidates():
-            mapped = root / rel if rel else root
-            tried.append(mapped)
+            mapped = (root / sn).resolve() if root.exists() else (root / sn)
             if mapped.is_dir():
                 return mapped
-        # Prefer first candidate in error path (even if missing)
-        return tried[0] if tried else (WEB_OUTPUT_DIR / rel)
 
-    # Non-docker path that doesn't exist — still return as-is
+    # Last resort: any candidate child matching run folder name
+    if name:
+        for root in _host_output_candidates():
+            if not root.is_dir():
+                continue
+            try:
+                for child in root.iterdir():
+                    if child.name == name and child.is_dir():
+                        return child
+                    if _is_run_dir(child):
+                        for cand in child.glob(f"{name}_result.json"):
+                            return child
+            except OSError:
+                continue
+
+    if search_rels:
+        return _primary_host_output() / search_rels[0]
     return p
 
 
 def _run_dir_missing_detail(original: str, resolved: Path) -> str:
     roots = ", ".join(str(r) for r in _host_output_candidates())
     return (
-        f"Run directory not found: {original} (resolved: {resolved}). "
-        f"Docker пишет прогоны в WEB_app/output. Положи папку прогона туда "
-        f"(WEB_app\\output\\{Path(original).name}) или выбери её в UI. "
+        f"Папка прогона не найдена: {original} → {resolved}. "
+        f"Docker пишет в bind ../output (обычно {ROOT / 'output'}). "
+        f"Открой прогон в шаге «Выбрать прогон» или задай YOLO_DRT_HOST_OUTPUT_DIR. "
         f"Искали в: {roots}"
     )
 
@@ -456,9 +506,10 @@ def access_info() -> dict[str, Any]:
 
 @app.get("/local/output")
 def local_output_info() -> dict[str, Any]:
-    root = ensure_web_output_dir()
+    root = _primary_host_output()
     return {
         "output_dir": str(root.resolve()),
+        "web_drop_dir": str(ensure_web_output_dir().resolve()),
         "candidates": [str(p) for p in _host_output_candidates()],
         "runs": list_local_runs(limit=100),
     }
@@ -466,7 +517,10 @@ def local_output_info() -> dict[str, Any]:
 
 @app.get("/local/runs")
 def local_runs(limit: int = 100) -> dict[str, Any]:
-    return {"runs": list_local_runs(limit=limit), "output_dir": str(ensure_web_output_dir().resolve())}
+    return {
+        "runs": list_local_runs(limit=limit),
+        "output_dir": str(_primary_host_output().resolve()),
+    }
 
 
 class SelectRunBody(BaseModel):
@@ -492,7 +546,7 @@ def local_select_run(body: SelectRunBody) -> dict[str, Any]:
         "ok": True,
         "run_dir": str(run_path.resolve()),
         "run_id": rid,
-        "output_dir": str(ensure_web_output_dir().resolve()),
+        "output_dir": str(_primary_host_output().resolve()),
     }
 
 
