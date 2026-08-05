@@ -6,6 +6,8 @@ __pycache__/
 *.onnx
 output/*
 !output/.gitkeep
+WEB_app/output/*
+!WEB_app/output/.gitkeep
 # веса не в git — кладёшь локально в models/, они попадают в образ при docker build
 models/**/*.pt
 models/**/*.pth

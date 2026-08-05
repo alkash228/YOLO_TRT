@@ -86,8 +86,8 @@ services:
       YOLO_DRT_TRT_AUTOCAST_FAST: "true"
       YOLO_DRT_INFERENCE_DEVICE: cuda
     volumes:
-      # Same folder WEB uses: <repo>/output
-      - ./output:/data/output
+      # Same folder WEB uses: WEB_app/output
+      - ./WEB_app/output:/data/output
       # Named volume lives in the Linux VM: fast random read for video decode.
       # Uploads + staged path-job copies go here (not to ../output).
       - yolo_work:/data/work

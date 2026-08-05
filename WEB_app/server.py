@@ -23,6 +23,8 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
+WEB_APP_DIR = Path(__file__).resolve().parent
+WEB_OUTPUT_DIR = WEB_APP_DIR / "output"
 
 
 _env_api = os.environ.get("YOLO_DRT_API_URL", "").strip()
@@ -203,13 +205,14 @@ _DOCKER_OUTPUT_PREFIXES = ("/data/output",)
 
 
 def _host_output_candidates() -> list[Path]:
-    """Host folders that may contain run dirs. Prefer <repo>/output (WEB + compose ./output)."""
+    """Host folders that may contain run dirs. Prefer WEB_app/output."""
     out: list[Path] = []
     raw = os.environ.get("YOLO_DRT_HOST_OUTPUT_DIR", "").strip()
     if raw:
         out.append(Path(raw))
+    out.append(WEB_OUTPUT_DIR)
+    # Legacy: repo root / parent
     out.append(ROOT / "output")
-    # Legacy layouts
     out.append(ROOT.parent / "output")
     out.append(Path.cwd() / "output")
     seen: set[str] = set()
@@ -227,10 +230,9 @@ def _host_output_candidates() -> list[Path]:
 
 
 def ensure_web_output_dir() -> Path:
-    """Canonical output next to the repo (create if missing)."""
-    path = ROOT / "output"
-    path.mkdir(parents=True, exist_ok=True)
-    return path
+    """Canonical output inside WEB_app/ (create if missing)."""
+    WEB_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    return WEB_OUTPUT_DIR
 
 
 def _host_output_root() -> Path:
@@ -238,7 +240,7 @@ def _host_output_root() -> Path:
     for p in _host_output_candidates():
         if p.is_dir():
             return p
-    return ROOT / "output"
+    return WEB_OUTPUT_DIR
 
 
 def _is_run_dir(path: Path) -> bool:
@@ -323,7 +325,7 @@ def _resolve_host_run_dir(run_dir: str | Path) -> Path:
             if mapped.is_dir():
                 return mapped
         # Prefer first candidate in error path (even if missing)
-        return tried[0] if tried else (ROOT / "output" / rel)
+        return tried[0] if tried else (WEB_OUTPUT_DIR / rel)
 
     # Non-docker path that doesn't exist — still return as-is
     return p
@@ -333,8 +335,8 @@ def _run_dir_missing_detail(original: str, resolved: Path) -> str:
     roots = ", ".join(str(r) for r in _host_output_candidates())
     return (
         f"Run directory not found: {original} (resolved: {resolved}). "
-        f"Docker пишет прогоны на хост в volume output. Проверь папку рядом с репо "
-        f"(output\\{Path(original).name}) или задай YOLO_DRT_HOST_OUTPUT_DIR. "
+        f"Docker пишет прогоны в WEB_app/output. Положи папку прогона туда "
+        f"(WEB_app\\output\\{Path(original).name}) или выбери её в UI. "
         f"Искали в: {roots}"
     )
 
