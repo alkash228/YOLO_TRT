@@ -126,6 +126,100 @@ def compact_packet_for_cache(packet: FramePacket) -> FramePacket:
     )
 
 
+def _scale_keypoints_list(
+    keypoints_list: list[np.ndarray | None] | None,
+    sx: float,
+    sy: float,
+) -> list[np.ndarray | None]:
+    if not keypoints_list:
+        return []
+    out: list[np.ndarray | None] = []
+    for kpts in keypoints_list:
+        if kpts is None or not isinstance(kpts, np.ndarray) or kpts.size == 0:
+            out.append(kpts)
+            continue
+        arr = np.array(kpts, dtype=np.float32, copy=True)
+        if arr.ndim == 2 and arr.shape[1] >= 2:
+            arr[:, 0] *= float(sx)
+            arr[:, 1] *= float(sy)
+        out.append(arr)
+    return out
+
+
+def _scale_cross_check_geometry(
+    verdicts: list | None,
+    accessories: list | None,
+    sx: float,
+    sy: float,
+) -> tuple[list, list]:
+    from dataclasses import replace
+
+    scaled_verdicts: list = []
+    for v in verdicts or []:
+        head = getattr(v, "head_xyxy", None)
+        if head is None:
+            scaled_verdicts.append(v)
+            continue
+        h = np.asarray(head, dtype=np.float32).copy().reshape(-1)
+        if h.size >= 4:
+            h[0] *= float(sx)
+            h[1] *= float(sy)
+            h[2] *= float(sx)
+            h[3] *= float(sy)
+            scaled_verdicts.append(replace(v, head_xyxy=h[:4]))
+        else:
+            scaled_verdicts.append(v)
+
+    scaled_acc: list = []
+    for det in accessories or []:
+        xyxy = getattr(det, "xyxy", None)
+        if xyxy is None:
+            scaled_acc.append(det)
+            continue
+        box = np.asarray(xyxy, dtype=np.float32).copy().reshape(-1)
+        if box.size >= 4:
+            box[0] *= float(sx)
+            box[1] *= float(sy)
+            box[2] *= float(sx)
+            box[3] *= float(sy)
+            scaled_acc.append(replace(det, xyxy=box[:4]))
+        else:
+            scaled_acc.append(det)
+    return scaled_verdicts, scaled_acc
+
+
+def _scale_instance_meta(
+    instance_meta: list[dict[str, object]] | None,
+    sx: float,
+    sy: float,
+) -> list[dict[str, object]] | None:
+    if not instance_meta:
+        return instance_meta
+    out: list[dict[str, object]] = []
+    for m in instance_meta:
+        if not isinstance(m, dict):
+            out.append(m)  # type: ignore[arg-type]
+            continue
+        row = dict(m)
+        bb = row.get("bbox_xywh")
+        if bb is not None and len(bb) >= 4:
+            x, y, w, h = [float(v) for v in bb[:4]]
+            row["bbox_xywh"] = [
+                int(round(x * sx)),
+                int(round(y * sy)),
+                max(1, int(round(w * sx))),
+                max(1, int(round(h * sy))),
+            ]
+        cxy = row.get("center_xy")
+        if cxy is not None and len(cxy) >= 2:
+            row["center_xy"] = [
+                int(round(float(cxy[0]) * sx)),
+                int(round(float(cxy[1]) * sy)),
+            ]
+        out.append(row)
+    return out
+
+
 def materialize_packet_for_render(
     packet: FramePacket,
     frame_bgr: np.ndarray | None = None,
@@ -135,35 +229,51 @@ def materialize_packet_for_render(
 ) -> FramePacket:
     """Развернуть RLE-маски и подставить frame_bgr перед overlay/encode."""
     fb = frame_bgr if frame_bgr is not None else packet.frame_bgr
+    src_h = src_w = 0
+    if packet.mask_hw:
+        src_h, src_w = int(packet.mask_hw[0]), int(packet.mask_hw[1])
+
     if packet.masks_rle and packet.mask_hw:
         mh, mw = packet.mask_hw
         stack = rle_list_to_stack_u8(packet.masks_rle, mh, mw)
+        src_h, src_w = int(mh), int(mw)
     elif packet.stack is not None and packet.stack.ndim == 3 and packet.stack.shape[0] > 0:
         stack = packet.stack
+        src_h, src_w = int(stack.shape[1]), int(stack.shape[2])
     else:
         h = height or (packet.mask_hw[0] if packet.mask_hw else 1)
         w = width or (packet.mask_hw[1] if packet.mask_hw else 1)
         stack = np.zeros((0, h, w), dtype=np.uint8)
 
-    # Masks are often at inference size; source frame may differ — resize or overlay draws nothing / crashes.
+    kpts = list(packet.keypoints_list or [])
+    verdicts = list(packet.cross_check_verdicts or [])
+    accessories = list(packet.cross_check_accessories or [])
+    instance_meta = list(packet.instance_meta or []) if packet.instance_meta else None
+
+    # Masks / pose / head boxes live in inference coords; source frame may differ.
     if (
-        stack.ndim == 3
-        and stack.shape[0] > 0
-        and fb is not None
+        fb is not None
         and getattr(fb, "ndim", 0) == 3
         and fb.shape[0] > 2
         and fb.shape[1] > 2
+        and src_h > 0
+        and src_w > 0
     ):
         fh, fw = int(fb.shape[0]), int(fb.shape[1])
-        sh, sw = int(stack.shape[1]), int(stack.shape[2])
-        if (sh, sw) != (fh, fw):
-            stack = np.stack(
-                [
-                    cv2.resize(stack[i], (fw, fh), interpolation=cv2.INTER_NEAREST)
-                    for i in range(int(stack.shape[0]))
-                ],
-                axis=0,
-            )
+        if (src_h, src_w) != (fh, fw):
+            sx = float(fw) / float(src_w)
+            sy = float(fh) / float(src_h)
+            if stack.ndim == 3 and stack.shape[0] > 0:
+                stack = np.stack(
+                    [
+                        cv2.resize(stack[i], (fw, fh), interpolation=cv2.INTER_NEAREST)
+                        for i in range(int(stack.shape[0]))
+                    ],
+                    axis=0,
+                )
+            kpts = _scale_keypoints_list(kpts, sx, sy)
+            verdicts, accessories = _scale_cross_check_geometry(verdicts, accessories, sx, sy)
+            instance_meta = _scale_instance_meta(instance_meta, sx, sy)
 
     return FramePacket(
         frame_idx=packet.frame_idx,
@@ -179,12 +289,12 @@ def materialize_packet_for_render(
         infer_ms=packet.infer_ms,
         reid_recoveries=packet.reid_recoveries,
         cross_ms=packet.cross_ms,
-        keypoints_list=list(packet.keypoints_list or []),
-        cross_check_verdicts=list(packet.cross_check_verdicts or []),
-        cross_check_accessories=list(packet.cross_check_accessories or []),
+        keypoints_list=kpts,
+        cross_check_verdicts=verdicts,
+        cross_check_accessories=accessories,
         masks_rle=None,
         mask_hw=None,
-        instance_meta=list(packet.instance_meta or []) if packet.instance_meta else None,
+        instance_meta=instance_meta,
     )
 
 
