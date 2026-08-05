@@ -112,24 +112,23 @@ def _scan_violator_packets(
     return presence, violations, packets_by_frame.get(frame_idx), frame_idx
 
 
+def _clip_path_for_id(run_dir: Path, run_id: str, stable_id: int) -> Path:
+    """Exact clip path only — never glob (id=1 must not pick id=10 / other runs)."""
+    return Path(run_dir) / f"{run_id}_violation_id{int(stable_id)}.mp4"
+
+
 def _read_still_from_violation_clip(run_dir: Path, run_id: str, stable_id: int) -> np.ndarray | None:
     """
-    Fast path: short NO HELMET clip (H.264) with overlays — take the FIRST frame
-    (not middle: old clips were full presence and mid-frame often had a helmet).
+    Fast path: ONLY `{run_id}_violation_id{sid}.mp4` (exact name).
+    Loose globs previously could feed the same wrong still into every report.
     """
-    run_dir = Path(run_dir)
-    candidates = [
-        run_dir / f"{run_id}_violation_id{int(stable_id)}.mp4",
-        *sorted(run_dir.glob(f"*violation_id{int(stable_id)}.mp4")),
-    ]
-    clip = next((p for p in candidates if p.is_file() and p.stat().st_size > 0), None)
-    if clip is None:
+    clip = _clip_path_for_id(run_dir, run_id, stable_id)
+    if not clip.is_file() or clip.stat().st_size <= 0:
         return None
     cap = cv2.VideoCapture(str(clip))
     if not cap.isOpened():
         return None
     try:
-        # Always frame 0 — for NO HELMET-only clips this is a real violation still.
         ok, frame = cap.read()
         if ok and frame is not None and frame.size > 0:
             return frame
@@ -137,6 +136,24 @@ def _read_still_from_violation_clip(run_dir: Path, run_id: str, stable_id: int) 
         cap.release()
     return None
 
+
+def _annotate_stable_id(rgb: np.ndarray, stable_id: int, frame_idx: int) -> np.ndarray:
+    """Burn ID into the still so reports for different IDs cannot be confused."""
+    out = np.ascontiguousarray(rgb.copy())
+    bgr = cv2.cvtColor(out, cv2.COLOR_RGB2BGR)
+    label = f"ID {int(stable_id)}  |  frame {int(frame_idx)}"
+    cv2.rectangle(bgr, (8, 8), (8 + 12 * len(label) + 24, 48), (0, 0, 0), -1)
+    cv2.putText(
+        bgr,
+        label,
+        (16, 38),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.9,
+        (0, 255, 255),
+        2,
+        cv2.LINE_AA,
+    )
+    return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
 
 def read_source_frame_bgr(input_path: str, frame_idx: int) -> np.ndarray | None:
     """Grab one source frame. HEVC-safe (no OpenCV seek — that yields corrupt frames)."""
@@ -219,7 +236,10 @@ def render_person_frame_rgb(
     if filtered.n_inst <= 0:
         filtered = filter_person_single_id(packet, stable_id)
     if filtered.n_inst <= 0:
-        return cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        raise RuntimeError(
+            f"На кадре {frame_idx} нет объекта ID {stable_id} в packets "
+            "(нельзя подставлять чужой full-frame)."
+        )
 
     prompt = str(meta.get("prompt") or "person").strip().casefold() or "person"
     ctx = _RenderContext(
@@ -230,7 +250,7 @@ def render_person_frame_rgb(
     )
     job = _EncodeJob(src_i=int(frame_idx), carry=filtered, frame_bgr=frame_bgr)
     _, rgb = _render_encode_job(job, ctx)
-    return rgb
+    return _annotate_stable_id(rgb, int(stable_id), int(frame_idx))
 
 
 def build_word_report(
@@ -253,54 +273,37 @@ def build_word_report(
         ) from exc
 
     run_path = Path(run_dir)
+    sid = int(stable_id)
     meta = load_run_metadata(run_path, run_id)
     data, _ = resolve_run_packets(run_path, run_id=run_id)
     overlay = resolve_overlay(meta, overlay_override=overlay_override)
 
     presence, violations, packet, frame_idx = _scan_violator_packets(
-        data, run_path, int(stable_id)
+        data, run_path, sid
     )
-    if frame_idx < 0:
-        raise RuntimeError(f"Нет кадров с нарушителем ID {stable_id}")
+    if frame_idx < 0 or packet is None:
+        raise RuntimeError(f"Нет кадров с нарушителем ID {sid}")
 
-    # Prefer still from already-built violation clip (seconds, not minutes on HEVC).
-    # Old presence-long clips can show a mid "helmet ON" frame — only trust short
-    # clips, or fall back to rendering the first NO HELMET packet frame.
-    clip_bgr = _read_still_from_violation_clip(run_path, run_id, int(stable_id))
-    use_clip = False
-    if clip_bgr is not None:
-        # Heuristic: presence-mode clips are long; NO HELMET clips are short.
-        clip_path = run_path / f"{run_id}_violation_id{int(stable_id)}.mp4"
-        n_clip = 0
-        if clip_path.is_file():
-            cap_n = cv2.VideoCapture(str(clip_path))
-            if cap_n.isOpened():
-                n_clip = int(cap_n.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-                cap_n.release()
-        # If clip is much longer than violation count, it is an old presence clip — ignore.
-        if n_clip <= 0 or n_clip <= max(8, len(violations) * 2 + 5):
-            use_clip = True
-    if use_clip and clip_bgr is not None:
-        rgb = cv2.cvtColor(clip_bgr, cv2.COLOR_BGR2RGB)
-    else:
-        rgb = render_person_frame_rgb(
-            packet=packet,
-            stable_id=int(stable_id),
-            meta=meta,
-            overlay=overlay,
-            frame_idx=frame_idx,
-            prefer_violation=bool(violations),
-            run_dir=run_path,
-            run_id=run_id,
-        )
+    # Always render from packets filtered by THIS stable_id.
+    # Do not reuse clip stills — old/wrong clips produced the same photo for every ID.
+    rgb = render_person_frame_rgb(
+        packet=packet,
+        stable_id=sid,
+        meta=meta,
+        overlay=overlay,
+        frame_idx=frame_idx,
+        prefer_violation=bool(violations),
+        run_dir=run_path,
+        run_id=run_id,
+    )
 
     violation_count = len(violations)
     presence_count = len(presence)
 
     reports_dir = run_path / "reports"
     reports_dir.mkdir(parents=True, exist_ok=True)
-    image_path = reports_dir / f"{run_id}_id{stable_id}_mid.jpg"
-    docx_path = reports_dir / f"{run_id}_akt_id{stable_id}.docx"
+    image_path = reports_dir / f"{run_id}_id{sid}_frame{frame_idx}.jpg"
+    docx_path = reports_dir / f"{run_id}_akt_id{sid}.docx"
 
     bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
     try:
@@ -337,7 +340,7 @@ def build_word_report(
     add_row("Объект / заказчик (тест)", company_name)
     add_row("Дата и время инцидента", incident_text)
     add_row("Вид нарушения", "Работа без защитной каски (NO HELMET)")
-    add_row("Идентификатор нарушителя", f"№ {stable_id}")
+    add_row("Идентификатор нарушителя", f"№ {sid}")
     add_row("Кадров присутствия в видео", str(presence_count))
     add_row("Срабатываний без каски", str(violation_count))
     add_row("Кадр в отчёте", str(frame_idx))
