@@ -385,7 +385,7 @@ def _materialize_run_from_api(job_id: str, *, run_id_hint: str | None = None) ->
     if not job_id:
         raise ValueError("job_id required")
     base = api_base()
-    with httpx.Client(timeout=120.0) as client:
+    with httpx.Client(timeout=300.0) as client:
         art = client.get(f"{base}/v1/jobs/{job_id}/artifacts")
         if art.status_code >= 400:
             raise RuntimeError(f"API artifacts {art.status_code}: {art.text[:300]}")
@@ -397,17 +397,47 @@ def _materialize_run_from_api(job_id: str, *, run_id_hint: str | None = None) ->
             raise RuntimeError(f"API returned no artifact files for job {job_id}")
         dest = ensure_web_output_dir() / run_id
         dest.mkdir(parents=True, exist_ok=True)
+        missing: list[str] = []
         for item in files:
             fname = str(item.get("name") or "").strip()
             if not fname or ".." in fname or "/" in fname or "\\" in fname:
                 continue
             target = dest / fname
+            expect = int(item.get("size_bytes") or 0)
             if target.is_file() and target.stat().st_size > 0:
-                continue
+                if expect <= 0 or target.stat().st_size == expect:
+                    continue
             r = client.get(f"{base}/v1/jobs/{job_id}/artifacts/{quote(fname)}")
             if r.status_code >= 400:
+                missing.append(f"{fname}(HTTP {r.status_code})")
                 continue
             target.write_bytes(r.content)
+            if expect > 0 and len(r.content) != expect:
+                missing.append(f"{fname}(size {len(r.content)}!={expect})")
+        if missing:
+            raise RuntimeError(
+                f"Incomplete artifact download for {run_id}: " + ", ".join(missing[:8])
+            )
+
+    # Manifest must have every chunk on disk — otherwise encode sees "no violations".
+    manifests = list(dest.glob("*_packets_manifest.json"))
+    if manifests:
+        import json
+
+        try:
+            man = json.loads(manifests[0].read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError(f"Bad packets manifest in {dest}: {exc}") from exc
+        for entry in man.get("chunks") or []:
+            rel = str(entry.get("path") or "")
+            if not rel:
+                continue
+            chunk = dest / rel
+            if not chunk.is_file() or chunk.stat().st_size <= 0:
+                raise RuntimeError(
+                    f"Missing spill chunk after download: {chunk.name}. "
+                    "API list/download incomplete — copy the run folder from Docker output bind."
+                )
     if not _is_run_dir(dest):
         raise RuntimeError(
             f"Downloaded files into {dest}, but run markers missing "

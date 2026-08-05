@@ -197,6 +197,54 @@ def find_packet_at_frame(
     return None
 
 
+def _verdict_is_violation(verdict: Any) -> bool:
+    if verdict is None:
+        return False
+    if isinstance(verdict, dict):
+        return not bool(verdict.get("ok", True))
+    return not bool(getattr(verdict, "ok", True))
+
+
+def diagnose_packet_violations(data: dict[str, Any], run_dir: Path) -> dict[str, Any]:
+    """Stats used when encode finds zero NO HELMET — distinguish empty vs wrong folder."""
+    n_packets = 0
+    n_with_people = 0
+    n_with_verdicts = 0
+    n_ok = 0
+    n_fail = 0
+    n_empty_verdicts = 0
+    for packet in iter_run_packets(data, Path(run_dir)):
+        n_packets += 1
+        n = int(packet.n_inst)
+        if n > 0:
+            n_with_people += 1
+        verdicts = packet.cross_check_verdicts or []
+        if n > 0 and not verdicts:
+            n_empty_verdicts += 1
+        if not verdicts:
+            continue
+        n_with_verdicts += 1
+        for i in range(min(n if n > 0 else len(verdicts), len(verdicts))):
+            if _verdict_is_violation(verdicts[i]):
+                n_fail += 1
+            else:
+                n_ok += 1
+    chunks = list(Path(run_dir).glob("*_packets_chunk_*.pkl"))
+    manifests = list(Path(run_dir).glob("*_packets_manifest.json"))
+    return {
+        "run_dir": str(Path(run_dir).resolve()),
+        "packets": n_packets,
+        "packets_with_people": n_with_people,
+        "packets_with_verdicts": n_with_verdicts,
+        "packets_people_but_no_verdicts": n_empty_verdicts,
+        "verdict_ok": n_ok,
+        "verdict_no_helmet": n_fail,
+        "chunk_files": len(chunks),
+        "has_manifest": bool(manifests),
+        "format": data.get("format"),
+    }
+
+
 def collect_stable_ids(data: dict[str, Any], run_dir: Path) -> list[int]:
     """All unique stable ReID IDs seen in the run."""
     ids: set[int] = set()
@@ -218,7 +266,7 @@ def collect_violator_stable_ids(data: dict[str, Any], run_dir: Path) -> list[int
         if n <= 0 or not verdicts:
             continue
         for i in range(min(n, len(verdicts))):
-            if verdicts[i].ok:
+            if not _verdict_is_violation(verdicts[i]):
                 continue
             if packet.stable_ids is None or i >= len(packet.stable_ids):
                 continue
@@ -235,7 +283,7 @@ def count_violations_by_stable_id(data: dict[str, Any], run_dir: Path) -> dict[i
         if n <= 0 or not verdicts or packet.stable_ids is None:
             continue
         for i in range(min(n, len(verdicts))):
-            if verdicts[i].ok:
+            if not _verdict_is_violation(verdicts[i]):
                 continue
             if i >= len(packet.stable_ids):
                 break
@@ -383,7 +431,7 @@ def filter_violator_single_id(packet: FramePacket, target_sid: int) -> FramePack
         sid = int(packet.stable_ids[i])
         if sid != int(target_sid):
             continue
-        if verdicts[i].ok:
+        if not _verdict_is_violation(verdicts[i]):
             return _empty_instances(packet)
         keep_idx = i
         break
@@ -599,8 +647,25 @@ def encode_violations_videos_per_id(
     )
     if not violator_ids:
         raw = count_violations_by_stable_id(data, run_dir)
+        diag = diagnose_packet_violations(data, run_dir)
+        report_n = int(meta.get("cross_check_violations") or 0)
         if not raw:
-            raise ValueError("No helmet violations (NO HELMET) found in run packets")
+            raise ValueError(
+                "No helmet violations (NO HELMET) found in run packets. "
+                f"diag={diag}; report.txt violations={report_n}. "
+                + (
+                    "Report says violations but packets have 0 — wrong/incomplete run folder "
+                    "(missing *_packets_chunk_*.pkl). Copy full run from Docker output bind."
+                    if report_n > 0
+                    else (
+                        "Packets have people but empty cross_check_verdicts — helmet engine "
+                        "likely did not run in Docker."
+                        if int(diag.get("packets_people_but_no_verdicts") or 0) > 0
+                        else "In this run the model marked everyone as OK (helmet on) "
+                        "or no people were tracked."
+                    )
+                )
+            )
         detail = ", ".join(f"id{sid}={n}" for sid, n in sorted(raw.items(), key=lambda x: -x[1]))
         raise ValueError(
             f"No violators passed threshold (>={threshold} NO HELMET frames, "
