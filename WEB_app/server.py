@@ -201,10 +201,34 @@ _build_jobs: dict[str, dict[str, Any]] = {}
 _DOCKER_OUTPUT_PREFIXES = ("/data/output",)
 
 
-def _host_output_root() -> Path:
+def _host_output_candidates() -> list[Path]:
+    """Where Docker/host may store runs (compose uses ../output OR ./output)."""
+    out: list[Path] = []
     raw = os.environ.get("YOLO_DRT_HOST_OUTPUT_DIR", "").strip()
     if raw:
-        return Path(raw)
+        out.append(Path(raw))
+    # Repo root next to WEB_app/ (YOLO_TRT/output or YOLO_DRT/output)
+    out.append(ROOT / "output")
+    # docker-compose.yml: ../output:/data/output  → sibling of the repo folder
+    out.append(ROOT.parent / "output")
+    # cwd fallback
+    out.append(Path.cwd() / "output")
+    # Dedupe while preserving order
+    seen: set[str] = set()
+    uniq: list[Path] = []
+    for p in out:
+        key = str(p.resolve()) if p.exists() else str(p)
+        if key in seen:
+            continue
+        seen.add(key)
+        uniq.append(p)
+    return uniq
+
+
+def _host_output_root() -> Path:
+    for p in _host_output_candidates():
+        if p.is_dir():
+            return p
     return ROOT / "output"
 
 
@@ -216,14 +240,35 @@ def _resolve_host_run_dir(run_dir: str | Path) -> Path:
     p = Path(raw)
     if p.is_dir():
         return p
+
+    rel = ""
     for prefix in _DOCKER_OUTPUT_PREFIXES:
         if raw == prefix or raw.startswith(prefix + "/"):
             rel = raw[len(prefix) :].lstrip("/")
-            mapped = _host_output_root() / rel if rel else _host_output_root()
+            break
+
+    tried: list[Path] = []
+    if rel:
+        for root in _host_output_candidates():
+            mapped = root / rel if rel else root
+            tried.append(mapped)
             if mapped.is_dir():
                 return mapped
-            return mapped
+        # Prefer first candidate in error path (even if missing)
+        return tried[0] if tried else (ROOT / "output" / rel)
+
+    # Non-docker path that doesn't exist — still return as-is
     return p
+
+
+def _run_dir_missing_detail(original: str, resolved: Path) -> str:
+    roots = ", ".join(str(r) for r in _host_output_candidates())
+    return (
+        f"Run directory not found: {original} (resolved: {resolved}). "
+        f"Docker пишет прогоны на хост в volume output. Проверь папку рядом с репо "
+        f"(output\\{Path(original).name}) или задай YOLO_DRT_HOST_OUTPUT_DIR. "
+        f"Искали в: {roots}"
+    )
 
 
 def _run_dir_query(run_dir: str) -> str:
@@ -541,10 +586,7 @@ def _run_build(
 def build_video(body: BuildVideoBody) -> BuildVideoResponse:
     run_dir = _resolve_host_run_dir(body.run_dir)
     if not run_dir.is_dir():
-        raise HTTPException(
-            400,
-            f"Run directory not found: {body.run_dir} (resolved: {run_dir})",
-        )
+        raise HTTPException(400, _run_dir_missing_detail(body.run_dir, run_dir))
 
     build_id = uuid.uuid4().hex[:12]
     with _build_lock:
@@ -576,10 +618,7 @@ def report_violators(run_dir: str, run_id: str) -> dict[str, Any]:
 
     run_path = _resolve_host_run_dir(run_dir)
     if not run_path.is_dir():
-        raise HTTPException(
-            400,
-            f"Run directory not found: {run_dir} (resolved: {run_path})",
-        )
+        raise HTTPException(400, _run_dir_missing_detail(run_dir, run_path))
     data, _ = resolve_run_packets(run_path, run_id=run_id)
     ids, vcounts, pcounts, threshold = collect_qualified_violator_ids(data, run_path)
     if not ids:
@@ -609,10 +648,7 @@ def report_companies() -> dict[str, list[str]]:
 def create_word_report(body: WordReportBody) -> WordReportResponse:
     run_dir = _resolve_host_run_dir(body.run_dir)
     if not run_dir.is_dir():
-        raise HTTPException(
-            400,
-            f"Run directory not found: {body.run_dir} (resolved: {run_dir})",
-        )
+        raise HTTPException(400, _run_dir_missing_detail(body.run_dir, run_dir))
 
     from WEB_app.word_report import build_word_report, parse_incident_datetime
 
