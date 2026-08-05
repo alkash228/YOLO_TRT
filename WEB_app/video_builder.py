@@ -34,7 +34,12 @@ _OVERLAY_KEYS = (
 )
 
 
-def load_run_metadata(run_dir: Path, run_id: str) -> dict[str, Any]:
+def load_run_metadata(
+    run_dir: Path,
+    run_id: str,
+    *,
+    source_video: str | None = None,
+) -> dict[str, Any]:
     run_dir = Path(run_dir)
     result_path = run_dir / f"{run_id}_result.json"
     summary_path = run_dir / f"{run_id}_run_summary.json"
@@ -97,25 +102,37 @@ def load_run_metadata(run_dir: Path, run_id: str) -> dict[str, Any]:
         if max_idx >= 0:
             source_frame_count = max_idx + 1
 
-    input_path = str(
+    recorded = str(
         data.get("input_path")
         or meta.get("input_path")
         or summary.get("input_path")
         or meta.get("input_video")
         or ""
     )
-    if not input_path or not Path(input_path).is_file():
-        rid = infer_run_id(run_dir, run_id)
-        for candidate in sorted(run_dir.glob(f"{rid}_source.*")):
-            if candidate.is_file():
-                input_path = str(candidate.resolve())
-                break
+    from app.core.video_encode import resolve_run_source_video, source_video_missing_message
+
+    rid = infer_run_id(run_dir, run_id)
+    input_path = (
+        resolve_run_source_video(
+            run_dir,
+            recorded,
+            run_id=rid,
+            override=source_video,
+        )
+        or ""
+    )
 
     return {
         "fps": float(
             data.get("fps") or meta.get("fps") or summary.get("video_fps") or 25.0
         ),
         "input_path": input_path,
+        "recorded_input_path": recorded,
+        "source_missing_hint": (
+            ""
+            if input_path
+            else source_video_missing_message(run_dir, recorded, run_id=rid)
+        ),
         "prompt": str(data.get("prompt") or meta.get("prompt") or summary.get("prompt") or "person"),
         "width": int(data.get("width") or meta.get("width") or summary.get("width") or 0),
         "height": int(data.get("height") or meta.get("height") or summary.get("height") or 0),
@@ -523,6 +540,7 @@ def _encode_one_violator(
             on_progress=on_progress,
             on_log=on_log,
             encode_src_indices=violation_frames,
+            run_id=str(run_id),
         )
     finally:
         ve._render_encode_job = orig_render
@@ -543,6 +561,7 @@ def encode_violations_videos_per_id(
     *,
     run_id: str | None = None,
     overlay_override: dict[str, Any] | None = None,
+    source_video: str | None = None,
     post_workers: int = 6,
     encode_preset: str = "fast",
     encode_crf: int = 23,
@@ -559,9 +578,14 @@ def encode_violations_videos_per_id(
     """
     run_dir = Path(run_dir)
     rid = infer_run_id(run_dir, run_id)
-    meta = load_run_metadata(run_dir, rid)
+    meta = load_run_metadata(run_dir, rid, source_video=source_video)
     data = meta["packets_data"]
     overlay = resolve_overlay(meta, overlay_override=overlay_override)
+
+    if not meta.get("input_path"):
+        raise ValueError(meta.get("source_missing_hint") or "Source video not found for this run")
+    if on_log:
+        on_log(f"Source video: {meta['input_path']}")
 
     if not meta.get("cross_check_enabled"):
         raise ValueError("Cross-check was disabled for this run")

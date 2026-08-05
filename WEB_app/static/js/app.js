@@ -15,6 +15,7 @@
   const runMeta = $("#run-meta");
   const crossWarn = $("#cross-warn");
   const btnBuild = $("#btn-build");
+  const sourceVideoInput = $("#source-video-input");
   const buildProgressWrap = $("#build-progress-wrap");
   const buildProgress = $("#build-progress");
   const buildStatus = $("#build-status");
@@ -909,7 +910,11 @@
       const r = await fetch("/build-video", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ run_dir: runDir, run_id: runId }),
+        body: JSON.stringify({
+          run_dir: runDir,
+          run_id: runId,
+          source_video: (sourceVideoInput?.value || "").trim() || null,
+        }),
       });
       if (!r.ok) throw new Error(await r.text());
       const { build_id } = await r.json();

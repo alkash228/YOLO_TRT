@@ -359,6 +359,7 @@ class BuildVideoBody(BaseModel):
     run_dir: str
     run_id: str
     overlay: dict[str, Any] | None = None
+    source_video: str | None = None
 
 
 class BuildVideoResponse(BaseModel):
@@ -659,6 +660,7 @@ def _run_build(
     run_dir: str,
     run_id: str,
     overlay: dict[str, Any] | None,
+    source_video: str | None = None,
 ) -> None:
     job = _build_jobs[build_id]
     try:
@@ -677,6 +679,7 @@ def _run_build(
             run_dir,
             run_id=run_id,
             overlay_override=overlay,
+            source_video=source_video,
             on_progress=on_progress,
             on_log=on_log,
         )
@@ -711,7 +714,13 @@ def build_video(body: BuildVideoBody) -> BuildVideoResponse:
         }
     t = threading.Thread(
         target=_run_build,
-        args=(build_id, str(run_dir.resolve()), body.run_id, body.overlay),
+        args=(
+            build_id,
+            str(run_dir.resolve()),
+            body.run_id,
+            body.overlay,
+            (body.source_video or "").strip() or None,
+        ),
         name=f"web-build-{build_id}",
         daemon=True,
     )

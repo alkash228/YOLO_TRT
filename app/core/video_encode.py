@@ -379,28 +379,138 @@ def _packet_frame_bgr(
         return frame_bgr
     if fb is not None and fb.size > 0:
         if fb.shape[0] <= _PLACEHOLDER_MAX and fb.shape[1] <= _PLACEHOLDER_MAX:
-            raise ValueError(
-                f"Frame {packet.frame_idx}: no source video pixels "
-                "(input_path missing or deleted; re-run inference or restore source copy)"
-            )
+                raise ValueError(
+                    f"Frame {packet.frame_idx}: нет пикселей исходного видео. "
+                    "На этой машине нет файла по input_path из прогона — "
+                    "положи оригинал как {run_id}_source.mp4 в папку прогона "
+                    "или укажи локальный путь к ролику в WEB."
+                )
         return fb
     raise ValueError(
         f"Frame {packet.frame_idx}: no image data (check input video path in run manifest)"
     )
 
 
-def _resolve_encode_input_path(input_path: str | None, run_dir: Path) -> str | None:
-    """Use manifest path when present; fall back to persisted {run_id}_source.* in run folder."""
+_VIDEO_SUFFIXES = {".mp4", ".mkv", ".mov", ".webm", ".avi", ".m4v"}
+
+
+def _source_search_dirs(run_dir: Path) -> list[Path]:
+    """Candidate folders when a run is copied to another machine without absolute paths."""
+    run_dir = Path(run_dir).resolve()
+    dirs: list[Path] = [run_dir, run_dir.parent]
+    env_dirs = os.environ.get("YOLO_DRT_VIDEOS") or os.environ.get("YOLO_SOURCE_DIRS") or ""
+    for part in env_dirs.replace(";", os.pathsep).split(os.pathsep):
+        part = part.strip().strip('"')
+        if part:
+            dirs.append(Path(part))
+    here = Path(__file__).resolve()
+    # .../app/core/video_encode.py → repo root (parent of app/)
+    repo = here.parents[2]
+    dirs.extend(
+        [
+            repo / "videos",
+            repo / "WEB_app" / "videos",
+            repo / "YOLO_DOCKER" / "videos",
+            Path.cwd() / "videos",
+        ]
+    )
+    out: list[Path] = []
+    seen: set[str] = set()
+    for d in dirs:
+        try:
+            key = str(d.resolve()) if d.exists() else str(d)
+        except OSError:
+            key = str(d)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(d)
+    return out
+
+
+def resolve_run_source_video(
+    run_dir: Path | str,
+    input_path: str | None = None,
+    *,
+    run_id: str | None = None,
+    override: str | None = None,
+) -> str | None:
+    """
+    Locate source pixels for encode/report.
+
+    Order: explicit override → existing absolute path → {run_id}_source.* in run →
+    basename of recorded path in run / videos dirs → any *_source.* in run.
+    """
+    run_dir = Path(run_dir)
+    if override:
+        ov = Path(override.strip().strip('"'))
+        if ov.is_file():
+            return str(ov.resolve())
     if input_path:
-        path = Path(input_path)
+        path = Path(str(input_path).strip().strip('"'))
         if path.is_file():
             return str(path.resolve())
-    run_dir = Path(run_dir)
+
+    rid = (run_id or "").strip()
+    if rid:
+        for candidate in sorted(run_dir.glob(f"{rid}_source.*")):
+            if candidate.is_file() and candidate.suffix.lower() in _VIDEO_SUFFIXES:
+                return str(candidate.resolve())
+
+    basename = Path(str(input_path or "")).name
+    if basename and Path(basename).suffix.lower() in _VIDEO_SUFFIXES:
+        for folder in _source_search_dirs(run_dir):
+            hit = folder / basename
+            if hit.is_file():
+                return str(hit.resolve())
+            # Docker-style names sometimes land as {stem}_source{suffix} after copy
+            stem = Path(basename).stem
+            for alt in folder.glob(f"{stem}_source.*"):
+                if alt.is_file():
+                    return str(alt.resolve())
+
     for pattern in ("*_source.mp4", "*_source.mkv", "*_source.mov", "*_source.webm"):
-        matches = sorted(run_dir.glob(pattern), key=lambda p: p.stat().st_mtime, reverse=True)
+        matches = sorted(
+            (p for p in run_dir.glob(pattern) if p.is_file()),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
         if matches:
             return str(matches[0].resolve())
-    return str(input_path) if input_path else None
+    return None
+
+
+def source_video_missing_message(
+    run_dir: Path | str,
+    input_path: str | None = None,
+    *,
+    run_id: str | None = None,
+) -> str:
+    run_dir = Path(run_dir)
+    rid = (run_id or "").strip() or "RUNID"
+    recorded = str(input_path or "").strip() or "(не записан)"
+    name = Path(recorded).name if recorded and recorded != "(не записан)" else "video.mp4"
+    return (
+        "Исходное видео для сборки клипов не найдено (прогон с другой машины?). "
+        f"В метаданных путь: {recorded}. "
+        f"Положи оригинал как {rid}_source{Path(name).suffix or '.mp4'} в папку прогона "
+        f"или файл {name} в videos/, либо укажи локальный путь к ролику в WEB."
+    )
+
+
+def _resolve_encode_input_path(
+    input_path: str | None,
+    run_dir: Path,
+    *,
+    run_id: str | None = None,
+    override: str | None = None,
+) -> str | None:
+    return resolve_run_source_video(
+        run_dir,
+        input_path,
+        run_id=run_id,
+        override=override,
+    )
 
 
 def _resolve_target_size(
@@ -503,12 +613,21 @@ def _encode_timeline_streaming(
     on_progress: Callable[[int, int], None] | None = None,
     on_log: Callable[[str], None] | None = None,
     encode_src_indices: set[int] | None = None,
+    run_id: str | None = None,
 ) -> Path:
     if source_frame_count <= 0:
         raise ValueError("source_frame_count required for streaming encode")
 
     video_path = Path(video_path)
     video_path.parent.mkdir(parents=True, exist_ok=True)
+    recorded_input = input_path
+    resolved_input = resolve_run_source_video(
+        video_path.parent,
+        input_path,
+        run_id=run_id,
+    )
+    if resolved_input:
+        input_path = resolved_input
     target_w, target_h = _resolve_target_size(width=width, height=height, input_path=input_path)
     prompt_lookup = prompt_id_lookup_from_prompt(prompt)
     n_src = int(source_frame_count)
@@ -546,8 +665,7 @@ def _encode_timeline_streaming(
 
     reader: _FfmpegHwVideoReader | _PrefetchedVideoReader | None = None
     cap: cv2.VideoCapture | None = None
-    resolved_input = _resolve_encode_input_path(input_path, video_path.parent)
-    if resolved_input and Path(resolved_input).exists():
+    if resolved_input and Path(resolved_input).is_file():
         try:
             reader = _open_decode_reader(
                 str(resolved_input),
@@ -565,8 +683,14 @@ def _encode_timeline_streaming(
                     on_log("Decode: none (packets only)")
             elif on_log:
                 on_log("Decode: OpenCV (sync)")
-    elif on_log and input_path:
-        on_log(f"Decode: source missing ({input_path})")
+    elif on_log:
+        on_log(
+            source_video_missing_message(
+                video_path.parent,
+                recorded_input,
+                run_id=run_id,
+            )
+        )
 
     carry: FramePacket | None = None
     stride = max(1, int(frame_stride))
