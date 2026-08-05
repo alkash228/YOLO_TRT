@@ -115,7 +115,24 @@ def read_source_frame_bgr(input_path: str, frame_idx: int) -> np.ndarray | None:
     """Grab one source frame — seek when possible, else grab-skip."""
     from app.core.frame_io import read_frame_bgr_smart
 
+    if not input_path:
+        return None
     return read_frame_bgr_smart(str(input_path), int(frame_idx))
+
+
+def _imwrite_bgr(path: Path, bgr: np.ndarray, *, quality: int = 92) -> None:
+    """cv2.imwrite breaks on non-ASCII Windows paths — encode then write bytes."""
+    ok, buf = cv2.imencode(".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)])
+    if not ok:
+        raise RuntimeError("Не удалось закодировать JPEG для отчёта")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(buf.tobytes())
+
+
+def _blank_bgr(width: int, height: int) -> np.ndarray:
+    h = max(1, int(height) or 720)
+    w = max(1, int(width) or 1280)
+    return np.zeros((h, w, 3), dtype=np.uint8)
 
 
 def render_person_frame_rgb(
@@ -126,15 +143,32 @@ def render_person_frame_rgb(
     overlay: dict[str, Any],
     frame_idx: int,
     prefer_violation: bool = True,
+    run_dir: Path | None = None,
+    run_id: str | None = None,
 ) -> np.ndarray:
-    input_path = str(meta.get("input_path") or "")
+    from app.core.video_encode import resolve_run_source_video
+
+    recorded = str(meta.get("input_path") or meta.get("recorded_input_path") or "")
+    input_path = recorded
+    if run_dir is not None:
+        resolved = resolve_run_source_video(
+            Path(run_dir),
+            recorded,
+            run_id=run_id,
+        )
+        if resolved:
+            input_path = resolved
+
     width = int(meta.get("width") or 0)
     height = int(meta.get("height") or 0)
     frame_bgr = read_source_frame_bgr(input_path, frame_idx) if input_path else None
 
     if packet is None:
         if frame_bgr is None:
-            raise RuntimeError(f"Кадр {frame_idx} недоступен в исходном видео")
+            raise RuntimeError(
+                f"Кадр {frame_idx} недоступен: нет packet и не читается исходник "
+                f"({input_path or 'input_path пуст'}). Положи RUNID_source.mp4 в папку прогона."
+            )
         return cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
 
     if frame_bgr is None and packet.frame_bgr is not None and packet.frame_bgr.size > 0:
@@ -142,8 +176,13 @@ def render_person_frame_rgb(
         if fb.shape[0] > 2 and fb.shape[1] > 2:
             frame_bgr = fb
 
-    if frame_bgr is not None:
-        height, width = int(frame_bgr.shape[0]), int(frame_bgr.shape[1])
+    if frame_bgr is None:
+        # Still draw overlay on a blank canvas if source video is missing on this machine.
+        if packet.mask_hw:
+            height, width = int(packet.mask_hw[0]), int(packet.mask_hw[1])
+        frame_bgr = _blank_bgr(width, height)
+
+    height, width = int(frame_bgr.shape[0]), int(frame_bgr.shape[1])
 
     filtered = (
         filter_violator_single_id(packet, stable_id)
@@ -153,8 +192,6 @@ def render_person_frame_rgb(
     if filtered.n_inst <= 0:
         filtered = filter_person_single_id(packet, stable_id)
     if filtered.n_inst <= 0:
-        if frame_bgr is None:
-            raise RuntimeError(f"Человек ID {stable_id} не найден на кадре {frame_idx}")
         return cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
 
     prompt = str(meta.get("prompt") or "person").strip().casefold() or "person"
@@ -206,6 +243,8 @@ def build_word_report(
         overlay=overlay,
         frame_idx=frame_idx,
         prefer_violation=bool(violations),
+        run_dir=run_path,
+        run_id=run_id,
     )
 
     violation_count = len(violations)
@@ -217,8 +256,10 @@ def build_word_report(
     docx_path = reports_dir / f"{run_id}_akt_id{stable_id}.docx"
 
     bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-    if not cv2.imwrite(str(image_path), bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 92]):
-        raise RuntimeError("Не удалось сохранить кадр для отчёта")
+    try:
+        _imwrite_bgr(image_path, bgr, quality=92)
+    except OSError as exc:
+        raise RuntimeError(f"Не удалось сохранить кадр для отчёта: {image_path} ({exc})") from exc
 
     org = (organization or company or "").strip() or "—"
     company_name = (company or org).strip() or "—"
@@ -258,7 +299,9 @@ def build_word_report(
     doc.add_paragraph()
     cap = doc.add_paragraph("Фотофиксация нарушителя:")
     cap.runs[0].bold = True
-    doc.add_picture(str(image_path), width=Cm(14))
+    from io import BytesIO
+
+    doc.add_picture(BytesIO(image_path.read_bytes()), width=Cm(14))
 
     doc.save(str(docx_path))
     return docx_path
