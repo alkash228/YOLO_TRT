@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 import json
+import os
 from collections.abc import Callable, Iterator
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
+import cv2
 import numpy as np
 
 from app.core.frame_pipeline import FramePacket
@@ -20,6 +22,16 @@ from app.core.video_encode import (
     infer_run_id,
     resolve_run_packets,
 )
+
+
+def web_debug_show_all_dets() -> bool:
+    """Debug period: draw full scene, highlight NO HELMET target. Off: YOLO_DRT_WEB_DEBUG_OVERLAY=0."""
+    return os.environ.get("YOLO_DRT_WEB_DEBUG_OVERLAY", "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+    )
 
 _OVERLAY_KEYS = (
     "overlay_alpha",
@@ -152,6 +164,7 @@ def resolve_overlay(
     overlay_override: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Overlay for encode: saved run snapshot, then user override from WEB/API settings."""
+    debug_all = web_debug_show_all_dets()
     overlay: dict[str, Any] = {
         "overlay_alpha": 0.45,
         "draw_boxes": True,
@@ -161,7 +174,8 @@ def resolve_overlay(
         "pose_kpt_conf": 0.25,
         "cross_check_enabled": bool(meta.get("cross_check_enabled", True)),
         "cross_check_draw_head_box": True,
-        "cross_check_draw_boxes": False,
+        # Debug: also draw accessory (helmet/…) detections so the full scene is visible.
+        "cross_check_draw_boxes": bool(debug_all),
     }
     saved = meta.get("saved_overlay") or {}
     if isinstance(saved, dict):
@@ -493,25 +507,180 @@ def _empty_instances(packet: FramePacket) -> FramePacket:
     )
 
 
+def _instance_index_for_sid(packet: FramePacket, target_sid: int) -> int | None:
+    if packet.stable_ids is None or packet.n_inst <= 0:
+        return None
+    for i in range(min(int(packet.n_inst), len(packet.stable_ids))):
+        if int(packet.stable_ids[i]) == int(target_sid):
+            return i
+    return None
+
+
+def _bbox_xywh_for_sid(
+    packet: FramePacket,
+    target_sid: int,
+    *,
+    target_w: int | None = None,
+    target_h: int | None = None,
+) -> tuple[int, int, int, int] | None:
+    i = _instance_index_for_sid(packet, target_sid)
+    if i is None:
+        return None
+    bbox: tuple[int, int, int, int] | None = None
+    meta = packet.instance_meta or []
+    if i < len(meta):
+        bb = meta[i].get("bbox_xywh") if isinstance(meta[i], dict) else None
+        if bb is not None and len(bb) >= 4:
+            x, y, w, h = int(bb[0]), int(bb[1]), int(bb[2]), int(bb[3])
+            if w > 0 and h > 0:
+                bbox = (x, y, w, h)
+    if bbox is None and packet.stack is not None and packet.stack.ndim == 3 and i < int(
+        packet.stack.shape[0]
+    ):
+        m = (packet.stack[i] > 127).astype(np.uint8)
+        if m.any():
+            x, y, w, h = cv2.boundingRect(m)
+            if w > 0 and h > 0:
+                bbox = (int(x), int(y), int(w), int(h))
+    if bbox is None:
+        return None
+    if target_w is None or target_h is None or target_w <= 0 or target_h <= 0:
+        return bbox
+    src_h = src_w = 0
+    if packet.mask_hw:
+        src_h, src_w = int(packet.mask_hw[0]), int(packet.mask_hw[1])
+    elif packet.stack is not None and packet.stack.ndim == 3 and packet.stack.shape[0] > 0:
+        src_h, src_w = int(packet.stack.shape[1]), int(packet.stack.shape[2])
+    elif packet.frame_bgr is not None and packet.frame_bgr.size > 0:
+        src_h, src_w = int(packet.frame_bgr.shape[0]), int(packet.frame_bgr.shape[1])
+    if src_w <= 0 or src_h <= 0 or (src_w == target_w and src_h == target_h):
+        return bbox
+    x, y, w, h = bbox
+    sx = float(target_w) / float(src_w)
+    sy = float(target_h) / float(src_h)
+    return (
+        int(round(x * sx)),
+        int(round(y * sy)),
+        max(1, int(round(w * sx))),
+        max(1, int(round(h * sy))),
+    )
+
+
+def highlight_no_helmet_on_rgb(
+    rgb: np.ndarray,
+    packet: FramePacket,
+    target_sid: int,
+    *,
+    target_w: int,
+    target_h: int,
+    frame_bgr: np.ndarray | None = None,
+    force: bool = False,
+) -> np.ndarray:
+    """Thick red callout on the NO HELMET target (RGB image)."""
+    del frame_bgr  # kept for call-site compatibility
+    i = _instance_index_for_sid(packet, target_sid)
+    if i is None:
+        return rgb
+    verdicts = packet.cross_check_verdicts or []
+    is_viol = i < len(verdicts) and _verdict_is_violation(verdicts[i])
+    if not force and not is_viol:
+        return rgb
+
+    bbox = _bbox_xywh_for_sid(
+        packet, target_sid, target_w=int(target_w), target_h=int(target_h)
+    )
+    if bbox is None:
+        return rgb
+
+    out = np.ascontiguousarray(rgb.copy())
+    bgr = cv2.cvtColor(out, cv2.COLOR_RGB2BGR)
+    x, y, w, h = bbox
+    x2, y2 = x + w, y + h
+    # Outer black + thick red so the no-helmet target is obvious among all dets.
+    cv2.rectangle(bgr, (x - 4, y - 4), (x2 + 4, y2 + 4), (0, 0, 0), 6)
+    cv2.rectangle(bgr, (x, y), (x2, y2), (0, 0, 255), 4)
+    label = f"NO HELMET  ID {int(target_sid)}"
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    scale = max(0.7, min(1.4, w / 220.0))
+    thickness = 2 if scale < 1.0 else 3
+    (tw, th), _ = cv2.getTextSize(label, font, scale, thickness)
+    pad = 8
+    ty = max(th + pad * 2, y - 10)
+    cv2.rectangle(
+        bgr,
+        (x, ty - th - pad * 2),
+        (x + tw + pad * 2, ty),
+        (0, 0, 180),
+        -1,
+    )
+    cv2.putText(
+        bgr,
+        label,
+        (x + pad, ty - pad),
+        font,
+        scale,
+        (255, 255, 255),
+        thickness,
+        cv2.LINE_AA,
+    )
+    return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+
+
+def _render_full_scene_highlight(
+    job: _EncodeJob,
+    ctx: _RenderContext,
+    carry: FramePacket,
+    target_sid: int,
+    *,
+    force_highlight: bool,
+) -> tuple[int, np.ndarray]:
+    work = replace(carry, frame_idx=job.src_i)
+    src_i, rgb = _render_encode_job(
+        replace(job, carry=work, frame_bgr=job.frame_bgr), ctx
+    )
+    rgb = highlight_no_helmet_on_rgb(
+        rgb,
+        work,
+        target_sid,
+        target_w=ctx.target_w,
+        target_h=ctx.target_h,
+        frame_bgr=job.frame_bgr,
+        force=force_highlight,
+    )
+    return src_i, rgb
+
+
 def _make_person_render_fn(target_sid: int):
     """Smooth per-person clip: update on keyframes, hold-forward between stride gaps."""
     last_draw: FramePacket | None = None
+    debug_all = web_debug_show_all_dets()
 
     def _render(job: _EncodeJob, ctx: _RenderContext) -> tuple[int, np.ndarray]:
         nonlocal last_draw
         carry = job.carry
         is_key = int(carry.frame_idx) == int(job.src_i)
         if is_key:
-            filtered = filter_person_single_id(carry, target_sid)
-            if filtered.n_inst > 0:
-                last_draw = filtered
+            if debug_all:
+                # Full scene while this person is present.
+                if filter_person_single_id(carry, target_sid).n_inst > 0:
+                    last_draw = carry
+                else:
+                    last_draw = None
             else:
-                last_draw = None
+                filtered = filter_person_single_id(carry, target_sid)
+                if filtered.n_inst > 0:
+                    last_draw = filtered
+                else:
+                    last_draw = None
 
         if last_draw is None:
             empty = _empty_instances(replace(carry, frame_idx=job.src_i))
             return _render_encode_job(replace(job, carry=empty), ctx)
 
+        if debug_all:
+            return _render_full_scene_highlight(
+                job, ctx, last_draw, target_sid, force_highlight=False
+            )
         work = replace(last_draw, frame_idx=job.src_i)
         return _render_encode_job(replace(job, carry=work, frame_bgr=job.frame_bgr), ctx)
 
@@ -519,7 +688,8 @@ def _make_person_render_fn(target_sid: int):
 
 
 def _make_violator_render_fn(target_sid: int):
-    """Draw overlay only on violation keyframes for target_sid (no hold-forward)."""
+    """Draw overlay on violation keyframes for target_sid (no hold-forward)."""
+    debug_all = web_debug_show_all_dets()
 
     def _render(job: _EncodeJob, ctx: _RenderContext) -> tuple[int, np.ndarray]:
         carry = job.carry
@@ -534,6 +704,11 @@ def _make_violator_render_fn(target_sid: int):
             empty = _empty_instances(replace(carry, frame_idx=job.src_i))
             return _render_encode_job(
                 replace(job, carry=empty, frame_bgr=job.frame_bgr), ctx
+            )
+        if debug_all:
+            # All detections + fat red callout on the no-helmet target.
+            return _render_full_scene_highlight(
+                job, ctx, carry, target_sid, force_highlight=True
             )
         return _render_encode_job(
             replace(job, carry=filtered, frame_bgr=job.frame_bgr), ctx

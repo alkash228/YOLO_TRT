@@ -1,6 +1,7 @@
 """Word (.docx) incident report per violator stable_id."""
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -14,9 +15,11 @@ from WEB_app.video_builder import (
     _verdict_is_violation,
     filter_person_single_id,
     filter_violator_single_id,
+    highlight_no_helmet_on_rgb,
     iter_run_packets,
     load_run_metadata,
     resolve_overlay,
+    web_debug_show_all_dets,
 )
 
 TEST_COMPANIES: tuple[str, ...] = (
@@ -228,18 +231,31 @@ def render_person_frame_rgb(
 
     height, width = int(frame_bgr.shape[0]), int(frame_bgr.shape[1])
 
-    filtered = (
-        filter_violator_single_id(packet, stable_id)
-        if prefer_violation
-        else filter_person_single_id(packet, stable_id)
-    )
-    if filtered.n_inst <= 0:
-        filtered = filter_person_single_id(packet, stable_id)
-    if filtered.n_inst <= 0:
+    person = filter_person_single_id(packet, stable_id)
+    if person.n_inst <= 0:
         raise RuntimeError(
             f"На кадре {frame_idx} нет объекта ID {stable_id} в packets "
             "(нельзя подставлять чужой full-frame)."
         )
+
+    debug_all = web_debug_show_all_dets()
+    if debug_all:
+        # Full scene for debug; still require this ID to be present.
+        draw_packet = packet
+        force_hl = True
+        if prefer_violation:
+            viol = filter_violator_single_id(packet, stable_id)
+            force_hl = viol.n_inst > 0
+    else:
+        filtered = (
+            filter_violator_single_id(packet, stable_id)
+            if prefer_violation
+            else person
+        )
+        if filtered.n_inst <= 0:
+            filtered = person
+        draw_packet = filtered
+        force_hl = False
 
     prompt = str(meta.get("prompt") or "person").strip().casefold() or "person"
     ctx = _RenderContext(
@@ -248,8 +264,18 @@ def render_person_frame_rgb(
         prompt_lookup={prompt: 0},
         overlay=overlay,
     )
-    job = _EncodeJob(src_i=int(frame_idx), carry=filtered, frame_bgr=frame_bgr)
+    job = _EncodeJob(src_i=int(frame_idx), carry=draw_packet, frame_bgr=frame_bgr)
     _, rgb = _render_encode_job(job, ctx)
+    if debug_all:
+        rgb = highlight_no_helmet_on_rgb(
+            rgb,
+            replace(draw_packet, frame_idx=int(frame_idx)),
+            int(stable_id),
+            target_w=ctx.target_w,
+            target_h=ctx.target_h,
+            frame_bgr=frame_bgr,
+            force=force_hl,
+        )
     return _annotate_stable_id(rgb, int(stable_id), int(frame_idx))
 
 
