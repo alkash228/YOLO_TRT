@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
+import subprocess
 import sys
 import threading
 import time
@@ -202,24 +204,128 @@ _build_jobs: dict[str, dict[str, Any]] = {}
 
 # Docker API returns container paths (/data/output/...); WEB runs on the host.
 _DOCKER_OUTPUT_PREFIXES = ("/data/output",)
+_docker_bind_cache: tuple[float, list[Path]] | None = None
+_DOCKER_BIND_TTL_SEC = 30.0
+
+
+def _normalize_docker_host_path(src: str) -> Path | None:
+    """Translate Docker Desktop/WSL mount Source to a Windows/host Path."""
+    s = (src or "").strip().replace("\\", "/")
+    if not s:
+        return None
+    for prefix in ("/run/desktop/mnt/host/", "/host_mnt/", "/mnt/host/", "/mnt/"):
+        if s.startswith(prefix):
+            rest = s[len(prefix) :].lstrip("/")
+            parts = rest.split("/", 1)
+            if len(parts) >= 1 and len(parts[0]) == 1 and parts[0].isalpha():
+                drive = parts[0].upper()
+                tail = parts[1] if len(parts) > 1 else ""
+                return Path(f"{drive}:/{tail}")
+            return Path("/" + rest)
+    # Plain Windows path from Docker Desktop
+    if re.match(r"^[A-Za-z]:/", s) or re.match(r"^[A-Za-z]:\\", src or ""):
+        return Path(src)
+    return Path(s)
+
+
+def _docker_output_bind_dirs() -> list[Path]:
+    """Ask the running API container where /data/output is actually mounted."""
+    global _docker_bind_cache
+    now = time.time()
+    if _docker_bind_cache and (now - _docker_bind_cache[0]) < _DOCKER_BIND_TTL_SEC:
+        return list(_docker_bind_cache[1])
+
+    names = [
+        os.environ.get("YOLO_DRT_CONTAINER_NAME", "").strip(),
+        "yolo-drt-api",
+    ]
+    found: list[Path] = []
+    for name in names:
+        if not name:
+            continue
+        try:
+            proc = subprocess.run(
+                [
+                    "docker",
+                    "inspect",
+                    "-f",
+                    "{{range .Mounts}}{{if eq .Destination \"/data/output\"}}{{.Source}}{{println}}{{end}}{{end}}",
+                    name,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if proc.returncode != 0:
+            continue
+        for line in (proc.stdout or "").splitlines():
+            mapped = _normalize_docker_host_path(line.strip())
+            if mapped is not None:
+                found.append(mapped)
+
+    _docker_bind_cache = (now, found)
+    return list(found)
+
+
+def _compose_output_dirs() -> list[Path]:
+    """Parse nearby docker-compose.yml for ../output:/data/output style binds."""
+    out: list[Path] = []
+    anchors = [ROOT, WEB_APP_DIR, Path.cwd(), *list(ROOT.parents)[:6]]
+    seen_files: set[str] = set()
+    for anchor in anchors:
+        for compose_name in ("docker-compose.yml", "compose.yml"):
+            # search this dir and one level of children (YOLO_DOCKER/)
+            candidates = [anchor / compose_name, anchor / "YOLO_DOCKER" / compose_name]
+            try:
+                if anchor.is_dir():
+                    for child in anchor.iterdir():
+                        if child.is_dir():
+                            candidates.append(child / compose_name)
+            except OSError:
+                pass
+            for cf in candidates:
+                try:
+                    key = str(cf.resolve())
+                except OSError:
+                    key = str(cf)
+                if key in seen_files or not cf.is_file():
+                    continue
+                seen_files.add(key)
+                try:
+                    text = cf.read_text(encoding="utf-8", errors="ignore")
+                except OSError:
+                    continue
+                for m in re.finditer(
+                    r"""["']?([^"'\s]+)/?["']?\s*:\s*["']?/data/output["']?""",
+                    text,
+                ):
+                    rel = m.group(1).strip().strip("\"'")
+                    if not rel or rel.startswith("${"):
+                        continue
+                    host = (cf.parent / rel).resolve()
+                    out.append(host)
+    return out
 
 
 def _host_output_candidates() -> list[Path]:
     """
     Host folders that may contain run dirs.
 
-    Docker compose bind is ``../output:/data/output`` relative to YOLO_DOCKER —
-    that is repo ``output/`` when WEB lives in ``YOLO_DRT/WEB_app``, or
-    ``<parent>/output`` when the git clone root is YOLO_DOCKER itself.
-    Prefer those over empty ``WEB_app/output``.
+    Order: env → live docker inspect bind → compose-parsed binds → nearby output/.
     """
     out: list[Path] = []
     raw = os.environ.get("YOLO_DRT_HOST_OUTPUT_DIR", "").strip()
     if raw:
         out.append(Path(raw))
+    out.extend(_docker_output_bind_dirs())
+    out.extend(_compose_output_dirs())
     out.append(ROOT / "output")
     out.append(ROOT.parent / "output")
-    # WEB started from YOLO_DOCKER tree while compose mounts ../output
+    for parent in list(ROOT.parents)[:5]:
+        out.append(parent / "output")
     if (ROOT / "docker-compose.yml").is_file() or (ROOT / "Dockerfile").is_file():
         out.append(ROOT.parent / "output")
     docker_compose = ROOT / "YOLO_DOCKER" / "docker-compose.yml"
@@ -241,8 +347,77 @@ def _host_output_candidates() -> list[Path]:
     return uniq
 
 
+def _find_run_dir_by_name(name: str) -> Path | None:
+    """Walk nearby trees for output/<run_id> when bind path guess fails."""
+    name = (name or "").strip().strip("/\\")
+    if not name or ".." in name or "/" in name or "\\" in name:
+        return None
+    for root in _host_output_candidates():
+        hit = root / name
+        if hit.is_dir():
+            return hit
+    # Broader: <anchor>/output/<name> up the tree
+    anchors = [ROOT, WEB_APP_DIR, Path.cwd(), *list(ROOT.parents)[:6]]
+    seen: set[str] = set()
+    for anchor in anchors:
+        try:
+            key = str(anchor.resolve())
+        except OSError:
+            key = str(anchor)
+        if key in seen:
+            continue
+        seen.add(key)
+        hit = anchor / "output" / name
+        if hit.is_dir():
+            return hit
+        hit2 = anchor / "WEB_app" / "output" / name
+        if hit2.is_dir():
+            return hit2
+    return None
+
+
+def _materialize_run_from_api(job_id: str, *, run_id_hint: str | None = None) -> Path:
+    """
+    Download run artifacts from Docker API into WEB_app/output/<run_id>.
+    Used when the host cannot see the container bind mount (nested clones, remote API).
+    """
+    job_id = (job_id or "").strip()
+    if not job_id:
+        raise ValueError("job_id required")
+    base = api_base()
+    with httpx.Client(timeout=120.0) as client:
+        art = client.get(f"{base}/v1/jobs/{job_id}/artifacts")
+        if art.status_code >= 400:
+            raise RuntimeError(f"API artifacts {art.status_code}: {art.text[:300]}")
+        payload = art.json()
+        files = list(payload.get("files") or [])
+        out_dir_api = str(payload.get("out_dir") or "")
+        run_id = (run_id_hint or Path(out_dir_api.rstrip("/\\")).name or job_id).strip()
+        if not files:
+            raise RuntimeError(f"API returned no artifact files for job {job_id}")
+        dest = ensure_web_output_dir() / run_id
+        dest.mkdir(parents=True, exist_ok=True)
+        for item in files:
+            fname = str(item.get("name") or "").strip()
+            if not fname or ".." in fname or "/" in fname or "\\" in fname:
+                continue
+            target = dest / fname
+            if target.is_file() and target.stat().st_size > 0:
+                continue
+            r = client.get(f"{base}/v1/jobs/{job_id}/artifacts/{quote(fname)}")
+            if r.status_code >= 400:
+                continue
+            target.write_bytes(r.content)
+    if not _is_run_dir(dest):
+        raise RuntimeError(
+            f"Downloaded files into {dest}, but run markers missing "
+            f"(job still in API memory? restart loses job_id)"
+        )
+    return dest
+
+
 def ensure_web_output_dir() -> Path:
-    """Ensure WEB_app/output exists (manual drop folder); not the Docker bind."""
+    """Ensure WEB_app/output exists (manual drop folder / API fetch cache)."""
     WEB_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     return WEB_OUTPUT_DIR
 
@@ -264,6 +439,10 @@ def _primary_host_output() -> Path:
             best = p
     if best is not None and best_n > 0:
         return best
+    binds = _docker_output_bind_dirs()
+    if binds:
+        binds[0].mkdir(parents=True, exist_ok=True)
+        return binds[0]
     preferred = ROOT / "output"
     preferred.mkdir(parents=True, exist_ok=True)
     return preferred
@@ -331,8 +510,8 @@ def list_local_runs(limit: int = 80) -> list[dict[str, Any]]:
     return rows[: max(1, int(limit))]
 
 
-def _resolve_host_run_dir(run_dir: str | Path) -> Path:
-    """Map Docker /data/output/... (or bare run id) to the Windows host bind-mount path."""
+def _resolve_host_run_dir(run_dir: str | Path, *, job_id: str | None = None) -> Path:
+    """Map Docker /data/output/... (or bare run id) to a host path; optionally fetch via API."""
     raw = str(run_dir or "").strip().replace("\\", "/")
     if not raw:
         return Path(raw)
@@ -361,20 +540,15 @@ def _resolve_host_run_dir(run_dir: str | Path) -> Path:
             if mapped.is_dir():
                 return mapped
 
-    # Last resort: any candidate child matching run folder name
-    if name:
-        for root in _host_output_candidates():
-            if not root.is_dir():
-                continue
-            try:
-                for child in root.iterdir():
-                    if child.name == name and child.is_dir():
-                        return child
-                    if _is_run_dir(child):
-                        for cand in child.glob(f"{name}_result.json"):
-                            return child
-            except OSError:
-                continue
+    found = _find_run_dir_by_name(name)
+    if found is not None:
+        return found
+
+    if job_id:
+        try:
+            return _materialize_run_from_api(job_id, run_id_hint=name or None)
+        except Exception:
+            pass
 
     if search_rels:
         return _primary_host_output() / search_rels[0]
@@ -383,11 +557,12 @@ def _resolve_host_run_dir(run_dir: str | Path) -> Path:
 
 def _run_dir_missing_detail(original: str, resolved: Path) -> str:
     roots = ", ".join(str(r) for r in _host_output_candidates())
+    binds = ", ".join(str(p) for p in _docker_output_bind_dirs()) or "(docker inspect недоступен)"
     return (
         f"Папка прогона не найдена: {original} → {resolved}. "
-        f"Docker пишет в bind ../output (обычно {ROOT / 'output'}). "
-        f"Открой прогон в шаге «Выбрать прогон» или задай YOLO_DRT_HOST_OUTPUT_DIR. "
-        f"Искали в: {roots}"
+        f"Реальный docker bind /data/output: {binds}. "
+        f"Задай YOLO_DRT_HOST_OUTPUT_DIR=путь\\к\\output или открой job пока API жив "
+        f"(WEB скачает артефакты сам). Искали в: {roots}"
     )
 
 
@@ -410,6 +585,7 @@ class BuildVideoBody(BaseModel):
     run_id: str
     overlay: dict[str, Any] | None = None
     source_video: str | None = None
+    job_id: str | None = None
 
 
 class BuildVideoResponse(BaseModel):
@@ -427,6 +603,7 @@ class WordReportBody(BaseModel):
     company: str = ""
     organization: str = ""
     incident_datetime: str = ""
+    job_id: str | None = None
 
 
 class WordReportResponse(BaseModel):
@@ -510,6 +687,7 @@ def local_output_info() -> dict[str, Any]:
     return {
         "output_dir": str(root.resolve()),
         "web_drop_dir": str(ensure_web_output_dir().resolve()),
+        "docker_binds": [str(p) for p in _docker_output_bind_dirs()],
         "candidates": [str(p) for p in _host_output_candidates()],
         "runs": list_local_runs(limit=100),
     }
@@ -526,16 +704,29 @@ def local_runs(limit: int = 100) -> dict[str, Any]:
 class SelectRunBody(BaseModel):
     run_dir: str
     run_id: str | None = None
+    job_id: str | None = None
 
 
 @app.post("/local/select-run")
 def local_select_run(body: SelectRunBody) -> dict[str, Any]:
-    run_path = _resolve_host_run_dir(body.run_dir)
+    job_id = (body.job_id or "").strip() or None
+    run_path = _resolve_host_run_dir(body.run_dir, job_id=job_id)
     if not run_path.is_dir():
         # Also accept absolute host path pasted by user
         alt = Path(str(body.run_dir).strip())
         if alt.is_dir():
             run_path = alt
+    if not run_path.is_dir() and job_id:
+        try:
+            run_path = _materialize_run_from_api(
+                job_id,
+                run_id_hint=(body.run_id or Path(str(body.run_dir)).name or None),
+            )
+        except Exception as exc:
+            raise HTTPException(
+                400,
+                _run_dir_missing_detail(body.run_dir, run_path) + f" | fetch: {exc}",
+            ) from exc
     if not run_path.is_dir():
         raise HTTPException(400, _run_dir_missing_detail(body.run_dir, run_path))
     rid = (body.run_id or "").strip() or run_path.name
@@ -547,6 +738,7 @@ def local_select_run(body: SelectRunBody) -> dict[str, Any]:
         "run_dir": str(run_path.resolve()),
         "run_id": rid,
         "output_dir": str(_primary_host_output().resolve()),
+        "docker_binds": [str(p) for p in _docker_output_bind_dirs()],
     }
 
 
@@ -753,7 +945,16 @@ def _run_build(
 
 @app.post("/build-video", response_model=BuildVideoResponse)
 def build_video(body: BuildVideoBody) -> BuildVideoResponse:
-    run_dir = _resolve_host_run_dir(body.run_dir)
+    job_id = (body.job_id or "").strip() or None
+    run_dir = _resolve_host_run_dir(body.run_dir, job_id=job_id)
+    if not run_dir.is_dir() and job_id:
+        try:
+            run_dir = _materialize_run_from_api(job_id, run_id_hint=body.run_id)
+        except Exception as exc:
+            raise HTTPException(
+                400,
+                _run_dir_missing_detail(body.run_dir, run_dir) + f" | fetch: {exc}",
+            ) from exc
     if not run_dir.is_dir():
         raise HTTPException(400, _run_dir_missing_detail(body.run_dir, run_dir))
 

@@ -728,11 +728,15 @@
     }
   }
 
-  async function resolveHostRun(runDir, runId) {
+  async function resolveHostRun(runDir, runId, jobId) {
     const r = await fetch("/local/select-run", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ run_dir: runDir, run_id: runId || null }),
+      body: JSON.stringify({
+        run_dir: runDir,
+        run_id: runId || null,
+        job_id: jobId || null,
+      }),
     });
     if (!r.ok) throw new Error(await r.text());
     return r.json();
@@ -749,6 +753,7 @@
       0;
     const pass2Sec = Number(stats.elapsed_pass2_sec) || 0;
     const violations = stats.cross_check_violations ?? pipeline.cross_check_violations ?? "—";
+    const jobId = job.job_id || currentJob?.job_id || pollJobId || null;
 
     cardVideo.classList.remove("hidden");
     initReportDefaults();
@@ -758,14 +763,14 @@
     let resolveErr = "";
     if (runDir) {
       try {
-        const mapped = await resolveHostRun(runDir, runId);
+        const mapped = await resolveHostRun(runDir, runId, jobId);
         runDir = mapped.run_dir || runDir;
         runId = mapped.run_id || runId;
       } catch (e) {
         resolveErr = String(e);
         showToast(
           "Папка прогона не найдена на диске",
-          "Docker пишет в output рядом с репо. Открой прогон вручную в шаге 2.",
+          "WEB попробует скачать артефакты с API по job id. Проверь, что Docker запущен и job ещё в памяти.",
           "error",
           12000
         );
@@ -778,7 +783,7 @@
       loadReportViolators(currentRunDir, currentRunId);
     }
     runMeta.innerHTML = `
-      <dt>Job ID</dt><dd><code>${currentJob?.job_id || pollJobId || "—"}</code></dd>
+      <dt>Job ID</dt><dd><code>${jobId || "—"}</code></dd>
       <dt>Run ID</dt><dd><code>${currentRunId || "—"}</code></dd>
       <dt>Папка на диске</dt><dd><code>${currentRunDir || "—"}</code></dd>
       <dt>Кадров обработано</dt><dd>${res.frames ?? stats.processed_frame_count ?? "—"}</dd>
@@ -802,7 +807,7 @@
       crossWarn.classList.add("hidden");
     }
 
-    btnBuild.onclick = () => startBuild(currentRunDir, currentRunId);
+    btnBuild.onclick = () => startBuild(currentRunDir, currentRunId, jobId);
   }
 
   btnRun.addEventListener("click", async () => {
@@ -932,7 +937,7 @@
     }
   }
 
-  async function startBuild(runDir, runId) {
+  async function startBuild(runDir, runId, jobId) {
     if (!runDir || !runId) return;
     btnBuild.disabled = true;
     btnBuild.textContent = "Сборка…";
@@ -950,6 +955,7 @@
           run_dir: runDir,
           run_id: runId,
           source_video: (sourceVideoInput?.value || "").trim() || null,
+          job_id: jobId || currentJob?.job_id || pollJobId || null,
         }),
       });
       if (!r.ok) throw new Error(await r.text());
