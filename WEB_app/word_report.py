@@ -8,14 +8,13 @@ from typing import Any
 import cv2
 import numpy as np
 
+from app.core.frame_pipeline import FramePacket
 from app.core.video_encode import _EncodeJob, _RenderContext, _render_encode_job, resolve_run_packets
 from WEB_app.video_builder import (
-    collect_presence_frame_indices,
-    collect_violation_frame_indices,
-    count_presence_by_stable_id,
-    count_violations_by_stable_id,
+    _verdict_is_violation,
     filter_person_single_id,
-    find_packet_at_frame,
+    filter_violator_single_id,
+    iter_run_packets,
     load_run_metadata,
     resolve_overlay,
 )
@@ -66,54 +65,93 @@ def parse_incident_datetime(raw: str) -> datetime:
     return datetime.now()
 
 
-def middle_presence_frame(
-    data: dict[str, Any], run_dir: Path, stable_id: int
-) -> int | None:
-    presence = collect_presence_frame_indices(data, run_dir, stable_id)
-    if not presence:
-        violations = collect_violation_frame_indices(data, run_dir, stable_id)
-        if not violations:
-            return None
-        return violations[len(violations) // 2]
-    return presence[len(presence) // 2]
+def _scan_violator_packets(
+    data: dict[str, Any],
+    run_dir: Path,
+    stable_id: int,
+) -> tuple[list[int], list[int], FramePacket | None, int]:
+    """
+    One pass over spill packets:
+    presence frames, violation frames, a packet for the chosen report frame, counts.
+    Prefers a NO HELMET frame (middle of violations) for the photo.
+    """
+    sid = int(stable_id)
+    presence: list[int] = []
+    violations: list[int] = []
+    packets_by_frame: dict[int, FramePacket] = {}
+    for packet in iter_run_packets(data, Path(run_dir)):
+        n = int(packet.n_inst)
+        if n <= 0 or packet.stable_ids is None:
+            continue
+        hit = False
+        viol = False
+        for i in range(min(n, len(packet.stable_ids))):
+            if int(packet.stable_ids[i]) != sid:
+                continue
+            hit = True
+            verdicts = packet.cross_check_verdicts or []
+            if i < len(verdicts) and _verdict_is_violation(verdicts[i]):
+                viol = True
+            break
+        if not hit:
+            continue
+        fi = int(packet.frame_idx)
+        presence.append(fi)
+        packets_by_frame[fi] = packet
+        if viol:
+            violations.append(fi)
+
+    if violations:
+        frame_idx = violations[len(violations) // 2]
+    elif presence:
+        frame_idx = presence[len(presence) // 2]
+    else:
+        return [], [], None, -1
+
+    return presence, violations, packets_by_frame.get(frame_idx), frame_idx
 
 
 def read_source_frame_bgr(input_path: str, frame_idx: int) -> np.ndarray | None:
-    """Grab one source frame. Sequential decode — HEVC-safe (no POS_FRAMES seek)."""
-    from app.core.frame_io import read_frame_bgr_sequential
+    """Grab one source frame — seek when possible, else grab-skip."""
+    from app.core.frame_io import read_frame_bgr_smart
 
-    return read_frame_bgr_sequential(str(input_path), int(frame_idx))
+    return read_frame_bgr_smart(str(input_path), int(frame_idx))
 
 
 def render_person_frame_rgb(
     *,
-    data: dict[str, Any],
-    run_dir: Path,
-    run_id: str,
+    packet: FramePacket | None,
     stable_id: int,
     meta: dict[str, Any],
     overlay: dict[str, Any],
     frame_idx: int,
+    prefer_violation: bool = True,
 ) -> np.ndarray:
     input_path = str(meta.get("input_path") or "")
     width = int(meta.get("width") or 0)
     height = int(meta.get("height") or 0)
     frame_bgr = read_source_frame_bgr(input_path, frame_idx) if input_path else None
 
-    packet = find_packet_at_frame(data, run_dir, frame_idx)
     if packet is None:
         if frame_bgr is None:
             raise RuntimeError(f"Кадр {frame_idx} недоступен в исходном видео")
-        rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-        return rgb
+        return cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
 
     if frame_bgr is None and packet.frame_bgr is not None and packet.frame_bgr.size > 0:
-        frame_bgr = packet.frame_bgr
+        fb = packet.frame_bgr
+        if fb.shape[0] > 2 and fb.shape[1] > 2:
+            frame_bgr = fb
 
     if frame_bgr is not None:
         height, width = int(frame_bgr.shape[0]), int(frame_bgr.shape[1])
 
-    filtered = filter_person_single_id(packet, stable_id)
+    filtered = (
+        filter_violator_single_id(packet, stable_id)
+        if prefer_violation
+        else filter_person_single_id(packet, stable_id)
+    )
+    if filtered.n_inst <= 0:
+        filtered = filter_person_single_id(packet, stable_id)
     if filtered.n_inst <= 0:
         if frame_bgr is None:
             raise RuntimeError(f"Человек ID {stable_id} не найден на кадре {frame_idx}")
@@ -155,24 +193,23 @@ def build_word_report(
     data, _ = resolve_run_packets(run_path, run_id=run_id)
     overlay = resolve_overlay(meta, overlay_override=overlay_override)
 
-    frame_idx = middle_presence_frame(data, run_path, stable_id)
-    if frame_idx is None:
+    presence, violations, packet, frame_idx = _scan_violator_packets(
+        data, run_path, int(stable_id)
+    )
+    if frame_idx < 0:
         raise RuntimeError(f"Нет кадров с нарушителем ID {stable_id}")
 
     rgb = render_person_frame_rgb(
-        data=data,
-        run_dir=run_path,
-        run_id=run_id,
-        stable_id=stable_id,
+        packet=packet,
+        stable_id=int(stable_id),
         meta=meta,
         overlay=overlay,
         frame_idx=frame_idx,
+        prefer_violation=bool(violations),
     )
 
-    vcounts = count_violations_by_stable_id(data, run_path)
-    pcounts = count_presence_by_stable_id(data, run_path)
-    violation_count = int(vcounts.get(int(stable_id), 0))
-    presence_count = int(pcounts.get(int(stable_id), 0))
+    violation_count = len(violations)
+    presence_count = len(presence)
 
     reports_dir = run_path / "reports"
     reports_dir.mkdir(parents=True, exist_ok=True)
@@ -215,6 +252,7 @@ def build_word_report(
     add_row("Идентификатор нарушителя", f"№ {stable_id}")
     add_row("Кадров присутствия в видео", str(presence_count))
     add_row("Срабатываний без каски", str(violation_count))
+    add_row("Кадр в отчёте", str(frame_idx))
     add_row("Исходное видео", source_name)
 
     doc.add_paragraph()

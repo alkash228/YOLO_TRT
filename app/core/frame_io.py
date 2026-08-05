@@ -17,22 +17,46 @@ def read_frame_bgr_sequential(
     target = max(0, int(frame_idx))
     if target > int(max_skip):
         return None
-    cap = cv2.VideoCapture(str(input_path))
+    # Prefer grab-skip (decode without BGR convert) until the target frame.
+    try:
+        for idx, frame in iter_selected_bgr_frames(str(input_path), [target]):
+            if idx == target:
+                return frame
+    except RuntimeError:
+        return None
+    return None
+
+
+def read_frame_bgr_smart(
+    input_path: str,
+    frame_idx: int,
+    *,
+    max_skip: int = 500_000,
+) -> np.ndarray | None:
+    """
+    Fast path: CAP_PROP_POS_FRAMES seek when the backend lands near the target.
+    Fallback: HEVC-safe grab-skip sequential decode.
+    """
+    target = max(0, int(frame_idx))
+    if target > int(max_skip):
+        return None
+    path = str(input_path)
+    if target == 0:
+        return read_frame_bgr_sequential(path, 0, max_skip=max_skip)
+    cap = cv2.VideoCapture(path)
     if not cap.isOpened():
         return None
     try:
-        idx = 0
-        while idx <= target:
-            ok, frame = cap.read()
-            if not ok or frame is None:
-                return None
-            if idx == target:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, float(target))
+        ok, frame = cap.read()
+        if ok and frame is not None and frame.size > 0:
+            pos = int(cap.get(cv2.CAP_PROP_POS_FRAMES) or -1)
+            # After reading frame N, POS is often N+1.
+            if pos < 0 or abs(pos - (target + 1)) <= 2 or abs(pos - target) <= 2:
                 return frame
-            idx += 1
-        return None
     finally:
         cap.release()
-
+    return read_frame_bgr_sequential(path, target, max_skip=max_skip)
 
 def iter_selected_bgr_frames(
     input_path: str,
