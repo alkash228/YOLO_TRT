@@ -86,10 +86,8 @@ services:
       YOLO_DRT_TRT_AUTOCAST_FAST: "true"
       YOLO_DRT_INFERENCE_DEVICE: cuda
     volumes:
-      # Final artifacts only — Windows host bind is OK for write-at-end JSON/mp4.
-      # Nested: YOLO_DRT/YOLO_DOCKER → ../output = YOLO_DRT/output
-      # Standalone clone: ../output = sibling of the repo folder.
-      - ../output:/data/output
+      # Same folder WEB uses: <repo>/output
+      - ./output:/data/output
       # Named volume lives in the Linux VM: fast random read for video decode.
       # Uploads + staged path-job copies go here (not to ../output).
       - yolo_work:/data/work

@@ -188,6 +188,7 @@ async def _lifespan(_app: FastAPI):
             loop.default_exception_handler(context)
 
     loop.set_exception_handler(handler)
+    ensure_web_output_dir()
     yield
 
 
@@ -202,22 +203,22 @@ _DOCKER_OUTPUT_PREFIXES = ("/data/output",)
 
 
 def _host_output_candidates() -> list[Path]:
-    """Where Docker/host may store runs (compose uses ../output OR ./output)."""
+    """Host folders that may contain run dirs. Prefer <repo>/output (WEB + compose ./output)."""
     out: list[Path] = []
     raw = os.environ.get("YOLO_DRT_HOST_OUTPUT_DIR", "").strip()
     if raw:
         out.append(Path(raw))
-    # Repo root next to WEB_app/ (YOLO_TRT/output or YOLO_DRT/output)
     out.append(ROOT / "output")
-    # docker-compose.yml: ../output:/data/output  → sibling of the repo folder
+    # Legacy layouts
     out.append(ROOT.parent / "output")
-    # cwd fallback
     out.append(Path.cwd() / "output")
-    # Dedupe while preserving order
     seen: set[str] = set()
     uniq: list[Path] = []
     for p in out:
-        key = str(p.resolve()) if p.exists() else str(p)
+        try:
+            key = str(p.resolve())
+        except OSError:
+            key = str(p)
         if key in seen:
             continue
         seen.add(key)
@@ -225,11 +226,78 @@ def _host_output_candidates() -> list[Path]:
     return uniq
 
 
+def ensure_web_output_dir() -> Path:
+    """Canonical output next to the repo (create if missing)."""
+    path = ROOT / "output"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
 def _host_output_root() -> Path:
+    ensure_web_output_dir()
     for p in _host_output_candidates():
         if p.is_dir():
             return p
     return ROOT / "output"
+
+
+def _is_run_dir(path: Path) -> bool:
+    if not path.is_dir():
+        return False
+    name = path.name
+    if name.startswith(".") or name in {"uploads", "input", "reports"}:
+        return False
+    # Typical run folder or any dir with result/packets
+    markers = (
+        f"{name}_result.json",
+        f"{name}_run_summary.json",
+        f"{name}_packets_manifest.json",
+    )
+    if any((path / m).is_file() for m in markers):
+        return True
+    if list(path.glob("*_result.json")) or list(path.glob("*_packets_manifest.json")):
+        return True
+    return False
+
+
+def list_local_runs(limit: int = 80) -> list[dict[str, Any]]:
+    ensure_web_output_dir()
+    found: dict[str, dict[str, Any]] = {}
+    for root in _host_output_candidates():
+        if not root.is_dir():
+            continue
+        try:
+            kids = sorted(root.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True)
+        except OSError:
+            continue
+        for child in kids:
+            if not _is_run_dir(child):
+                continue
+            key = str(child.resolve())
+            if key in found:
+                continue
+            try:
+                mtime = child.stat().st_mtime
+            except OSError:
+                mtime = 0.0
+            rid = child.name
+            for cand in child.glob("*_result.json"):
+                rid = cand.name[: -len("_result.json")]
+                break
+            found[key] = {
+                "run_dir": key,
+                "run_id": rid,
+                "name": child.name,
+                "root": str(root.resolve()),
+                "mtime": mtime,
+            }
+            if len(found) >= max(1, int(limit)):
+                break
+        if len(found) >= max(1, int(limit)):
+            break
+    rows = list(found.values())
+    rows.sort(key=lambda r: float(r.get("mtime") or 0), reverse=True)
+    return rows
 
 
 def _resolve_host_run_dir(run_dir: str | Path) -> Path:
@@ -380,6 +448,48 @@ def access_info() -> dict[str, Any]:
         "bind_host": WEB_HOST,
         "web_port": WEB_PORT,
         "api_port": api_port,
+    }
+
+
+@app.get("/local/output")
+def local_output_info() -> dict[str, Any]:
+    root = ensure_web_output_dir()
+    return {
+        "output_dir": str(root.resolve()),
+        "candidates": [str(p) for p in _host_output_candidates()],
+        "runs": list_local_runs(limit=100),
+    }
+
+
+@app.get("/local/runs")
+def local_runs(limit: int = 100) -> dict[str, Any]:
+    return {"runs": list_local_runs(limit=limit), "output_dir": str(ensure_web_output_dir().resolve())}
+
+
+class SelectRunBody(BaseModel):
+    run_dir: str
+    run_id: str | None = None
+
+
+@app.post("/local/select-run")
+def local_select_run(body: SelectRunBody) -> dict[str, Any]:
+    run_path = _resolve_host_run_dir(body.run_dir)
+    if not run_path.is_dir():
+        # Also accept absolute host path pasted by user
+        alt = Path(str(body.run_dir).strip())
+        if alt.is_dir():
+            run_path = alt
+    if not run_path.is_dir():
+        raise HTTPException(400, _run_dir_missing_detail(body.run_dir, run_path))
+    rid = (body.run_id or "").strip() or run_path.name
+    for cand in run_path.glob("*_result.json"):
+        rid = cand.name[: -len("_result.json")]
+        break
+    return {
+        "ok": True,
+        "run_dir": str(run_path.resolve()),
+        "run_id": rid,
+        "output_dir": str(ensure_web_output_dir().resolve()),
     }
 
 

@@ -62,8 +62,32 @@
         </div>
       </section>
 
-      <section class="card hidden" id="card-video">
+
+      <section class="card" id="card-pick-run">
         <div class="step-label">Шаг 2</div>
+        <h2>Выбрать прогон</h2>
+        <p class="hint" id="output-dir-hint">output: —</p>
+        <label class="field">
+          <span>Папка прогона из output</span>
+          <div class="job-resume-row">
+            <select id="run-folder-select">
+              <option value="">— выберите папку —</option>
+            </select>
+            <button type="button" class="btn btn-secondary" id="btn-refresh-runs">Обновить</button>
+          </div>
+        </label>
+        <label class="field">
+          <span>Или вставь путь к папке</span>
+          <div class="job-resume-row">
+            <input type="text" id="run-dir-input" placeholder="C:\\path\\output\\run_folder" autocomplete="off" spellcheck="false" />
+            <button type="button" class="btn btn-secondary" id="btn-open-run-dir">Открыть</button>
+          </div>
+        </label>
+        <p class="hint">Положи папку прогона в <code>output</code> рядом с репо и нажми «Обновить».</p>
+      </section>
+
+      <section class="card hidden" id="card-video">
+        <div class="step-label">Шаг 3</div>
         <h2>Клипы нарушений</h2>
         <dl class="meta" id="run-meta"></dl>
         <p class="warn hidden" id="cross-warn"></p>

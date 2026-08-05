@@ -33,6 +33,11 @@
   const apiUrlInput = $("#api-url-input");
   const btnApiUrlApply = $("#btn-api-url-apply");
   const btnApiUrlAuto = $("#btn-api-url-auto");
+  const runFolderSelect = $("#run-folder-select");
+  const btnRefreshRuns = $("#btn-refresh-runs");
+  const runDirInput = $("#run-dir-input");
+  const btnOpenRunDir = $("#btn-open-run-dir");
+  const outputDirHint = $("#output-dir-hint");
 
   let selectedFile = null;
   let currentJob = null;
@@ -90,6 +95,62 @@
     );
     await checkHealth();
     return data;
+  }
+
+  async function refreshLocalRuns() {
+    try {
+      const r = await fetch("/local/runs?limit=100");
+      if (!r.ok) throw new Error(await r.text());
+      const data = await r.json();
+      if (outputDirHint) {
+        outputDirHint.textContent = `output: ${data.output_dir || "—"}`;
+      }
+      if (!runFolderSelect) return;
+      const cur = runFolderSelect.value;
+      runFolderSelect.innerHTML =
+        '<option value="">— выберите папку —</option>' +
+        (data.runs || [])
+          .map((row) => {
+            const label = `${row.name || row.run_id} (${row.run_id})`;
+            const val = row.run_dir;
+            return `<option value="${encodeURIComponent(JSON.stringify(row))}">${label}</option>`;
+          })
+          .join("");
+      if (cur) {
+        for (const opt of runFolderSelect.options) {
+          if (opt.value === cur) {
+            runFolderSelect.value = cur;
+            break;
+          }
+        }
+      }
+    } catch (e) {
+      if (outputDirHint) outputDirHint.textContent = `output: ошибка — ${e}`;
+    }
+  }
+
+  async function openRunFolder(runDir, runId) {
+    const r = await fetch("/local/select-run", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ run_dir: runDir, run_id: runId || null }),
+    });
+    if (!r.ok) throw new Error(await r.text());
+    const data = await r.json();
+    currentRunDir = data.run_dir;
+    currentRunId = data.run_id;
+    if (runDirInput) runDirInput.value = data.run_dir;
+    cardVideo.classList.remove("hidden");
+    initReportDefaults();
+    runMeta.innerHTML = `
+      <dt>Run ID</dt><dd><code>${currentRunId || "—"}</code></dd>
+      <dt>Папка</dt><dd><code>${currentRunDir || "—"}</code></dd>
+    `;
+    crossWarn.classList.add("hidden");
+    btnBuild.onclick = () => startBuild(currentRunDir, currentRunId);
+    await loadReportViolators(currentRunDir, currentRunId);
+    showToast("Прогон открыт", currentRunId || currentRunDir);
+    cardVideo?.scrollIntoView({ behavior: "smooth", block: "start" });
   }
 
   async function syncApiUrlFromServer() {
@@ -896,6 +957,35 @@
     }
   });
 
+  btnRefreshRuns?.addEventListener("click", () => refreshLocalRuns());
+  runFolderSelect?.addEventListener("change", async () => {
+    const raw = runFolderSelect.value;
+    if (!raw) return;
+    try {
+      const row = JSON.parse(decodeURIComponent(raw));
+      await openRunFolder(row.run_dir, row.run_id);
+    } catch (e) {
+      showToast("Прогон", String(e), "error", 7000);
+    }
+  });
+  btnOpenRunDir?.addEventListener("click", async () => {
+    try {
+      await openRunFolder(runDirInput?.value || "", null);
+    } catch (e) {
+      showToast("Прогон", String(e), "error", 7000);
+    }
+  });
+  runDirInput?.addEventListener("keydown", async (e) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      try {
+        await openRunFolder(runDirInput.value, null);
+      } catch (err) {
+        showToast("Прогон", String(err), "error", 7000);
+      }
+    }
+  });
+
   async function bootstrapResume() {
     const fromUrl = jobIdFromUrl();
     const fromStore = storedJobId();
@@ -923,6 +1013,7 @@
       console.warn("API bootstrap failed:", e);
       await checkHealth();
     }
+    await refreshLocalRuns();
     await bootstrapResume();
   }
 
