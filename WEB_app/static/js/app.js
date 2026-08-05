@@ -27,6 +27,12 @@
   const reportViolatorsWrap = $("#report-violators-wrap");
   const reportViolatorId = $("#report-violator-id");
   const btnReportOne = $("#btn-report-one");
+  const jobIdInput = $("#job-id-input");
+  const btnResumeJob = $("#btn-resume-job");
+  const jobIdHint = $("#job-id-hint");
+  const apiUrlInput = $("#api-url-input");
+  const btnApiUrlApply = $("#btn-api-url-apply");
+  const btnApiUrlAuto = $("#btn-api-url-auto");
 
   let selectedFile = null;
   let currentJob = null;
@@ -38,8 +44,128 @@
   let apiReady = false;
   let currentSettings = null;
 
-  /** Poll interval — progress reads throttled slot; 2s avoids GIL noise with infer. */
-  const JOB_POLL_MS = 2000;
+  const JOB_STORAGE_KEY = "yolo_drt_web_last_job_id";
+  const API_URL_STORAGE_KEY = "yolo_drt_web_api_url";
+
+  function storedApiUrl() {
+    try {
+      return (localStorage.getItem(API_URL_STORAGE_KEY) || "").trim();
+    } catch (_) {
+      return "";
+    }
+  }
+
+  function rememberApiUrl(url) {
+    const v = String(url || "").trim();
+    try {
+      if (v) localStorage.setItem(API_URL_STORAGE_KEY, v);
+      else localStorage.removeItem(API_URL_STORAGE_KEY);
+    } catch (_) {
+      /* ignore */
+    }
+    if (apiUrlInput && v) apiUrlInput.value = v;
+  }
+
+  async function applyApiUrl(raw, { auto = false } = {}) {
+    const body = { api_url: auto ? "" : String(raw || "").trim() };
+    const r = await fetch("/proxy/api-url", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!r.ok) throw new Error(await r.text());
+    const data = await r.json();
+    const url = String(data.api_url || "");
+    if (data.mode === "manual") rememberApiUrl(url);
+    else {
+      rememberApiUrl("");
+      if (apiUrlInput) apiUrlInput.value = url;
+    }
+    const reach = data.reachable ? (data.status || "ok") : "не отвечает";
+    showToast(
+      data.mode === "manual" ? "API задан вручную" : "API: авто",
+      `${url} · ${reach}`,
+      data.reachable ? "success" : "error",
+      5000
+    );
+    await checkHealth();
+    return data;
+  }
+
+  async function syncApiUrlFromServer() {
+    try {
+      const r = await fetch("/proxy/api-url");
+      if (!r.ok) return;
+      const data = await r.json();
+      if (apiUrlInput) {
+        apiUrlInput.value = data.override || data.api_url || storedApiUrl() || "http://127.0.0.1:8080";
+      }
+    } catch (_) {
+      if (apiUrlInput && !apiUrlInput.value) {
+        apiUrlInput.value = storedApiUrl() || "http://127.0.0.1:8080";
+      }
+    }
+  }
+
+  function rememberJobId(jobId) {
+    const id = String(jobId || "").trim();
+    if (!id) return;
+    try {
+      localStorage.setItem(JOB_STORAGE_KEY, id);
+    } catch (_) {
+      /* ignore quota / private mode */
+    }
+    if (jobIdInput) jobIdInput.value = id;
+    if (jobIdHint) jobIdHint.textContent = `Текущая задача: ${id}`;
+    try {
+      const url = new URL(window.location.href);
+      url.searchParams.set("job", id);
+      window.history.replaceState({}, "", url);
+    } catch (_) {
+      /* ignore */
+    }
+  }
+
+  function storedJobId() {
+    try {
+      return (localStorage.getItem(JOB_STORAGE_KEY) || "").trim();
+    } catch (_) {
+      return "";
+    }
+  }
+
+  function jobIdFromUrl() {
+    try {
+      return (new URL(window.location.href).searchParams.get("job") || "").trim();
+    } catch (_) {
+      return "";
+    }
+  }
+
+  async function resumeJobById(rawId, { quiet = false } = {}) {
+    const jobId = String(rawId || "").trim();
+    if (!jobId) {
+      if (!quiet) showToast("Укажите job ID", "", "error", 4000);
+      return;
+    }
+    await checkHealth();
+    if (!apiReady) {
+      if (!quiet) showToast("API недоступен", "Сначала поднимите Docker API", "error", 6000);
+      return;
+    }
+    stopJobPoll();
+    rememberJobId(jobId);
+    pollJobId = jobId;
+    jobProgressWrap.classList.remove("hidden");
+    jobProgress.classList.add("indeterminate");
+    jobProgress.style.width = "30%";
+    jobStatus.textContent = `Загрузка задачи ${jobId}…`;
+    btnRun.disabled = true;
+    btnRun.textContent = "Ожидание…";
+    setStatus("busy", "Открытие задачи…");
+    if (!quiet) showToast("Открываю задачу", jobId);
+    await pollJob(jobId);
+  }
 
   /** Baked fast profile — same as app/config/ui_fast_profile.json */
   const FAST_PROFILE = {
@@ -65,6 +191,9 @@
     pose_kpt_conf: 0.30,
     default_prompt: "person",
   };
+
+  /** Poll interval — progress reads throttled slot; 2s avoids GIL noise with infer. */
+  const JOB_POLL_MS = 2000;
 
   function initReportDefaults() {
     const now = new Date();
@@ -494,6 +623,7 @@
         jobProgress.style.width = "100%";
         jobStatus.textContent = formatJobDoneLine(job);
         currentJob = job;
+        rememberJobId(jobId);
         showVideoSection(job);
         btnRun.disabled = false;
         btnRun.textContent = "Начать анализ";
@@ -513,9 +643,24 @@
         showToast("Ошибка обработки", job.result?.error || job.error || "", "error", 8000);
         return;
       }
+      rememberJobId(jobId);
       scheduleJobPoll(jobId);
     } catch (e) {
-      jobStatus.textContent = String(e);
+      const msg = String(e);
+      jobStatus.textContent = msg;
+      if (/404|not found|Job not found/i.test(msg)) {
+        stopJobPoll();
+        btnRun.disabled = false;
+        btnRun.textContent = "Начать анализ";
+        setStatus("error", "Задача не найдена");
+        showToast(
+          "Задача не найдена",
+          "API мог перезапуститься — job ID живёт в памяти контейнера. Запустите анализ снова.",
+          "error",
+          9000
+        );
+        return;
+      }
       scheduleJobPoll(jobId);
     }
   }
@@ -540,6 +685,7 @@
       loadReportViolators(currentRunDir, currentRunId);
     }
     runMeta.innerHTML = `
+      <dt>Job ID</dt><dd><code>${currentJob?.job_id || pollJobId || "—"}</code></dd>
       <dt>Кадров обработано</dt><dd>${res.frames ?? stats.processed_frame_count ?? "—"}</dd>
       <dt>Нарушений (без каски)</dt><dd>${violations}</dd>
       <dt>Время анализа (YOLO)</dt><dd>${inferSec > 0 ? formatDuration(inferSec) : "—"}</dd>
@@ -597,6 +743,7 @@
       jobStatus.textContent = "Анализ видео…";
       jobProgress.classList.add("indeterminate");
       jobProgress.style.width = "30%";
+      rememberJobId(job_id);
       pollJobId = job_id;
       pollJob(job_id);
     } catch (e) {
@@ -714,6 +861,70 @@
     }
   }
 
-  checkHealth();
-  initReportDefaults();
+  btnResumeJob?.addEventListener("click", () => {
+    resumeJobById(jobIdInput?.value || storedJobId());
+  });
+  jobIdInput?.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      resumeJobById(jobIdInput.value);
+    }
+  });
+
+  btnApiUrlApply?.addEventListener("click", async () => {
+    try {
+      await applyApiUrl(apiUrlInput?.value || "");
+    } catch (e) {
+      showToast("API URL", String(e), "error", 7000);
+    }
+  });
+  btnApiUrlAuto?.addEventListener("click", async () => {
+    try {
+      await applyApiUrl("", { auto: true });
+    } catch (e) {
+      showToast("API URL", String(e), "error", 7000);
+    }
+  });
+  apiUrlInput?.addEventListener("keydown", async (e) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      try {
+        await applyApiUrl(apiUrlInput.value);
+      } catch (err) {
+        showToast("API URL", String(err), "error", 7000);
+      }
+    }
+  });
+
+  async function bootstrapResume() {
+    const fromUrl = jobIdFromUrl();
+    const fromStore = storedJobId();
+    const id = fromUrl || fromStore;
+    if (jobIdInput && id) jobIdInput.value = id;
+    if (jobIdHint && id) jobIdHint.textContent = `Сохранена задача: ${id}`;
+    if (!id) return;
+    await resumeJobById(id, { quiet: true });
+  }
+
+  async function bootstrap() {
+    initReportDefaults();
+    const saved = storedApiUrl();
+    if (apiUrlInput) {
+      apiUrlInput.value = saved || "http://127.0.0.1:8080";
+    }
+    try {
+      if (saved) {
+        await applyApiUrl(saved);
+      } else {
+        await syncApiUrlFromServer();
+        await checkHealth();
+      }
+    } catch (e) {
+      console.warn("API bootstrap failed:", e);
+      await checkHealth();
+    }
+    await bootstrapResume();
+  }
+
+  bootstrap();
 })();

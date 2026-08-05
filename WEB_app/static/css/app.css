@@ -104,6 +104,40 @@ body {
   background: var(--err);
 }
 
+.header-api {
+  width: 100%;
+  margin-top: 0.35rem;
+}
+
+.api-url-field {
+  margin-bottom: 0;
+  max-width: 42rem;
+}
+
+.api-url-row {
+  display: flex;
+  gap: 0.5rem;
+  align-items: stretch;
+}
+
+.api-url-row input {
+  flex: 1;
+  min-width: 0;
+}
+
+.api-url-row .btn {
+  flex-shrink: 0;
+}
+
+@media (max-width: 640px) {
+  .api-url-row {
+    flex-wrap: wrap;
+  }
+  .api-url-row .btn {
+    flex: 1;
+  }
+}
+
 @keyframes pulse {
   0%, 100% { opacity: 1; }
   50% { opacity: 0.4; }
@@ -608,6 +642,48 @@ body {
 .field span {
   font-size: 0.8rem;
   color: var(--muted);
+}
+
+.job-resume {
+  margin-top: 1.25rem;
+  padding-top: 1.1rem;
+  border-top: 1px solid var(--border);
+}
+
+.job-resume-field {
+  margin-bottom: 0.4rem;
+}
+
+.job-resume-row {
+  display: flex;
+  gap: 0.6rem;
+  align-items: stretch;
+}
+
+.job-resume-row input {
+  flex: 1;
+  min-width: 0;
+}
+
+.job-resume-row .btn {
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+
+@media (max-width: 560px) {
+  .job-resume-row {
+    flex-direction: column;
+  }
+}
+
+.btn-secondary {
+  background: var(--surface);
+  color: var(--text);
+  border: 1px solid var(--border);
+}
+
+.btn-secondary:hover {
+  background: color-mix(in srgb, var(--surface) 85%, var(--text));
 }
 
 input[type="text"],

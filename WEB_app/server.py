@@ -34,6 +34,22 @@ _API_PROBE_PORTS = (8080, 8765)
 _api_url_cache: str | None = None
 _api_url_cache_at: float = 0.0
 _API_URL_TTL_SEC = 5.0
+# UI override (POST /proxy/api-url) — wins over auto-probe until cleared.
+_user_api_url: str | None = None
+_user_api_lock = threading.Lock()
+
+
+def _normalize_api_url(raw: str) -> str:
+    url = (raw or "").strip().rstrip("/")
+    if not url:
+        return ""
+    if "://" not in url:
+        url = "http://" + url
+    low = url.casefold()
+    if not (low.startswith("http://") or low.startswith("https://")):
+        raise ValueError("API URL must be http:// or https://")
+    # Block obvious junk / SSRF to file schemes etc. (already filtered).
+    return url
 
 
 def _probe_api(url: str) -> tuple[bool, str]:
@@ -91,6 +107,11 @@ def api_base() -> str:
     """Live API target with short TTL cache (Docker may start after WEB)."""
     global _api_url_cache, _api_url_cache_at
 
+    with _user_api_lock:
+        override = _user_api_url
+    if override:
+        return override
+
     now = time.time()
     if _api_url_cache and (now - _api_url_cache_at) < _API_URL_TTL_SEC:
         return _api_url_cache
@@ -98,6 +119,57 @@ def api_base() -> str:
     _api_url_cache = url
     _api_url_cache_at = now
     return url
+
+
+def set_user_api_url(raw: str | None) -> dict[str, Any]:
+    """Set or clear UI API override. Empty string clears override (auto-probe)."""
+    global _user_api_url, _api_url_cache, _api_url_cache_at
+
+    text = (raw or "").strip()
+    if not text:
+        with _user_api_lock:
+            _user_api_url = None
+        _api_url_cache = None
+        _api_url_cache_at = 0.0
+        resolved = api_base()
+        ok, status = _probe_api(resolved)
+        return {
+            "ok": True,
+            "mode": "auto",
+            "api_url": resolved,
+            "override": None,
+            "reachable": ok,
+            "status": status,
+        }
+
+    url = _normalize_api_url(text)
+    ok, status = _probe_api(url)
+    with _user_api_lock:
+        _user_api_url = url
+    _api_url_cache = None
+    _api_url_cache_at = 0.0
+    return {
+        "ok": True,
+        "mode": "manual",
+        "api_url": url,
+        "override": url,
+        "reachable": ok,
+        "status": status,
+    }
+
+
+def get_api_url_info() -> dict[str, Any]:
+    with _user_api_lock:
+        override = _user_api_url
+    base = api_base()
+    ok, status = _probe_api(base)
+    return {
+        "api_url": base,
+        "override": override,
+        "mode": "manual" if override else "auto",
+        "reachable": ok,
+        "status": status,
+    }
 
 
 @asynccontextmanager
@@ -214,8 +286,31 @@ def index() -> HTMLResponse:
 
 
 @app.get("/config")
-def config() -> dict[str, str]:
-    return {"api_url": api_base(), "web_url": f"http://127.0.0.1:{WEB_PORT}"}
+def config() -> dict[str, Any]:
+    info = get_api_url_info()
+    return {
+        "api_url": info["api_url"],
+        "web_url": f"http://127.0.0.1:{WEB_PORT}",
+        "api_url_mode": info["mode"],
+        "api_url_override": info["override"],
+    }
+
+
+@app.get("/proxy/api-url")
+def proxy_get_api_url() -> dict[str, Any]:
+    return get_api_url_info()
+
+
+class ApiUrlBody(BaseModel):
+    api_url: str = ""
+
+
+@app.put("/proxy/api-url")
+def proxy_put_api_url(body: ApiUrlBody) -> dict[str, Any]:
+    try:
+        return set_user_api_url(body.api_url)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
 
 
 @app.get("/access-info")
@@ -228,9 +323,13 @@ def access_info() -> dict[str, Any]:
     except ValueError:
         api_port = 8765
 
+    with _user_api_lock:
+        override = _user_api_url
     return {
         "web_urls": listen_urls(WEB_HOST, WEB_PORT),
         "api_proxy_target": api_target,
+        "api_url_mode": "manual" if override else "auto",
+        "api_url_override": override,
         "api_base_urls": listen_urls("127.0.0.1", api_port),
         "lan_ips": lan_ipv4_addresses(),
         "bind_host": WEB_HOST,
@@ -252,7 +351,13 @@ async def proxy_health() -> dict[str, Any]:
             r.raise_for_status()
             data = r.json()
             if isinstance(data, dict):
-                data = {**data, "api_proxy_target": base}
+                with _user_api_lock:
+                    override = _user_api_url
+                data = {
+                    **data,
+                    "api_proxy_target": base,
+                    "api_url_mode": "manual" if override else "auto",
+                }
             return data
     except httpx.HTTPError as exc:
         raise HTTPException(
