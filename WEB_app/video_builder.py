@@ -531,9 +531,9 @@ def _encode_one_violator(
     if not violation_frames:
         input_path = str(meta["input_path"] or "")
         if input_path:
-            from app.core.video_processor import VideoProcessor
+            from app.core.ffmpeg_utils import mux_audio_if_possible
 
-            VideoProcessor._mux_audio_if_possible(input_path, path)
+            mux_audio_if_possible(input_path, path)
 
     return path
 

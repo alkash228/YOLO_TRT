@@ -3320,31 +3320,6 @@ class VideoProcessor:
 
     @staticmethod
     def _mux_audio_if_possible(src_video: str, video_only: Path) -> None:
-        if not video_only.exists():
-            return
-        tmp = video_only.with_name(video_only.stem + "_audio.mp4")
-        cmd = [
-            "ffmpeg",
-            "-y",
-            "-i",
-            str(video_only),
-            "-i",
-            str(src_video),
-            "-c:v",
-            "copy",
-            "-map",
-            "0:v:0",
-            "-map",
-            "1:a:0?",
-            "-shortest",
-            str(tmp),
-        ]
-        try:
-            subprocess.run(cmd, check=True, capture_output=True)
-            tmp.replace(video_only)
-        except (FileNotFoundError, subprocess.CalledProcessError):
-            if tmp.exists():
-                try:
-                    tmp.unlink()
-                except OSError:
-                    pass
+        from app.core.ffmpeg_utils import mux_audio_if_possible
+
+        mux_audio_if_possible(src_video, video_only)

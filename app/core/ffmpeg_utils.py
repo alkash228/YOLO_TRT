@@ -345,3 +345,42 @@ def _popen_kwargs() -> dict[str, Any]:
     startupinfo = subprocess.STARTUPINFO()
     startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
     return {"startupinfo": startupinfo, "creationflags": 0x00000200}
+
+
+def mux_audio_if_possible(src_video: str, video_only: str | Any) -> None:
+    """Copy audio from src into video-only MP4 via ffmpeg (no torch / YOLO imports)."""
+    from pathlib import Path
+
+    out = Path(video_only)
+    if not out.exists() or not str(src_video).strip():
+        return
+    tmp = out.with_name(out.stem + "_audio.mp4")
+    try:
+        exe = resolve_ffmpeg_exe()
+    except Exception:
+        exe = shutil.which("ffmpeg") or "ffmpeg"
+    cmd = [
+        exe,
+        "-y",
+        "-i",
+        str(out),
+        "-i",
+        str(src_video),
+        "-c:v",
+        "copy",
+        "-map",
+        "0:v:0",
+        "-map",
+        "1:a:0?",
+        "-shortest",
+        str(tmp),
+    ]
+    try:
+        subprocess.run(cmd, check=True, capture_output=True, **_popen_kwargs())
+        tmp.replace(out)
+    except (FileNotFoundError, subprocess.CalledProcessError, OSError):
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
