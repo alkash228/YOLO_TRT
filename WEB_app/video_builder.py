@@ -174,8 +174,7 @@ def resolve_overlay(
         "pose_kpt_conf": 0.25,
         "cross_check_enabled": bool(meta.get("cross_check_enabled", True)),
         "cross_check_draw_head_box": True,
-        # Debug: also draw accessory (helmet/…) detections so the full scene is visible.
-        "cross_check_draw_boxes": bool(debug_all),
+        "cross_check_draw_boxes": False,
     }
     saved = meta.get("saved_overlay") or {}
     if isinstance(saved, dict):
@@ -186,8 +185,18 @@ def resolve_overlay(
         for key in _OVERLAY_KEYS:
             if key in overlay_override and overlay_override[key] is not None:
                 overlay[key] = overlay_override[key]
-    # Violations clip: only the target person — never draw helmet boxes of others.
-    overlay["cross_check_draw_boxes"] = False
+    if debug_all:
+        # Debug period: force full scene — all people + helmet dets + head verdicts.
+        overlay["draw_boxes"] = True
+        overlay["draw_masks"] = True
+        overlay["draw_centers"] = True
+        overlay["draw_pose"] = True
+        overlay["cross_check_enabled"] = True
+        overlay["cross_check_draw_head_box"] = True
+        overlay["cross_check_draw_boxes"] = True
+    else:
+        # Production violation clips: don't spam accessory boxes of bystanders.
+        overlay["cross_check_draw_boxes"] = False
     return overlay
 
 
