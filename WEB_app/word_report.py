@@ -112,7 +112,7 @@ def _scan_violator_packets(
 
 
 def read_source_frame_bgr(input_path: str, frame_idx: int) -> np.ndarray | None:
-    """Grab one source frame — seek when possible, else grab-skip."""
+    """Grab one source frame. HEVC-safe (no OpenCV seek — that yields corrupt frames)."""
     from app.core.frame_io import read_frame_bgr_smart
 
     if not input_path:
