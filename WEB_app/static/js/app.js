@@ -779,6 +779,30 @@
 
     currentRunDir = runDir;
     currentRunId = runId;
+    if (runDirInput && runDir) runDirInput.value = runDir;
+    try {
+      await refreshLocalRuns();
+      if (runFolderSelect && (runId || runDir)) {
+        for (const opt of runFolderSelect.options) {
+          if (!opt.value) continue;
+          try {
+            const row = JSON.parse(decodeURIComponent(opt.value));
+            if (
+              (runId && row.run_id === runId) ||
+              (runDir && row.run_dir === runDir) ||
+              (runId && String(row.name || "") === String(runId))
+            ) {
+              runFolderSelect.value = opt.value;
+              break;
+            }
+          } catch (_) {
+            /* ignore bad option */
+          }
+        }
+      }
+    } catch (_) {
+      /* refresh optional */
+    }
     if (currentRunDir && currentRunId && !resolveErr) {
       loadReportViolators(currentRunDir, currentRunId);
     }
@@ -808,6 +832,7 @@
     }
 
     btnBuild.onclick = () => startBuild(currentRunDir, currentRunId, jobId);
+    cardVideo?.scrollIntoView({ behavior: "smooth", block: "start" });
   }
 
   btnRun.addEventListener("click", async () => {

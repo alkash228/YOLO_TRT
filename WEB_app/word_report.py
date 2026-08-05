@@ -80,7 +80,7 @@ def middle_presence_frame(
 
 def read_source_frame_bgr(input_path: str, frame_idx: int) -> np.ndarray | None:
     """Grab one source frame. Sequential decode — HEVC-safe (no POS_FRAMES seek)."""
-    from app.core.window_frame_loader import read_frame_bgr_sequential
+    from app.core.frame_io import read_frame_bgr_sequential
 
     return read_frame_bgr_sequential(str(input_path), int(frame_idx))
 

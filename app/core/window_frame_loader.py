@@ -145,24 +145,9 @@ def read_frame_bgr_sequential(
     max_skip: int = 500_000,
 ) -> np.ndarray | None:
     """Read one frame by sequential decode (HEVC-safe; no POS_FRAMES seek)."""
-    target = max(0, int(frame_idx))
-    if target > int(max_skip):
-        return None
-    cap = cv2.VideoCapture(str(input_path))
-    if not cap.isOpened():
-        return None
-    try:
-        idx = 0
-        while idx <= target:
-            ok, frame = cap.read()
-            if not ok or frame is None:
-                return None
-            if idx == target:
-                return frame
-            idx += 1
-        return None
-    finally:
-        cap.release()
+    from app.core.frame_io import read_frame_bgr_sequential as _read
+
+    return _read(input_path, frame_idx, max_skip=max_skip)
 
 
 class WindowPrefetcher:
