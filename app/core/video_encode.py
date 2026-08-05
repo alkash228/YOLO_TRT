@@ -250,7 +250,7 @@ class _RenderContext:
 
 
 def _render_encode_job(job: _EncodeJob, ctx: _RenderContext) -> tuple[int, np.ndarray]:
-    from app.core.video_processor import VideoProcessor
+    from app.core.instance_serialize import serialize_frame_instances
 
     work = materialize_packet_for_render(
         replace(job.carry, frame_idx=job.src_i),
@@ -260,7 +260,7 @@ def _render_encode_job(job: _EncodeJob, ctx: _RenderContext) -> tuple[int, np.nd
     )
     result = post_process_frame(
         work,
-        serialize_fn=VideoProcessor.serialize_frame_instances,
+        serialize_fn=serialize_frame_instances,
         prompt_id_lookup=ctx.prompt_lookup,
         overlay_alpha=float(ctx.overlay.get("overlay_alpha", 0.45)),
         draw_boxes=bool(ctx.overlay.get("draw_boxes", True)),
