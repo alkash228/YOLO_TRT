@@ -114,8 +114,8 @@ def _scan_violator_packets(
 
 def _read_still_from_violation_clip(run_dir: Path, run_id: str, stable_id: int) -> np.ndarray | None:
     """
-    Fast path: violation MP4 is short and usually H.264 with overlays already burned in.
-    Avoids decoding the long HEVC source just for one Word still.
+    Fast path: short NO HELMET clip (H.264) with overlays — take the FIRST frame
+    (not middle: old clips were full presence and mid-frame often had a helmet).
     """
     run_dir = Path(run_dir)
     candidates = [
@@ -129,14 +129,8 @@ def _read_still_from_violation_clip(run_dir: Path, run_id: str, stable_id: int) 
     if not cap.isOpened():
         return None
     try:
-        n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-        if n > 2:
-            # Middle of a short clip is fine (re-encoded; seek OK).
-            cap.set(cv2.CAP_PROP_POS_FRAMES, float(max(0, n // 2)))
+        # Always frame 0 — for NO HELMET-only clips this is a real violation still.
         ok, frame = cap.read()
-        if (not ok or frame is None) and n > 0:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-            ok, frame = cap.read()
         if ok and frame is not None and frame.size > 0:
             return frame
     finally:
@@ -270,8 +264,23 @@ def build_word_report(
         raise RuntimeError(f"Нет кадров с нарушителем ID {stable_id}")
 
     # Prefer still from already-built violation clip (seconds, not minutes on HEVC).
+    # Old presence-long clips can show a mid "helmet ON" frame — only trust short
+    # clips, or fall back to rendering the first NO HELMET packet frame.
     clip_bgr = _read_still_from_violation_clip(run_path, run_id, int(stable_id))
+    use_clip = False
     if clip_bgr is not None:
+        # Heuristic: presence-mode clips are long; NO HELMET clips are short.
+        clip_path = run_path / f"{run_id}_violation_id{int(stable_id)}.mp4"
+        n_clip = 0
+        if clip_path.is_file():
+            cap_n = cv2.VideoCapture(str(clip_path))
+            if cap_n.isOpened():
+                n_clip = int(cap_n.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+                cap_n.release()
+        # If clip is much longer than violation count, it is an old presence clip — ignore.
+        if n_clip <= 0 or n_clip <= max(8, len(violations) * 2 + 5):
+            use_clip = True
+    if use_clip and clip_bgr is not None:
         rgb = cv2.cvtColor(clip_bgr, cv2.COLOR_BGR2RGB)
     else:
         rgb = render_person_frame_rgb(

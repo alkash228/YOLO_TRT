@@ -691,9 +691,11 @@ def encode_violations_videos_per_id(
     for sid in violator_ids:
         presence = set(collect_presence_frame_indices(data, run_dir, sid))
         violations = set(collect_violation_frame_indices(data, run_dir, sid))
-        if not presence:
+        # Clips labeled NO HELMET must contain violation keyframes only.
+        use_frames = violations if violations else presence
+        if not use_frames:
             continue
-        frame_sets[sid] = presence
+        frame_sets[sid] = use_frames
         violation_sets[sid] = violations
     total_steps = sum(len(frames) for frames in frame_sets.values()) or 1
     done_steps = 0
@@ -703,12 +705,14 @@ def encode_violations_videos_per_id(
         encode_frames = frame_sets.get(sid)
         if not encode_frames:
             continue
-        n_presence = len(encode_frames)
+        n_encode = len(encode_frames)
         n_v = len(violation_sets.get(sid, ()))
+        n_presence = int(presence_counts.get(sid, 0))
         if on_log:
             on_log(
                 f"Encode violator stable_id={sid} "
-                f"({idx + 1}/{len(violator_ids)}, {n_presence} frames, {n_v} NO HELMET)…"
+                f"({idx + 1}/{len(violator_ids)}, {n_encode} NO HELMET frames, "
+                f"presence={n_presence})…"
             )
         out_path = run_dir / f"{rid}_violation_id{sid}.mp4"
 
@@ -731,13 +735,13 @@ def encode_violations_videos_per_id(
             on_progress=lambda d, t, b=done_steps: _inner_progress(d, t, _base=b),
             on_log=on_log,
             violation_frames=encode_frames,
-            violations_only=False,
+            violations_only=True,
         )
-        done_steps += n_presence
+        done_steps += n_encode
         outputs.append(
             {
                 "stable_id": sid,
-                "violation_frames": n_v,
+                "violation_frames": n_v or n_encode,
                 "violation_count": violation_counts.get(sid, n_v),
                 "presence_frames": n_presence,
                 "video_path": str(path.resolve()),
