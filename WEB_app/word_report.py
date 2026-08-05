@@ -19,6 +19,7 @@ from WEB_app.video_builder import (
     iter_run_packets,
     load_run_metadata,
     resolve_overlay,
+    stamp_all_people_boxes_rgb,
     web_debug_show_all_dets,
 )
 
@@ -267,6 +268,13 @@ def render_person_frame_rgb(
     job = _EncodeJob(src_i=int(frame_idx), carry=draw_packet, frame_bgr=frame_bgr)
     _, rgb = _render_encode_job(job, ctx)
     if debug_all:
+        rgb = stamp_all_people_boxes_rgb(
+            rgb,
+            replace(draw_packet, frame_idx=int(frame_idx)),
+            target_w=ctx.target_w,
+            target_h=ctx.target_h,
+            focus_sid=int(stable_id),
+        )
         rgb = highlight_no_helmet_on_rgb(
             rgb,
             replace(draw_packet, frame_idx=int(frame_idx)),

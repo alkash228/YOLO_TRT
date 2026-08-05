@@ -575,6 +575,76 @@ def _bbox_xywh_for_sid(
     )
 
 
+def stamp_all_people_boxes_rgb(
+    rgb: np.ndarray,
+    packet: FramePacket,
+    *,
+    target_w: int,
+    target_h: int,
+    focus_sid: int | None = None,
+) -> np.ndarray:
+    """
+    Draw every tracked person from instance_meta / stack bboxes.
+    Used in debug when mask overlay silently skips (empty stack / size mismatch).
+    """
+    n = int(packet.n_inst or 0)
+    if n <= 0:
+        return rgb
+    out = np.ascontiguousarray(rgb.copy())
+    bgr = cv2.cvtColor(out, cv2.COLOR_RGB2BGR)
+    tw, th = int(target_w), int(target_h)
+    for i in range(n):
+        sid = (
+            int(packet.stable_ids[i])
+            if packet.stable_ids is not None and i < len(packet.stable_ids)
+            else i + 1
+        )
+        if focus_sid is not None and int(sid) == int(focus_sid):
+            continue  # focus callout drawn separately
+        bbox = _bbox_xywh_for_sid(packet, sid, target_w=tw, target_h=th)
+        if bbox is None:
+            # Try index-based meta when stable_ids missing/duplicate edge cases.
+            meta = packet.instance_meta or []
+            if i < len(meta) and isinstance(meta[i], dict):
+                bb = meta[i].get("bbox_xywh")
+                if bb is not None and len(bb) >= 4:
+                    x, y, w, h = int(bb[0]), int(bb[1]), int(bb[2]), int(bb[3])
+                    if w > 0 and h > 0:
+                        src_h = src_w = 0
+                        if packet.mask_hw:
+                            src_h, src_w = int(packet.mask_hw[0]), int(packet.mask_hw[1])
+                        if src_w > 0 and src_h > 0 and (src_w != tw or src_h != th):
+                            sx = float(tw) / float(src_w)
+                            sy = float(th) / float(src_h)
+                            bbox = (
+                                int(round(x * sx)),
+                                int(round(y * sy)),
+                                max(1, int(round(w * sx))),
+                                max(1, int(round(h * sy))),
+                            )
+                        else:
+                            bbox = (x, y, w, h)
+        if bbox is None:
+            continue
+        x, y, w, h = bbox
+        color = (80, 200, 80)  # green-ish BGR for helmeted / other people
+        verdicts = packet.cross_check_verdicts or []
+        if i < len(verdicts) and _verdict_is_violation(verdicts[i]):
+            color = (0, 165, 255)  # orange other violators
+        cv2.rectangle(bgr, (x, y), (x + w, y + h), color, 2)
+        cv2.putText(
+            bgr,
+            f"ID {sid}",
+            (x, max(18, y - 6)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            color,
+            2,
+            cv2.LINE_AA,
+        )
+    return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+
+
 def highlight_no_helmet_on_rgb(
     rgb: np.ndarray,
     packet: FramePacket,
@@ -646,6 +716,14 @@ def _render_full_scene_highlight(
     work = replace(carry, frame_idx=job.src_i)
     src_i, rgb = _render_encode_job(
         replace(job, carry=work, frame_bgr=job.frame_bgr), ctx
+    )
+    # Always stamp meta boxes so bystanders stay visible even if mask overlay failed.
+    rgb = stamp_all_people_boxes_rgb(
+        rgb,
+        work,
+        target_w=ctx.target_w,
+        target_h=ctx.target_h,
+        focus_sid=target_sid,
     )
     rgb = highlight_no_helmet_on_rgb(
         rgb,

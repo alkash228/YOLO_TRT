@@ -138,12 +138,33 @@ def materialize_packet_for_render(
     if packet.masks_rle and packet.mask_hw:
         mh, mw = packet.mask_hw
         stack = rle_list_to_stack_u8(packet.masks_rle, mh, mw)
-    elif packet.stack.size > 0:
+    elif packet.stack is not None and packet.stack.ndim == 3 and packet.stack.shape[0] > 0:
         stack = packet.stack
     else:
         h = height or (packet.mask_hw[0] if packet.mask_hw else 1)
         w = width or (packet.mask_hw[1] if packet.mask_hw else 1)
         stack = np.zeros((0, h, w), dtype=np.uint8)
+
+    # Masks are often at inference size; source frame may differ — resize or overlay draws nothing / crashes.
+    if (
+        stack.ndim == 3
+        and stack.shape[0] > 0
+        and fb is not None
+        and getattr(fb, "ndim", 0) == 3
+        and fb.shape[0] > 2
+        and fb.shape[1] > 2
+    ):
+        fh, fw = int(fb.shape[0]), int(fb.shape[1])
+        sh, sw = int(stack.shape[1]), int(stack.shape[2])
+        if (sh, sw) != (fh, fw):
+            stack = np.stack(
+                [
+                    cv2.resize(stack[i], (fw, fh), interpolation=cv2.INTER_NEAREST)
+                    for i in range(int(stack.shape[0]))
+                ],
+                axis=0,
+            )
+
     return FramePacket(
         frame_idx=packet.frame_idx,
         frame_bgr=fb,
@@ -163,6 +184,7 @@ def materialize_packet_for_render(
         cross_check_accessories=list(packet.cross_check_accessories or []),
         masks_rle=None,
         mask_hw=None,
+        instance_meta=list(packet.instance_meta or []) if packet.instance_meta else None,
     )
 
 
