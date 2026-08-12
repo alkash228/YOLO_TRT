@@ -1,12 +1,13 @@
 # Модели запекаются в образ при build (папка ./models → /data/models).
 # TRT engines: положи в ./models/TRT/ до build, иначе соберутся при первом старте (внутри контейнера).
-# Pipeline defaults = baked UI fast profile (windowed + SAM-ID + Pass2 OSNet, no live ReID).
+# Pipeline defaults = baked UI fast profile (windowed + SAM-ID + Pass2 SOLIDER, no live ReID).
+# Identity/ReID = person only. Helmet (YOLO_DRT_CROSS_MODEL) = per-frame cross-check, no track/ReID.
 services:
   yolo-drt-api:
     build:
       context: .
       dockerfile: Dockerfile
-    image: yolo-drt-api:V0.5
+    image: yolo-drt-api:latest
     container_name: yolo-drt-api
     restart: unless-stopped
     runtime: nvidia
@@ -27,9 +28,10 @@ services:
       YOLO_DRT_VIDEOS_DIR: /data/videos
       # Sync job wait (seconds). 5h video needs many hours of wall time.
       YOLO_DRT_SYNC_TIMEOUT_SEC: "86400"
-      YOLO_DRT_DETECT_MODEL: /data/models/YOLO/yolo26x-pose.pt
+      YOLO_DRT_DETECT_MODEL: /data/models/YOLO/yolo26x.pt
       YOLO_DRT_CROSS_MODEL: /data/models/YOLO/Helmet/helmet-26m.pt
-      YOLO_DRT_REID_MODEL: /data/models/RD/osnet_ain_x1_0_msmt17_256x128_amsgrad_ep50_lr0.0015_coslr_b64_fb10_softmax_labsmth_flip_jitter.pth
+      YOLO_DRT_REID_BACKEND: solider
+      YOLO_DRT_REID_MODEL: /data/models/RD/solider_swin_small_msmt17.pth
       YOLO_DRT_OUTPUT_DIR: /data/output
       # Named volume (Linux VM disk) — fast decode vs Windows bind-mount.
       YOLO_DRT_WORK_DIR: /data/work
@@ -41,11 +43,18 @@ services:
       YOLO_DRT_USE_REID: "false"
       YOLO_DRT_SAM_IDENTITY_BACKEND: memory
       YOLO_DRT_SAM_MATCH_IOU: "0.30"
-      YOLO_DRT_SAM_OSNET_REENTRY: "false"
+      YOLO_DRT_SAM_OSNET_REENTRY: "true"
+      YOLO_DRT_SAM_OSNET_REENTRY_THRESH: "0.65"
+      YOLO_DRT_SAM_OSNET_REENTRY_MIN_MISS: "15"
       YOLO_DRT_USE_OFFLINE_TRACKLET_LINK: "true"
       YOLO_DRT_TRACKLET_LINK_USE_REID: "true"
-      YOLO_DRT_TRACKLET_LINK_MAX_GAP_FRAMES: "300"
-      YOLO_DRT_TRACKLET_LINK_MIN_SIM: "0.60"
+      YOLO_DRT_TRACKLET_LINK_MAX_GAP_FRAMES: "0"
+      YOLO_DRT_TRACKLET_LINK_MIN_SIM: "0.65"
+      YOLO_DRT_TRACKLET_LINK_SAMPLES_PER_TRACKLET: "8"
+      YOLO_DRT_TRACK_BUFFER: "900"
+      YOLO_DRT_IDENTITY_GALLERY: "true"
+      YOLO_DRT_IDENTITY_GALLERY_MIN_SIM: "0.65"
+      YOLO_DRT_IDENTITY_GALLERY_SPILL: "true"
       YOLO_DRT_USE_TENSORRT: "true"
       YOLO_DRT_CROSS_CHECK_ENABLED: "true"
       YOLO_DRT_CROSS_CHECK_OBJECT_PROMPT: helmet
@@ -68,7 +77,6 @@ services:
       YOLO_DRT_INFER_BATCH_SIZE: "64"
       YOLO_DRT_GPU_QUEUE_DEPTH: "4"
       YOLO_DRT_DECODE_PREFETCH: "4"
-      YOLO_DRT_TRACK_BUFFER: "300"
       YOLO_DRT_DETECT_CONF: "0.20"
       YOLO_DRT_APPEARANCE_THRESH: "0.55"
       YOLO_DRT_POSE_KPT_CONF: "0.25"

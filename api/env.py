@@ -6,8 +6,8 @@ from pathlib import Path
 
 from app.config.settings import (
     MODELS_DIR,
-    OSNET_FILENAME,
     OUTPUT_DIR,
+    SOLIDER_FILENAME,
     UPLOAD_DIR,
     WORK_DIR,
     PipelineSettings,
@@ -50,18 +50,21 @@ def load_settings_from_env() -> PipelineSettings:
     work_dir = _env_path("YOLO_DRT_WORK_DIR", WORK_DIR) or WORK_DIR
     upload_dir = _env_path("YOLO_DRT_UPLOAD_DIR", UPLOAD_DIR) or UPLOAD_DIR
 
+    # Person detect (bbox). Helmet / ReID paths are separate roles — never swap them.
     detect = _env_path(
         "YOLO_DRT_DETECT_MODEL",
-        models_dir / "YOLO" / "yolo26x-pose.pt",
-    ) or (models_dir / "YOLO" / "yolo26x-pose.pt")
+        models_dir / "YOLO" / "yolo26x.pt",
+    ) or (models_dir / "YOLO" / "yolo26x.pt")
+    # Accessories-only cross-check model (no ReID / stable_id on these dets).
     cross = _env_path(
         "YOLO_DRT_CROSS_MODEL",
         models_dir / "YOLO" / "Helmet" / "helmet-26m.pt",
     ) or (models_dir / "YOLO" / "Helmet" / "helmet-26m.pt")
+    # Person identity weights (Pass2 / SAM re-entry) — not used for helmet boxes.
     reid = _env_path(
         "YOLO_DRT_REID_MODEL",
-        models_dir / "RD" / OSNET_FILENAME,
-    ) or (models_dir / "RD" / OSNET_FILENAME)
+        models_dir / "RD" / SOLIDER_FILENAME,
+    ) or (models_dir / "RD" / SOLIDER_FILENAME)
     sam_model = _env_path("YOLO_DRT_SAM_MODEL", None)
 
     strategy = os.environ.get("YOLO_DRT_TRT_ENGINE_STRATEGY", "central").strip() or "central"
@@ -77,6 +80,13 @@ def load_settings_from_env() -> PipelineSettings:
         detect_model=detect,
         cross_check_model=cross,
         reid_model=reid,
+        reid_backend=(
+            os.environ.get(
+                "YOLO_DRT_REID_BACKEND",
+                str(baked.get("reid_backend", "solider")),
+            ).strip()
+            or "solider"
+        ),
         output_dir=output_dir,
         work_dir=work_dir,
         upload_dir=upload_dir,
@@ -98,31 +108,50 @@ def load_settings_from_env() -> PipelineSettings:
             "YOLO_DRT_SAM_MATCH_IOU", float(baked.get("sam_match_iou", 0.30))
         ),
         sam_osnet_reentry=_env_bool(
-            "YOLO_DRT_SAM_OSNET_REENTRY", bool(baked.get("sam_osnet_reentry", False))
+            "YOLO_DRT_SAM_OSNET_REENTRY", bool(baked.get("sam_osnet_reentry", True))
         ),
-        sam_osnet_reentry_thresh=_env_float("YOLO_DRT_SAM_OSNET_REENTRY_THRESH", 0.70),
-        sam_osnet_reentry_min_miss=_env_int("YOLO_DRT_SAM_OSNET_REENTRY_MIN_MISS", 30),
+        sam_osnet_reentry_thresh=_env_float(
+            "YOLO_DRT_SAM_OSNET_REENTRY_THRESH",
+            float(baked.get("sam_osnet_reentry_thresh", 0.65)),
+        ),
+        sam_osnet_reentry_min_miss=_env_int(
+            "YOLO_DRT_SAM_OSNET_REENTRY_MIN_MISS",
+            int(baked.get("sam_osnet_reentry_min_miss", 15)),
+        ),
         use_offline_tracklet_link=_env_bool(
             "YOLO_DRT_USE_OFFLINE_TRACKLET_LINK",
             bool(baked.get("use_offline_tracklet_link", True)),
         ),
         tracklet_link_max_gap_frames=_env_int(
             "YOLO_DRT_TRACKLET_LINK_MAX_GAP_FRAMES",
-            int(baked.get("tracklet_link_max_gap_frames", 300)),
+            int(baked.get("tracklet_link_max_gap_frames", 0)),
         ),
         tracklet_link_min_sim=_env_float(
             "YOLO_DRT_TRACKLET_LINK_MIN_SIM",
-            float(baked.get("tracklet_link_min_sim", 0.60)),
+            float(baked.get("tracklet_link_min_sim", 0.65)),
         ),
         tracklet_link_use_reid=_env_bool(
             "YOLO_DRT_TRACKLET_LINK_USE_REID",
             bool(baked.get("tracklet_link_use_reid", True)),
         ),
         tracklet_link_samples_per_tracklet=_env_int(
-            "YOLO_DRT_TRACKLET_LINK_SAMPLES_PER_TRACKLET", 5
+            "YOLO_DRT_TRACKLET_LINK_SAMPLES_PER_TRACKLET",
+            int(baked.get("tracklet_link_samples_per_tracklet", 8)),
         ),
         tracklet_link_spatial_weight=_env_float(
             "YOLO_DRT_TRACKLET_LINK_SPATIAL_WEIGHT", 0.15
+        ),
+        identity_gallery_enabled=_env_bool(
+            "YOLO_DRT_IDENTITY_GALLERY",
+            bool(baked.get("identity_gallery_enabled", True)),
+        ),
+        identity_gallery_min_sim=_env_float(
+            "YOLO_DRT_IDENTITY_GALLERY_MIN_SIM",
+            float(baked.get("identity_gallery_min_sim", 0.65)),
+        ),
+        identity_gallery_spill=_env_bool(
+            "YOLO_DRT_IDENTITY_GALLERY_SPILL",
+            bool(baked.get("identity_gallery_spill", True)),
         ),
         use_tensorrt=_env_bool(
             "YOLO_DRT_USE_TENSORRT", bool(baked.get("use_tensorrt", True))
@@ -202,7 +231,7 @@ def load_settings_from_env() -> PipelineSettings:
             "YOLO_DRT_DECODE_PREFETCH", int(baked.get("decode_prefetch", 4))
         ),
         track_buffer=_env_int(
-            "YOLO_DRT_TRACK_BUFFER", int(baked.get("track_buffer", 300))
+            "YOLO_DRT_TRACK_BUFFER", int(baked.get("track_buffer", 900))
         ),
         frame_stride=_env_int(
             "YOLO_DRT_FRAME_STRIDE", int(baked.get("frame_stride", 0))
@@ -215,6 +244,9 @@ def load_settings_from_env() -> PipelineSettings:
         ),
         pose_kpt_conf=_env_float(
             "YOLO_DRT_POSE_KPT_CONF", float(baked.get("pose_kpt_conf", 0.25))
+        ),
+        draw_pose=_env_bool(
+            "YOLO_DRT_DRAW_POSE", bool(baked.get("draw_pose", False))
         ),
         smart_ram_budget=_env_bool(
             "YOLO_DRT_SMART_RAM_BUDGET", bool(baked.get("smart_ram_budget", True))

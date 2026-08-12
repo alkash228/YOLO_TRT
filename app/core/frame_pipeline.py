@@ -472,7 +472,7 @@ def post_process_frame(
     draw_boxes: bool,
     draw_masks: bool,
     draw_centers: bool,
-    draw_pose: bool = True,
+    draw_pose: bool = False,
     pose_kpt_conf: float = 0.25,
     cross_check_enabled: bool = False,
     cross_check_draw_head_box: bool = True,

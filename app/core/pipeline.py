@@ -10,7 +10,6 @@ import torch
 from app.config.settings import PipelineSettings
 from app.core.batch_utils import effective_speed_tuning
 from app.core.detect_engine import DetectEngine
-from app.core.reid_engine import ReidEngine
 from app.core.seg_engine import SegEngine
 from app.core.trt_paths import engines_ready
 from app.core.video_processor import VideoProcessor
@@ -39,7 +38,8 @@ def _trt_kwargs(settings: PipelineSettings) -> dict:
 def warmup_engines(
     detect: DetectEngine,
     seg: SegEngine | None,
-    reid: ReidEngine | None,
+    reid: object | None,
+    cross: DetectEngine | None = None,
 ) -> None:
     """Прогрев CUDA перед первым job (убирает пик ~1–3 с на старте)."""
     dummy = np.zeros((480, 640, 3), dtype=np.uint8)
@@ -50,6 +50,11 @@ def warmup_engines(
     if seg is not None:
         try:
             seg.predict(dummy)
+        except Exception:
+            pass
+    if cross is not None:
+        try:
+            cross.predict(dummy)
         except Exception:
             pass
     if reid is not None:
@@ -88,6 +93,15 @@ def build_processor(
     if settings.use_tensorrt and device == "cpu" and on_log:
         on_log("TensorRT пропущен: выбран CPU")
 
+    from app.core.reid_engine import resolve_reid_backend
+    from app.core.sam_memory_tracker import needs_osnet_embed, uses_sam_identity
+
+    reid_backend = resolve_reid_backend(
+        getattr(settings, "reid_backend", None), settings.reid_model
+    )
+    # SOLIDER is PyTorch-only — do not require / build an OSNet-style .engine for it.
+    need_reid_trt = bool(needs_osnet_embed(settings)) and reid_backend == "osnet"
+
     if use_trt:
         ready = engines_ready(
             detect_pt=Path(settings.detect_model),
@@ -97,15 +111,28 @@ def build_processor(
             max_batch=int(settings.tensorrt_max_batch),
             fp16=bool(settings.tensorrt_fp16),
             need_cross=bool(settings.cross_check_enabled),
+            need_reid=need_reid_trt,
+            strategy=str(
+                getattr(settings, "tensorrt_engine_strategy", "central") or "central"
+            ),
+            central_dir=getattr(settings, "tensorrt_central_dir", None),
         )
         if on_log:
             on_log(
-                f"TensorRT: detect={ready['detect']} reid={ready['reid']} "
+                f"TensorRT: detect={ready['detect']} "
+                f"reid={'n/a' if not need_reid_trt else ready['reid']} "
                 f"cross={ready['cross_check']}"
             )
-        if not all(ready.values()):
-            if on_log:
-                on_log("TensorRT: не все .engine найдены — fallback на PyTorch или Собрать engines")
+        if not ready.get("detect", False) and on_log:
+            on_log(
+                f"TensorRT: нет engine для detect «{Path(settings.detect_model).stem}» "
+                f"(в models/TRT лежит другой stem, напр. yolo26x-pose). "
+                f"Собери engines под текущую detect-модель или fallback -> PyTorch."
+            )
+        if need_reid_trt and not ready.get("reid", False) and on_log:
+            on_log("TensorRT: нет OSNet .engine — ReID fallback PyTorch")
+        if bool(settings.cross_check_enabled) and not ready.get("cross_check", False) and on_log:
+            on_log("TensorRT: нет cross-check .engine — helmet fallback PyTorch")
 
     detect = DetectEngine(
         settings.detect_model,
@@ -144,23 +171,34 @@ def build_processor(
         )
 
     reid = None
-    from app.core.sam_memory_tracker import needs_osnet_embed, uses_sam_identity
-
     load_osnet = needs_osnet_embed(settings)
     if load_osnet:
-        reid = ReidEngine(
+        from app.core.reid_engine import create_reid_engine
+
+        backend = reid_backend
+        reid = create_reid_engine(
             settings.reid_model,
+            backend=backend,
             device=device,
             use_amp=half,
-            use_tensorrt=use_trt,
+            use_tensorrt=use_trt and backend == "osnet",
             tensorrt_fp16=bool(settings.tensorrt_fp16),
+            tensorrt_engine_strategy=str(
+                getattr(settings, "tensorrt_engine_strategy", "central") or "central"
+            ),
+            tensorrt_central_dir=getattr(settings, "tensorrt_central_dir", None),
         )
         if on_log and getattr(reid, "using_tensorrt", False):
             on_log(
                 f"ReID TRT: {Path(reid.model_path).name} (batch={reid.trt_max_batch})"
             )
-        elif on_log and settings.use_tensorrt:
+        elif on_log and settings.use_tensorrt and backend == "osnet":
             on_log("ReID PyTorch: .engine не найден / TRT load failed (см. warning)")
+        elif on_log and backend == "solider":
+            on_log(
+                f"ReID SOLIDER PyTorch: {Path(settings.reid_model).name} "
+                f"(dim={getattr(reid, 'feat_dim', '?')})"
+            )
     elif on_log and uses_sam_identity(settings):
         on_log(
             "Identity: SAM masklet memory "
@@ -182,7 +220,7 @@ def build_processor(
                 on_log(f"Cross-check TRT: {cross.model_path}")
 
     if warmup:
-        warmup_engines(detect, seg, reid)
+        warmup_engines(detect, seg, reid, cross)
     return VideoProcessor(detect, seg, reid, settings, cross_check_engine=cross)
 
 

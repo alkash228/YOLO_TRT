@@ -1,4 +1,8 @@
-"""Build violations-only MP4 from a YOLO_DRT run folder — one video per stable ReID ID."""
+"""Build per-violator MP4s from a YOLO_DRT run folder — one video per stable ReID ID.
+
+Qualification uses NO HELMET counts; clip timeline is the full presence of that ID
+(all keyframes where the person appears), not a sparse NO HELMET montage.
+"""
 from __future__ import annotations
 
 import json
@@ -25,7 +29,10 @@ from app.core.video_encode import (
 
 
 def web_debug_show_all_dets() -> bool:
-    """Debug period: draw full scene, highlight NO HELMET target. Off: YOLO_DRT_WEB_DEBUG_OVERLAY=0."""
+    """Debug period: force boxes/masks/helmet overlay knobs. Off: YOLO_DRT_WEB_DEBUG_OVERLAY=0.
+
+    Per-ID violation/person clips still draw only the target stable_id (no bystanders).
+    """
     return os.environ.get("YOLO_DRT_WEB_DEBUG_OVERLAY", "1").strip().lower() not in (
         "0",
         "false",
@@ -168,13 +175,14 @@ def resolve_overlay(
     overlay: dict[str, Any] = {
         "overlay_alpha": 0.45,
         "draw_boxes": True,
-        "draw_masks": True,
-        "draw_centers": True,
-        "draw_pose": True,
+        "draw_masks": False,
+        "draw_centers": False,
+        # Pose is optional; person∩helmet does not require keypoints.
+        "draw_pose": False,
         "pose_kpt_conf": 0.25,
         "cross_check_enabled": bool(meta.get("cross_check_enabled", True)),
         "cross_check_draw_head_box": True,
-        "cross_check_draw_boxes": False,
+        "cross_check_draw_boxes": True,
     }
     saved = meta.get("saved_overlay") or {}
     if isinstance(saved, dict):
@@ -186,11 +194,11 @@ def resolve_overlay(
             if key in overlay_override and overlay_override[key] is not None:
                 overlay[key] = overlay_override[key]
     if debug_all:
-        # Debug period: force full scene — all people + helmet dets + head verdicts.
+        # Debug: force target overlay knobs (boxes / helmet / head). Per-ID render
+        # still filters to one stable_id — do not use this to stamp bystanders.
+        # Do not force pose skeletons (no-op when keypoints absent anyway).
         overlay["draw_boxes"] = True
         overlay["draw_masks"] = True
-        overlay["draw_centers"] = True
-        overlay["draw_pose"] = True
         overlay["cross_check_enabled"] = True
         overlay["cross_check_draw_head_box"] = True
         overlay["cross_check_draw_boxes"] = True
@@ -215,9 +223,16 @@ def stamp_debug_hud_rgb(
         for k in kpts
         if k is not None and getattr(k, "size", 0) > 0
     )
+    n_helm = len(packet.cross_check_accessories or [])
+    n_fail = sum(
+        1
+        for v in (packet.cross_check_verdicts or [])
+        if _verdict_is_violation(v)
+    )
+    pose_state = "ON" if draw_pose and n_kpt > 0 else ("off*" if draw_pose else "off")
     label = (
-        f"DBG full-scene  people={int(packet.n_inst)}  "
-        f"pose={'ON' if draw_pose else 'off'}  kpts={n_kpt}"
+        f"DBG person+helmet  people={int(packet.n_inst)}  "
+        f"helmets={n_helm}  NO_HELMET={n_fail}  pose={pose_state}"
     )
     out = np.ascontiguousarray(rgb.copy())
     bgr = cv2.cvtColor(out, cv2.COLOR_RGB2BGR)
@@ -228,7 +243,7 @@ def stamp_debug_hud_rgb(
         label,
         (12, h - 12),
         cv2.FONT_HERSHEY_SIMPLEX,
-        0.65,
+        0.55,
         (0, 255, 255),
         2,
         cv2.LINE_AA,
@@ -317,7 +332,7 @@ def collect_stable_ids(data: dict[str, Any], run_dir: Path) -> list[int]:
 
 
 def collect_violator_stable_ids(data: dict[str, Any], run_dir: Path) -> list[int]:
-    """Unique stable ReID IDs that violated cross-check (no helmet) at least once."""
+    """Unique person stable_ids that violated cross-check (no helmet) at least once."""
     ids: set[int] = set()
     for packet in iter_run_packets(data, Path(run_dir)):
         verdicts = packet.cross_check_verdicts or []
@@ -334,7 +349,7 @@ def collect_violator_stable_ids(data: dict[str, Any], run_dir: Path) -> list[int
 
 
 def count_violations_by_stable_id(data: dict[str, Any], run_dir: Path) -> dict[int, int]:
-    """Cross-check NO HELMET keyframes per stable ReID id."""
+    """Cross-check NO HELMET keyframes per person stable_id."""
     counts: dict[int, int] = {}
     for packet in iter_run_packets(data, Path(run_dir)):
         verdicts = packet.cross_check_verdicts or []
@@ -369,29 +384,37 @@ def collect_qualified_violator_ids(
     run_dir: Path,
     *,
     min_violation_frames: int = 3,
-    min_violation_ratio: float = 0.08,
-    min_relative_to_max: float = 0.25,
+    min_violation_ratio: float = 0.0,
+    min_relative_to_max: float = 0.0,
 ) -> tuple[list[int], dict[int, int], dict[int, int], int]:
     """
-    Violators worth a clip: enough NO HELMET hits vs presence and vs worst offender.
+    Gate for writing a per-ID clip: primarily NO HELMET frame count.
+
+    INCLUDE if viol_frames >= min_violation_frames (default 3).
+    Optional extras (off by default — they used to fight “many NO HELMET ⇒ in”):
+      - min_relative_to_max > 0: also require >= max_v * that fraction
+      - min_violation_ratio > 0: also require viol/presence >= that ratio
 
     Returns (qualified_ids desc by count, violation_counts, presence_counts, threshold_used).
     """
     vcounts = count_violations_by_stable_id(data, run_dir)
     pcounts = count_presence_by_stable_id(data, run_dir)
     if not vcounts:
-        return [], vcounts, pcounts, min_violation_frames
+        return [], vcounts, pcounts, int(min_violation_frames)
 
-    max_v = max(vcounts.values())
-    threshold = max(int(min_violation_frames), int(max_v * min_relative_to_max))
+    threshold = max(1, int(min_violation_frames))
+    if float(min_relative_to_max) > 0:
+        max_v = max(vcounts.values())
+        threshold = max(threshold, int(max_v * float(min_relative_to_max)))
 
     qualified: list[int] = []
     for sid, vc in vcounts.items():
         if vc < threshold:
             continue
-        pc = pcounts.get(sid, 0)
-        if pc > 0 and (vc / pc) < float(min_violation_ratio):
-            continue
+        if float(min_violation_ratio) > 0:
+            pc = pcounts.get(sid, 0)
+            if pc > 0 and (vc / pc) < float(min_violation_ratio):
+                continue
         qualified.append(sid)
 
     qualified.sort(key=lambda s: (-vcounts[s], s))
@@ -460,6 +483,8 @@ def filter_person_single_id(packet: FramePacket, target_sid: int) -> FramePacket
         if packet.instance_meta and i < len(packet.instance_meta)
         else None
     )
+    # Keep helmet accessory dets so stills/clips can draw person∩helmet without pose.
+    accessories = list(packet.cross_check_accessories or [])
 
     return replace(
         packet,
@@ -470,7 +495,7 @@ def filter_person_single_id(packet: FramePacket, target_sid: int) -> FramePacket
         n_inst=1,
         keypoints_list=kpts,
         cross_check_verdicts=vlist,
-        cross_check_accessories=[],
+        cross_check_accessories=accessories,
         masks_rle=masks_rle,
         instance_meta=instance_meta,
     )
@@ -511,6 +536,7 @@ def filter_violator_single_id(packet: FramePacket, target_sid: int) -> FramePack
         if packet.instance_meta and i < len(packet.instance_meta)
         else None
     )
+    accessories = list(packet.cross_check_accessories or [])
 
     return replace(
         packet,
@@ -521,7 +547,7 @@ def filter_violator_single_id(packet: FramePacket, target_sid: int) -> FramePack
         n_inst=1,
         keypoints_list=kpts,
         cross_check_verdicts=vlist,
-        cross_check_accessories=[],
+        cross_check_accessories=accessories,
         masks_rle=masks_rle,
         instance_meta=instance_meta,
     )
@@ -741,6 +767,44 @@ def highlight_no_helmet_on_rgb(
     return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
 
 
+def stamp_helmet_accessories_rgb(
+    rgb: np.ndarray,
+    packet: FramePacket,
+    *,
+    target_w: int,
+    target_h: int,
+) -> np.ndarray:
+    """Draw helmet / accessory boxes from cross_check_accessories (no pose required)."""
+    from app.core.cross_check import draw_cross_check_detections
+    from app.core.frame_pipeline import _scale_cross_check_geometry
+
+    accessories = list(packet.cross_check_accessories or [])
+    if not accessories:
+        return rgb
+
+    tw, th = int(target_w), int(target_h)
+    src_h = src_w = 0
+    if packet.mask_hw:
+        src_h, src_w = int(packet.mask_hw[0]), int(packet.mask_hw[1])
+    elif packet.stack is not None and packet.stack.ndim == 3 and packet.stack.shape[0] > 0:
+        src_h, src_w = int(packet.stack.shape[1]), int(packet.stack.shape[2])
+    if src_h > 0 and src_w > 0 and (src_h != th or src_w != tw):
+        _, accessories = _scale_cross_check_geometry(
+            None, accessories, float(tw) / float(src_w), float(th) / float(src_h)
+        )
+
+    ih, iw = int(rgb.shape[0]), int(rgb.shape[1])
+    if (ih, iw) != (th, tw) and ih > 0 and iw > 0:
+        _, accessories = _scale_cross_check_geometry(
+            None, accessories, float(iw) / float(tw), float(ih) / float(th)
+        )
+
+    out = np.ascontiguousarray(rgb.copy())
+    bgr = cv2.cvtColor(out, cv2.COLOR_RGB2BGR)
+    bgr = draw_cross_check_detections(bgr, accessories, color=(0, 200, 255))
+    return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+
+
 def stamp_all_poses_rgb(
     rgb: np.ndarray,
     packet: FramePacket,
@@ -752,15 +816,17 @@ def stamp_all_poses_rgb(
     pose_line_thickness: int = 3,
 ) -> np.ndarray:
     """
-    Draw YOLO pose skeletons for EVERY instance in the packet.
-    Independent of mask overlay / single-id filter — fixes 'skeleton only on violator'.
+    Optional YOLO pose skeletons for every instance.
+    No-op when keypoints_list is empty (person-detect / no-pose runs).
     """
     from app.core.exporter import pose_overlay_colors
     from app.core.frame_pipeline import _scale_keypoints_list
     from app.core.pose_utils import draw_pose_on_frame
 
     kpts = list(packet.keypoints_list or [])
-    if not kpts:
+    if not kpts or not any(
+        k is not None and getattr(k, "size", 0) > 0 for k in kpts
+    ):
         return rgb
 
     tw, th = int(target_w), int(target_h)
@@ -816,17 +882,7 @@ def _render_full_scene_highlight(
     src_i, rgb = _render_encode_job(
         replace(job, carry=work, frame_bgr=job.frame_bgr), ctx
     )
-    # Force skeletons for all people (even if base render was single-id somehow).
-    rgb = stamp_all_poses_rgb(
-        rgb,
-        work,
-        target_w=ctx.target_w,
-        target_h=ctx.target_h,
-        pose_kpt_conf=float(ctx.overlay.get("pose_kpt_conf", 0.25)),
-        pose_point_radius=int(ctx.overlay.get("pose_point_radius", 6) or 6),
-        pose_line_thickness=int(ctx.overlay.get("pose_line_thickness", 3) or 3),
-    )
-    # Always stamp meta boxes so bystanders stay visible even if mask overlay failed.
+    # Person boxes first — primary cue for person∩helmet (no pose required).
     rgb = stamp_all_people_boxes_rgb(
         rgb,
         work,
@@ -834,6 +890,24 @@ def _render_full_scene_highlight(
         target_h=ctx.target_h,
         focus_sid=target_sid,
     )
+    # Helmet accessory boxes from cross-check model.
+    rgb = stamp_helmet_accessories_rgb(
+        rgb,
+        work,
+        target_w=ctx.target_w,
+        target_h=ctx.target_h,
+    )
+    # Optional pose: only when enabled AND keypoints exist (else no-op).
+    if bool(ctx.overlay.get("draw_pose", False)):
+        rgb = stamp_all_poses_rgb(
+            rgb,
+            work,
+            target_w=ctx.target_w,
+            target_h=ctx.target_h,
+            pose_kpt_conf=float(ctx.overlay.get("pose_kpt_conf", 0.25)),
+            pose_point_radius=int(ctx.overlay.get("pose_point_radius", 6) or 6),
+            pose_line_thickness=int(ctx.overlay.get("pose_line_thickness", 3) or 3),
+        )
     rgb = highlight_no_helmet_on_rgb(
         rgb,
         work,
@@ -846,13 +920,62 @@ def _render_full_scene_highlight(
     rgb = stamp_debug_hud_rgb(
         rgb,
         work,
-        draw_pose=bool(ctx.overlay.get("draw_pose", True)),
+        draw_pose=bool(ctx.overlay.get("draw_pose", False)),
     )
     return src_i, rgb
 
 
+def _render_target_only(
+    job: _EncodeJob,
+    ctx: _RenderContext,
+    filtered: FramePacket,
+    target_sid: int,
+    *,
+    debug_all: bool,
+    force_highlight: bool = False,
+) -> tuple[int, np.ndarray]:
+    """Draw only target stable_id; highlight NO HELMET; never stamp bystanders."""
+    work = replace(filtered, frame_idx=job.src_i)
+    src_i, rgb = _render_encode_job(
+        replace(job, carry=work, frame_bgr=job.frame_bgr), ctx
+    )
+    if debug_all:
+        rgb = stamp_helmet_accessories_rgb(
+            rgb,
+            work,
+            target_w=ctx.target_w,
+            target_h=ctx.target_h,
+        )
+        if bool(ctx.overlay.get("draw_pose", False)):
+            rgb = stamp_all_poses_rgb(
+                rgb,
+                work,
+                target_w=ctx.target_w,
+                target_h=ctx.target_h,
+                pose_kpt_conf=float(ctx.overlay.get("pose_kpt_conf", 0.25)),
+                pose_point_radius=int(ctx.overlay.get("pose_point_radius", 6) or 6),
+                pose_line_thickness=int(ctx.overlay.get("pose_line_thickness", 3) or 3),
+            )
+    rgb = highlight_no_helmet_on_rgb(
+        rgb,
+        work,
+        target_sid,
+        target_w=ctx.target_w,
+        target_h=ctx.target_h,
+        frame_bgr=job.frame_bgr,
+        force=force_highlight,
+    )
+    if debug_all:
+        rgb = stamp_debug_hud_rgb(
+            rgb,
+            work,
+            draw_pose=bool(ctx.overlay.get("draw_pose", False)),
+        )
+    return src_i, rgb
+
+
 def _make_person_render_fn(target_sid: int):
-    """Smooth per-person clip: update on keyframes, hold-forward between stride gaps."""
+    """Per-ID clip: target only, hold-forward between stride gaps; highlight NO HELMET."""
     last_draw: FramePacket | None = None
     debug_all = web_debug_show_all_dets()
 
@@ -861,35 +984,22 @@ def _make_person_render_fn(target_sid: int):
         carry = job.carry
         is_key = int(carry.frame_idx) == int(job.src_i)
         if is_key:
-            if debug_all:
-                # Full scene while this person is present.
-                if filter_person_single_id(carry, target_sid).n_inst > 0:
-                    last_draw = carry
-                else:
-                    last_draw = None
-            else:
-                filtered = filter_person_single_id(carry, target_sid)
-                if filtered.n_inst > 0:
-                    last_draw = filtered
-                else:
-                    last_draw = None
+            filtered = filter_person_single_id(carry, target_sid)
+            last_draw = filtered if filtered.n_inst > 0 else None
 
         if last_draw is None:
             empty = _empty_instances(replace(carry, frame_idx=job.src_i))
             return _render_encode_job(replace(job, carry=empty), ctx)
 
-        if debug_all:
-            return _render_full_scene_highlight(
-                job, ctx, last_draw, target_sid, force_highlight=False
-            )
-        work = replace(last_draw, frame_idx=job.src_i)
-        return _render_encode_job(replace(job, carry=work, frame_bgr=job.frame_bgr), ctx)
+        return _render_target_only(
+            job, ctx, last_draw, target_sid, debug_all=debug_all, force_highlight=False
+        )
 
     return _render
 
 
 def _make_violator_render_fn(target_sid: int):
-    """Draw overlay on violation keyframes for target_sid (no hold-forward)."""
+    """Draw overlay on violation keyframes for target_sid only (no bystanders)."""
     debug_all = web_debug_show_all_dets()
 
     def _render(job: _EncodeJob, ctx: _RenderContext) -> tuple[int, np.ndarray]:
@@ -906,13 +1016,8 @@ def _make_violator_render_fn(target_sid: int):
             return _render_encode_job(
                 replace(job, carry=empty, frame_bgr=job.frame_bgr), ctx
             )
-        if debug_all:
-            # All detections + fat red callout on the no-helmet target.
-            return _render_full_scene_highlight(
-                job, ctx, carry, target_sid, force_highlight=True
-            )
-        return _render_encode_job(
-            replace(job, carry=filtered, frame_bgr=job.frame_bgr), ctx
+        return _render_target_only(
+            job, ctx, filtered, target_sid, debug_all=debug_all, force_highlight=True
         )
 
     return _render
@@ -938,8 +1043,8 @@ def _encode_one_violator(
 ) -> Path:
     if on_log and web_debug_show_all_dets():
         on_log(
-            "WEB debug overlay ON: full scene + pose + NO HELMET highlight "
-            f"(id={stable_id})"
+            "WEB debug overlay ON: target-only boxes/masks/helmet + NO HELMET "
+            f"(id={stable_id}; no bystanders)"
         )
     # Force rewrite so players/browsers cannot keep a stale same-name MP4.
     try:
@@ -997,14 +1102,16 @@ def encode_violations_videos_per_id(
     encode_crf: int = 23,
     encode_codec: str = "auto",
     min_violation_frames: int = 3,
-    min_violation_ratio: float = 0.08,
-    min_relative_to_max: float = 0.25,
+    min_violation_ratio: float = 0.0,
+    min_relative_to_max: float = 0.0,
     on_progress: Callable[[int, int], None] | None = None,
     on_log: Callable[[str], None] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """
-    One short MP4 per qualified violator: only NO HELMET keyframes for that stable_id.
-    Skips IDs with too few helmet violations vs presence / vs max offender.
+    One MP4 per ID with enough NO HELMET frames (gate: min_violation_frames).
+
+    Clip timeline = all presence keyframes for that stable_id (grab-skip), not a
+    sparse NO HELMET montage. Overlay draws only that ID.
     """
     run_dir = Path(run_dir)
     rid = infer_run_id(run_dir, run_id)
@@ -1027,6 +1134,23 @@ def encode_violations_videos_per_id(
         min_violation_ratio=min_violation_ratio,
         min_relative_to_max=min_relative_to_max,
     )
+    qualified_set = set(violator_ids)
+    if on_log:
+        extras = []
+        if float(min_relative_to_max) > 0:
+            extras.append(f"min_relative_to_max={min_relative_to_max}")
+        if float(min_violation_ratio) > 0:
+            extras.append(f"min_violation_ratio={min_violation_ratio}")
+        extra_s = f" (+{', '.join(extras)})" if extras else ""
+        on_log(
+            f"Qualification gate: min_violation_frames={threshold} "
+            f"(main knob; many NO HELMET ⇒ INCLUDE){extra_s}"
+        )
+        for sid in sorted(violation_counts.keys(), key=lambda s: (-violation_counts[s], s)):
+            vc = int(violation_counts[sid])
+            decision = "INCLUDE" if sid in qualified_set else "SKIP"
+            on_log(f"id{sid} viol_frames={vc} → {decision}")
+
     if not violator_ids:
         raw = count_violations_by_stable_id(data, run_dir)
         diag = diagnose_packet_violations(data, run_dir)
@@ -1050,17 +1174,7 @@ def encode_violations_videos_per_id(
             )
         detail = ", ".join(f"id{sid}={n}" for sid, n in sorted(raw.items(), key=lambda x: -x[1]))
         raise ValueError(
-            f"No violators passed threshold (>={threshold} NO HELMET frames, "
-            f"ratio>={min_violation_ratio:.0%} of presence). Raw counts: {detail}"
-        )
-
-    if on_log:
-        on_log(
-            f"Qualified violators (threshold>={threshold} frames): "
-            + ", ".join(
-                f"id{sid}={violation_counts[sid]}/{presence_counts.get(sid, '?')}"
-                for sid in violator_ids
-            )
+            f"No violators passed gate (>= {threshold} NO HELMET frames). Raw counts: {detail}"
         )
 
     def _make_lookup() -> _ChunkPacketLookup | _SortedPacketLookup:
@@ -1070,15 +1184,20 @@ def encode_violations_videos_per_id(
 
     frame_sets: dict[int, set[int]] = {}
     violation_sets: dict[int, set[int]] = {}
+    presence_sets: dict[int, set[int]] = {}
+    encode_is_presence: dict[int, bool] = {}
     for sid in violator_ids:
         presence = set(collect_presence_frame_indices(data, run_dir, sid))
         violations = set(collect_violation_frame_indices(data, run_dir, sid))
-        # Clips labeled NO HELMET must contain violation keyframes only.
-        use_frames = violations if violations else presence
+        # Full presence timeline for this ID; fall back to violation frames if empty.
+        use_presence = bool(presence)
+        use_frames = presence if use_presence else violations
         if not use_frames:
             continue
         frame_sets[sid] = use_frames
         violation_sets[sid] = violations
+        presence_sets[sid] = presence
+        encode_is_presence[sid] = use_presence
     total_steps = sum(len(frames) for frames in frame_sets.values()) or 1
     done_steps = 0
 
@@ -1089,13 +1208,18 @@ def encode_violations_videos_per_id(
             continue
         n_encode = len(encode_frames)
         n_v = len(violation_sets.get(sid, ()))
-        n_presence = int(presence_counts.get(sid, 0))
+        n_presence = len(presence_sets.get(sid, ())) or int(presence_counts.get(sid, 0))
         if on_log:
-            on_log(
-                f"Encode violator stable_id={sid} "
-                f"({idx + 1}/{len(violator_ids)}, {n_encode} NO HELMET frames, "
-                f"presence={n_presence})…"
-            )
+            if encode_is_presence.get(sid, False):
+                on_log(
+                    f"id{sid}: presence_frames={n_encode} violation_frames={n_v} "
+                    f"→ encoding all presence ({idx + 1}/{len(violator_ids)})"
+                )
+            else:
+                on_log(
+                    f"id{sid}: presence_frames={n_presence} violation_frames={n_v} "
+                    f"→ encoding violation frames fallback ({idx + 1}/{len(violator_ids)})"
+                )
         out_path = run_dir / f"{rid}_violation_id{sid}.mp4"
 
         def _inner_progress(done: int, total: int, *, _base: int = done_steps) -> None:
@@ -1117,15 +1241,16 @@ def encode_violations_videos_per_id(
             on_progress=lambda d, t, b=done_steps: _inner_progress(d, t, _base=b),
             on_log=on_log,
             violation_frames=encode_frames,
-            violations_only=True,
+            violations_only=False,
         )
         done_steps += n_encode
         outputs.append(
             {
                 "stable_id": sid,
-                "violation_frames": n_v or n_encode,
+                "violation_frames": n_v,
                 "violation_count": violation_counts.get(sid, n_v),
-                "presence_frames": n_presence,
+                "presence_frames": n_presence if n_presence > 0 else n_encode,
+                "encode_frames": n_encode,
                 "video_path": str(path.resolve()),
                 "video_name": path.name,
             }
@@ -1137,6 +1262,7 @@ def encode_violations_videos_per_id(
         "cross_check_violations": meta["cross_check_violations"],
         "violator_count": len(outputs),
         "violation_threshold": threshold,
+        "min_violation_frames": int(min_violation_frames),
         "stable_ids": [o["stable_id"] for o in outputs],
         "violation_counts": {str(k): v for k, v in violation_counts.items()},
         "presence_counts": {str(k): v for k, v in presence_counts.items()},
@@ -1159,8 +1285,9 @@ def encode_person_videos_per_id(
     on_log: Callable[[str], None] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """
-    One MP4 per stable ReID id (full timeline, any cross-check state).
-    Prefer encode_violations_videos_per_id for NO HELMET review clips.
+    One MP4 per stable ReID id (full source timeline, any cross-check state).
+    For violator review clips prefer encode_violations_videos_per_id
+    (qualify by NO HELMET count; encode full presence of that ID).
     """
     run_dir = Path(run_dir)
     rid = infer_run_id(run_dir, run_id)

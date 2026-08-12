@@ -100,6 +100,7 @@ def serialize_frame_instances(
             if not v.ok and v.warning:
                 row["warning"] = v.warning
             row["cross_check_intersection_px"] = round(v.best_intersection_px, 2)
+            # Legacy key: highlight box (person∩helmet when OK, person-top otherwise).
             if v.head_xyxy is not None:
                 hx0, hy0, hx1, hy1 = [float(x) for x in v.head_xyxy.tolist()]
                 row["head_bbox_xyxy"] = [int(hx0), int(hy0), int(hx1), int(hy1)]

@@ -7,11 +7,7 @@ import numpy as np
 
 from app.config.settings import PipelineSettings
 from app.core.detect_engine import DetectItem
-from app.core.fusion import (
-    dedupe_detections,
-    inherit_motion_ids,
-    merge_seg_fallback_detections,
-)
+from app.core.fusion import dedupe_detections, inherit_motion_ids, merge_seg_fallback_detections
 from app.core.motion_tracker import MotionTracker
 from app.core.prompt_utils import label_match
 from app.core.reid_engine import ReidEngine
@@ -20,8 +16,11 @@ from app.core.seg_engine import SegItem
 
 @dataclass(slots=True)
 class PreparedFrame:
+    # Person detections only (prompt-filtered). These alone feed tracker / ReID / stable_id.
     valid_dets: list[DetectItem]
     segments: list[SegItem]
+    # Helmet (accessory) boxes from the cross-check model — overlay/verdict only.
+    # Never merged into valid_dets; never cropped for ReID; never assigned track IDs.
     cross_raw: list[DetectItem]
 
 
@@ -36,7 +35,11 @@ def prepare_batch_frames(
     motion_tracker: MotionTracker | None,
     use_motion_tracker: bool,
 ) -> tuple[list[PreparedFrame], list[np.ndarray], list[tuple[int, int]]]:
-    """Filter/merge detections and collect ReID crops (shared GPU+CPU path)."""
+    """Filter/merge *person* detections and collect ReID crops.
+
+    Helmet/cross-check detections stay in ``cross_raw`` only. Identity
+    (SAM / OSNet / SOLIDER) applies exclusively to person ``valid_dets``.
+    """
     from app.core.sam_memory_tracker import needs_osnet_embed, uses_stable_identity
 
     use_seg = bool(settings.use_seg)
@@ -53,7 +56,8 @@ def prepare_batch_frames(
             dets_raw = motion_tracker.assign(dets_raw)
 
         segs_raw = segments[fi] if fi < len(segments) else []
-        cross_raw = cross_detections[fi] if fi < len(cross_detections) else []
+        # Keep accessories separate — do not feed into motion_tracker / ReID.
+        cross_raw = list(cross_detections[fi] if fi < len(cross_detections) else [])
 
         detections_f = [d for d in dets_raw if label_match(d.label, terms)]
         segments_f = [s for s in segs_raw if label_match(s.label, terms)]
@@ -70,9 +74,21 @@ def prepare_batch_frames(
         valid_dets: list[DetectItem] = []
         if need_osnet:
             frame = frames_bgr[fi]
+            use_torso = bool(getattr(settings, "reid_torso_crop", True))
+            kpt_conf = float(getattr(settings, "pose_kpt_conf", 0.25))
+            torso_pad = float(getattr(settings, "reid_torso_pad", 0.20))
+            torso_min_area = float(getattr(settings, "reid_torso_min_area_ratio", 0.12))
             for det in detections_f:
                 valid_dets.append(det)
-                crop = ReidEngine.crop_from_bbox(frame, det.xyxy)
+                crop = ReidEngine.crop_for_reid(
+                    frame,
+                    det.xyxy,
+                    det.keypoints,
+                    kpt_conf=kpt_conf,
+                    use_torso=use_torso,
+                    torso_pad=torso_pad,
+                    torso_min_area_ratio=torso_min_area,
+                )
                 if crop is not None and crop.size > 0:
                     crop_map.append((fi, len(valid_dets) - 1))
                     all_crops.append(crop)

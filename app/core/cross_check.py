@@ -1,4 +1,9 @@
-"""Cross-model intersection rules (e.g. pose head ∩ helmet)."""
+"""Cross-model intersection rules (person bbox ∩ helmet bbox).
+
+Helmet detections are accessories only: used for OK / NO HELMET verdicts and
+overlay drawing. They are never tracked, never embedded for ReID, and never
+receive their own stable_id — identity belongs to the person DetectItem.
+"""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -9,7 +14,7 @@ import numpy as np
 from app.core.detect_engine import DetectItem
 from app.core.fusion import box_iou
 
-# COCO head keypoints: nose, eyes, ears.
+# Deprecated: previously used for pose-head ∩ helmet. Kept for import compat.
 HEAD_KEYPOINT_IDS: tuple[int, ...] = (0, 1, 2, 3, 4)
 
 
@@ -17,6 +22,8 @@ HEAD_KEYPOINT_IDS: tuple[int, ...] = (0, 1, 2, 3, 4)
 class CrossCheckVerdict:
     ok: bool
     warning: str
+    # Highlight region for overlay/JSON (legacy name head_xyxy):
+    # OK → person∩best-helmet; NO HELMET → upper portion of person bbox.
     head_xyxy: np.ndarray | None
     best_intersection_px: float
     best_iou: float
@@ -32,6 +39,41 @@ def box_intersection_area(a: np.ndarray, b: np.ndarray) -> float:
     return float(iw * ih)
 
 
+def box_intersection_xyxy(a: np.ndarray, b: np.ndarray) -> np.ndarray | None:
+    ax0, ay0, ax1, ay1 = [float(v) for v in a.tolist()]
+    bx0, by0, bx1, by1 = [float(v) for v in b.tolist()]
+    ix0, iy0 = max(ax0, bx0), max(ay0, by0)
+    ix1, iy1 = min(ax1, bx1), min(ay1, by1)
+    if ix1 <= ix0 or iy1 <= iy0:
+        return None
+    return np.array([ix0, iy0, ix1, iy1], dtype=np.float32)
+
+
+def person_upper_bbox(
+    person_xyxy: np.ndarray,
+    *,
+    frame_w: int = 0,
+    frame_h: int = 0,
+    top_frac: float = 0.35,
+    side_inset: float = 0.15,
+) -> np.ndarray:
+    """Upper person band used as overlay/warn anchor when no helmet match."""
+    px0, py0, px1, py1 = [float(v) for v in person_xyxy.tolist()]
+    ph = max(1.0, py1 - py0)
+    pw = max(1.0, px1 - px0)
+    x0 = px0 + pw * side_inset
+    x1 = px1 - pw * side_inset
+    y0 = py0
+    y1 = py0 + ph * top_frac
+    if frame_w > 0:
+        x0 = max(0.0, min(x0, float(frame_w - 1)))
+        x1 = max(0.0, min(x1, float(frame_w - 1)))
+    if frame_h > 0:
+        y0 = max(0.0, min(y0, float(frame_h - 1)))
+        y1 = max(0.0, min(y1, float(frame_h - 1)))
+    return np.array([x0, y0, x1, y1], dtype=np.float32)
+
+
 def head_bbox_from_keypoints(
     kpts: np.ndarray | None,
     person_xyxy: np.ndarray,
@@ -41,42 +83,74 @@ def head_bbox_from_keypoints(
     frame_w: int = 0,
     frame_h: int = 0,
 ) -> np.ndarray:
-    """Head region from pose keypoints; fallback = upper part of person box."""
-    xs: list[float] = []
-    ys: list[float] = []
-    if kpts is not None and isinstance(kpts, np.ndarray) and kpts.ndim == 2 and kpts.shape[1] >= 3:
-        for idx in HEAD_KEYPOINT_IDS:
-            if idx >= int(kpts.shape[0]):
-                continue
-            x, y, c = float(kpts[idx, 0]), float(kpts[idx, 1]), float(kpts[idx, 2])
-            if c >= kpt_conf:
-                xs.append(x)
-                ys.append(y)
-    if xs and ys:
-        x0, x1 = min(xs), max(xs)
-        y0, y1 = min(ys), max(ys)
-        bw = max(8.0, x1 - x0)
-        bh = max(8.0, y1 - y0)
-        x0 -= pad * bw
-        x1 += pad * bw
-        y0 -= pad * bh
-        y1 += pad * bh
-    else:
-        px0, py0, px1, py1 = [float(v) for v in person_xyxy.tolist()]
-        ph = max(1.0, py1 - py0)
-        pw = max(1.0, px1 - px0)
-        x0 = px0 + pw * 0.15
-        x1 = px1 - pw * 0.15
-        y0 = py0
-        y1 = py0 + ph * 0.35
+    """Deprecated: pose-head region. Prefer person_upper_bbox / person∩helmet."""
+    del kpts, kpt_conf, pad
+    return person_upper_bbox(person_xyxy, frame_w=frame_w, frame_h=frame_h)
 
-    if frame_w > 0:
-        x0 = max(0.0, min(x0, float(frame_w - 1)))
-        x1 = max(0.0, min(x1, float(frame_w - 1)))
-    if frame_h > 0:
-        y0 = max(0.0, min(y0, float(frame_h - 1)))
-        y1 = max(0.0, min(y1, float(frame_h - 1)))
-    return np.array([x0, y0, x1, y1], dtype=np.float32)
+
+def evaluate_person_helmet_cross(
+    person: DetectItem,
+    accessories: list[DetectItem],
+    *,
+    min_intersection_px: float = 1.0,
+    min_iou: float = 0.0,
+    frame_w: int = 0,
+    frame_h: int = 0,
+    ok_text: str = "OK",
+    warn_text: str = "NO HELMET",
+) -> CrossCheckVerdict:
+    """OK only if a helmet bbox intersects this person (area and/or IoU).
+
+    Missing helmet association is always NO HELMET (ok=False):
+    - empty accessories (model found nothing, or all filtered by conf/prompt)
+    - helmets elsewhere in the frame but none overlapping this person
+
+    There is no second "no_helmet" classifier — absence of a qualifying
+    helmet detection is itself the violation.
+    """
+    del ok_text
+    person_box = person.xyxy
+    best_ia = 0.0
+    best_iou = 0.0
+    best_acc: DetectItem | None = None
+    miss_ia = 0.0
+    miss_iou = 0.0
+
+    for acc in accessories:
+        ia = box_intersection_area(person_box, acc.xyxy)
+        iou = float(box_iou(person_box, acc.xyxy))
+        qualifies = ia >= float(min_intersection_px)
+        if float(min_iou) > 0:
+            qualifies = qualifies or iou >= float(min_iou)
+        if qualifies:
+            if best_acc is None or ia > best_ia or (ia == best_ia and iou > best_iou):
+                best_ia = ia
+                best_iou = iou
+                best_acc = acc
+        elif ia > miss_ia or (ia == miss_ia and iou > miss_iou):
+            miss_ia = ia
+            miss_iou = iou
+
+    if best_acc is not None:
+        highlight = box_intersection_xyxy(person_box, best_acc.xyxy)
+        if highlight is None:
+            highlight = np.asarray(best_acc.xyxy, dtype=np.float32).copy()
+        return CrossCheckVerdict(
+            ok=True,
+            warning="",
+            head_xyxy=highlight,
+            best_intersection_px=best_ia,
+            best_iou=best_iou,
+        )
+
+    # No qualifying helmet on/near this person → NO HELMET (feeds violation streak).
+    return CrossCheckVerdict(
+        ok=False,
+        warning=warn_text,
+        head_xyxy=person_upper_bbox(person_box, frame_w=frame_w, frame_h=frame_h),
+        best_intersection_px=miss_ia,
+        best_iou=miss_iou,
+    )
 
 
 def evaluate_head_helmet_cross(
@@ -91,30 +165,17 @@ def evaluate_head_helmet_cross(
     ok_text: str = "OK",
     warn_text: str = "NO HELMET",
 ) -> CrossCheckVerdict:
-    head = head_bbox_from_keypoints(
-        person.keypoints,
-        person.xyxy,
-        kpt_conf=kpt_conf,
+    """Deprecated alias → person bbox ∩ helmet (keypoints ignored)."""
+    del kpt_conf
+    return evaluate_person_helmet_cross(
+        person,
+        accessories,
+        min_intersection_px=min_intersection_px,
+        min_iou=min_iou,
         frame_w=frame_w,
         frame_h=frame_h,
-    )
-    best_ia = 0.0
-    best_iou = 0.0
-    for acc in accessories:
-        ia = box_intersection_area(head, acc.xyxy)
-        iou = box_iou(head, acc.xyxy)
-        best_ia = max(best_ia, ia)
-        best_iou = max(best_iou, iou)
-
-    ok = best_ia >= min_intersection_px
-    if min_iou > 0:
-        ok = ok or best_iou >= min_iou
-    return CrossCheckVerdict(
-        ok=ok,
-        warning="" if ok else warn_text,
-        head_xyxy=head,
-        best_intersection_px=best_ia,
-        best_iou=best_iou,
+        ok_text=ok_text,
+        warn_text=warn_text,
     )
 
 
@@ -130,17 +191,23 @@ def evaluate_cross_check_batch(
     warn_text: str = "NO HELMET",
     helmet_min_conf: float = 0.0,
 ) -> list[CrossCheckVerdict]:
-    """helmet_min_conf: ignore accessory detections below this score."""
+    """Per-person helmet verdicts; empty/filtered accessories → all NO HELMET.
+
+    helmet_min_conf: ignore accessory detections below this score (raises
+    "no det" rate — those persons still get ok=False / NO HELMET).
+
+    kpt_conf is ignored (API compat); rule is person bbox ∩ helmet bbox.
+    """
+    del kpt_conf
     filtered_acc = (
         [a for a in accessories if float(a.conf) >= float(helmet_min_conf)]
         if helmet_min_conf > 0
-        else accessories
+        else list(accessories)
     )
     return [
-        evaluate_head_helmet_cross(
+        evaluate_person_helmet_cross(
             p,
             filtered_acc,
-            kpt_conf=kpt_conf,
             min_intersection_px=min_intersection_px,
             min_iou=min_iou,
             frame_w=frame_w,
@@ -161,6 +228,7 @@ def smooth_helmet_verdicts(
 ) -> list[CrossCheckVerdict]:
     """
     Temporal filter per stable_id: need consecutive NO HELMET frames before violation.
+    raw_ok=False (missing/non-overlapping helmet) always appends to the streak.
     Helmet detected → OK immediately (no flicker «был в каске → без» на одном кадре).
     """
     from dataclasses import replace
@@ -230,6 +298,7 @@ def draw_cross_check_overlay(
     *,
     draw_head_box: bool = True,
 ) -> np.ndarray:
+    """Draw highlight box (person∩helmet or person-top) + NO HELMET warning."""
     out = frame_bgr
     for verdict in verdicts:
         if verdict.head_xyxy is None:

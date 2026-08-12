@@ -83,7 +83,7 @@ from app.core.video_encode import (
 from app.core.packet_spill import PacketSpillWriter
 from app.core.pose_utils import keypoints_to_json
 from app.core.prompt_utils import label_match, prompt_terms
-from app.core.reid_engine import ReidEngine
+from app.core.reid_engine import ReidEngine, create_reid_engine, resolve_reid_backend
 from app.core.sam_memory_tracker import (
     build_identity_tracker,
     needs_osnet_embed,
@@ -155,6 +155,11 @@ class VideoProcessor:
         frame=None,
         accessories: list | None = None,
     ) -> tuple[list[CrossCheckVerdict], list[CrossCheckDetection], float]:
+        """Per-person helmet verdicts after identity is assigned.
+
+        ``valid_dets`` / ``stable_ids`` are person-only (already tracked/ReID'd).
+        Helmet boxes are predict-only accessories — never fed back into the tracker.
+        """
         cross_verdicts: list[CrossCheckVerdict] = []
         cross_accessories: list[CrossCheckDetection] = []
         cross_ms = 0.0
@@ -166,19 +171,22 @@ class VideoProcessor:
             return cross_verdicts, cross_accessories, cross_ms
         if accessories is None:
             if frame is None:
-                return cross_verdicts, cross_accessories, cross_ms
-            obj_terms = prompt_terms(self.settings.cross_check_object_prompt)
-            t_cross = time.perf_counter()
-            aux_raw = self.cross_check_engine.predict(frame)
-            cross_ms = (time.perf_counter() - t_cross) * 1000.0
-            accessories = [d for d in aux_raw if label_match(d.label, obj_terms)]
+                # No helmet frame → still emit per-person NO HELMET (not silent OK).
+                accessories = []
+            else:
+                obj_terms = prompt_terms(self.settings.cross_check_object_prompt)
+                t_cross = time.perf_counter()
+                # predict() only — never track() on the helmet model.
+                aux_raw = self.cross_check_engine.predict(frame)
+                cross_ms = (time.perf_counter() - t_cross) * 1000.0
+                accessories = [d for d in aux_raw if label_match(d.label, obj_terms)]
         cross_accessories = [
             CrossCheckDetection(d.label, float(d.conf), d.xyxy.copy()) for d in accessories
         ]
+        # Person bbox ∩ helmet bbox; no associated helmet → NO HELMET.
         cross_verdicts = evaluate_cross_check_batch(
             valid_dets,
             accessories,
-            kpt_conf=self.settings.pose_kpt_conf,
             min_intersection_px=self.settings.cross_check_min_intersection_px,
             min_iou=self.settings.cross_check_min_iou,
             frame_w=width,
@@ -338,40 +346,73 @@ class VideoProcessor:
                 )
             return None
 
-        max_gap = int(getattr(self.settings, "tracklet_link_max_gap_frames", 300))
-        min_sim = float(getattr(self.settings, "tracklet_link_min_sim", 0.60))
+        max_gap = int(getattr(self.settings, "tracklet_link_max_gap_frames", 0))
+        min_sim = float(getattr(self.settings, "tracklet_link_min_sim", 0.65))
         spatial_w = float(getattr(self.settings, "tracklet_link_spatial_weight", 0.15))
         use_reid = bool(getattr(self.settings, "tracklet_link_use_reid", True))
-        samples = int(getattr(self.settings, "tracklet_link_samples_per_tracklet", 5))
+        samples = int(getattr(self.settings, "tracklet_link_samples_per_tracklet", 8))
+        gap_label = "unlimited" if max_gap <= 0 else str(max_gap)
 
         missing_emb = sum(1 for t in tracklets if t.embedding is None)
-        temp_engine: ReidEngine | None = None
+        temp_engine = None
         embed_engine = self.reid_engine
         if use_reid and missing_emb > 0:
             if embed_engine is None:
                 reid_path = Path(self.settings.reid_model)
                 if reid_path.is_file():
                     try:
+                        backend = resolve_reid_backend(
+                            getattr(self.settings, "reid_backend", None),
+                            reid_path,
+                        )
                         if on_debug_log:
                             on_debug_log(
-                                "Tracklet link: loading OSNet for offline embeddings…"
+                                f"Tracklet link: loading {backend} for offline embeddings…"
                             )
-                        temp_engine = ReidEngine(
+                        # SOLIDER is PyTorch-only; OSNet may still use TRT when enabled.
+                        temp_engine = create_reid_engine(
                             reid_path,
+                            backend=backend,
                             device=getattr(self.settings, "inference_device", "cuda"),
                             use_amp=bool(self.settings.use_amp),
-                            use_tensorrt=bool(self.settings.use_tensorrt),
+                            use_tensorrt=bool(self.settings.use_tensorrt)
+                            and backend == "osnet",
                             tensorrt_fp16=bool(self.settings.tensorrt_fp16),
+                            tensorrt_engine_strategy=str(
+                                getattr(
+                                    self.settings, "tensorrt_engine_strategy", "central"
+                                )
+                                or "central"
+                            ),
+                            tensorrt_central_dir=getattr(
+                                self.settings, "tensorrt_central_dir", None
+                            ),
                         )
                         embed_engine = temp_engine
+                        if on_debug_log:
+                            dim = int(getattr(embed_engine, "feat_dim", 0) or 0)
+                            on_debug_log(
+                                f"Pass2 ReID backend={backend} dim={dim} "
+                                f"samples={samples} min_sim={min_sim} gap={gap_label}"
+                            )
                     except Exception as exc:
                         if on_debug_log:
-                            on_debug_log(f"Tracklet link: OSNet load failed: {exc}")
+                            on_debug_log(f"Tracklet link: ReID load failed: {exc}")
                 elif on_debug_log:
                     on_debug_log(
                         f"Tracklet link: ReID weights missing ({reid_path.name}); "
                         "appearance merge skipped"
                     )
+            elif on_debug_log:
+                backend = resolve_reid_backend(
+                    getattr(self.settings, "reid_backend", None),
+                    getattr(embed_engine, "source_model_path", self.settings.reid_model),
+                )
+                dim = int(getattr(embed_engine, "feat_dim", 0) or 0)
+                on_debug_log(
+                    f"Pass2 ReID backend={backend} dim={dim} "
+                    f"samples={samples} min_sim={min_sim} gap={gap_label}"
+                )
             if embed_engine is not None:
                 enrich_tracklets_from_video(
                     tracklets,
@@ -389,7 +430,7 @@ class VideoProcessor:
         if use_reid and not has_any_emb and on_debug_log:
             on_debug_log(
                 "Tracklet link: no embeddings available — "
-                "skipping (enable tracklet_link_use_reid + OSNet weights)"
+                "skipping (enable tracklet_link_use_reid + ReID weights)"
             )
             return None
 
@@ -405,7 +446,7 @@ class VideoProcessor:
             if on_debug_log:
                 on_debug_log(
                     f"Tracklet link: no merges "
-                    f"({result.n_tracklets_in} tracklets, gap≤{max_gap}, sim≥{min_sim})"
+                    f"({result.n_tracklets_in} tracklets, gap≤{gap_label}, sim≥{min_sim})"
                 )
             return {
                 "n_tracklets_in": result.n_tracklets_in,
@@ -528,6 +569,7 @@ class VideoProcessor:
                 if not v.ok and v.warning:
                     row["warning"] = v.warning
                 row["cross_check_intersection_px"] = round(v.best_intersection_px, 2)
+                # Legacy key: highlight (person∩helmet OK, person-top otherwise).
                 if v.head_xyxy is not None:
                     hx0, hy0, hx1, hy1 = [float(x) for x in v.head_xyxy.tolist()]
                     row["head_bbox_xyxy"] = [int(hx0), int(hy0), int(hx1), int(hy1)]
@@ -2093,6 +2135,19 @@ class VideoProcessor:
             "gpu_infer_sec": 0.0,
             "cpu_finalize_sec": 0.0,
         }
+        if on_debug_log:
+            gal = getattr(self.tracker, "gallery", None)
+            if gal is not None:
+                on_debug_log(
+                    "Identity gallery: CPU DB enabled "
+                    f"(min_sim={getattr(gal, 'min_sim', '?')}, "
+                    f"spill={'on' if getattr(gal, '_spill_path', None) else 'off'})"
+                )
+            gap = int(getattr(self.settings, "tracklet_link_max_gap_frames", 0))
+            on_debug_log(
+                "Pass2 tracklet gap="
+                + ("unlimited (full video)" if gap <= 0 else str(gap))
+            )
         if on_debug_log and getattr(self.settings, "reid_debug_log", False):
             on_debug_log(
                 "ReID debug: ON (new_id, id_switch, iou_recover, motion_iou, dup)"

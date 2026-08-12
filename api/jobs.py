@@ -53,23 +53,6 @@ def _path_under(child: Path, parent: Path) -> bool:
         return False
 
 
-def _stage_max_copy_bytes() -> int:
-    """Skip full copy for huge videos (5h+). Default 2 GiB."""
-    raw = os.environ.get("YOLO_DRT_STAGE_MAX_COPY_GB", "2").strip() or "2"
-    try:
-        gb = float(raw)
-    except ValueError:
-        gb = 2.0
-    if gb <= 0:
-        return 0  # never copy
-    return int(gb * (1024**3))
-
-
-def _videos_mount_dir() -> Path:
-    raw = os.environ.get("YOLO_DRT_VIDEOS_DIR", "/data/videos").strip() or "/data/videos"
-    return Path(raw)
-
-
 def stage_video_for_job(
     src: str | Path,
     *,
@@ -77,14 +60,11 @@ def stage_video_for_job(
     job_id: str,
 ) -> tuple[str, Path | None]:
     """
-    Optionally copy external path videos into work_dir/jobs/<id>/ for fast
-    local decode.
+    Copy external path videos into work_dir/jobs/<id>/ so windowed decode
+    hits the same local disk as typical UI / upload flows.
 
-    Large files (default >2 GiB) and files under /data/videos are opened
-    in place — copying a 5h video into the Docker volume often fails (disk /
-    timeout / «не грузится»).
-
-    Returns (path_to_open, staged_dir_or_None).
+    Returns (path_to_open, staged_dir_or_None). staged_dir is set only when
+    a copy was created (caller may delete after the job).
     """
     src_path = Path(src)
     if not src_path.is_file():
@@ -96,28 +76,11 @@ def stage_video_for_job(
     if _path_under(src_path, work):
         return str(src_path.resolve()), None
 
-    size = int(src_path.stat().st_size)
-    max_copy = _stage_max_copy_bytes()
-    videos_dir = _videos_mount_dir()
-    under_videos = videos_dir.exists() and _path_under(src_path, videos_dir)
-
-    # Long videos (5h+) and ./videos mount: decode in place — no multi‑GB copy.
-    if under_videos or (max_copy > 0 and size > max_copy) or max_copy == 0:
-        return str(src_path.resolve()), None
-
     stage_dir = work / "jobs" / job_id
     stage_dir.mkdir(parents=True, exist_ok=True)
     dest = stage_dir / src_path.name
-    if dest.exists() and dest.stat().st_size == size:
+    if dest.exists() and dest.stat().st_size == src_path.stat().st_size:
         return str(dest.resolve()), stage_dir
-    # Prefer hardlink (instant) when same filesystem; else copy.
-    try:
-        if dest.exists():
-            dest.unlink()
-        os.link(src_path, dest)
-        return str(dest.resolve()), stage_dir
-    except OSError:
-        pass
     shutil.copy2(src_path, dest)
     return str(dest.resolve()), stage_dir
 
@@ -279,34 +242,6 @@ class JobManager:
         job.cancel()
         return job
 
-    def latest(self) -> JobState | None:
-        with self._lock:
-            if not self._jobs:
-                return None
-            return max(self._jobs.values(), key=lambda j: float(j.created_at or 0.0))
-
-    def list_jobs(self, *, limit: int = 20) -> list[JobState]:
-        with self._lock:
-            jobs = sorted(
-                self._jobs.values(),
-                key=lambda j: float(j.created_at or 0.0),
-                reverse=True,
-            )
-        return jobs[: max(1, int(limit))]
-
-    def cancel_latest(self) -> JobState | None:
-        job = self.latest()
-        if job is None:
-            return None
-        return self.cancel(job.job_id)
-
-    def active_job(self) -> JobState | None:
-        with self._lock:
-            running = [j for j in self._jobs.values() if j.status in ("queued", "running")]
-        if not running:
-            return None
-        return max(running, key=lambda j: float(j.created_at or 0.0))
-
     def _worker_loop(self) -> None:
         while True:
             job_id = self._queue.get()
@@ -380,8 +315,6 @@ class JobManager:
             )
             if staged_dir is not None:
                 job.debug_logs.append(f"Staged input → {video_path}")
-            else:
-                job.debug_logs.append(f"Decode in place (no copy): {video_path}")
             job.progress_slot.force(0, 0, "inference")
             if not job.bench_mode:
                 job.progress = job.materialize_progress()
@@ -447,7 +380,12 @@ class JobManager:
         finally:
             if processor is not None:
                 try:
-                    gpu_stats = soft_cleanup_after_job(processor)
+                    gpu_stats = soft_cleanup_after_job(
+                        processor,
+                        unload_pass2_reid=False,
+                        unload_cross_check=False,
+                        flush_cuda_cache=True,
+                    )
                     before = float(gpu_stats.get("before_mb") or 0.0)
                     after = float(gpu_stats.get("after_mb") or 0.0)
                     freed = float(gpu_stats.get("freed_mb") or 0.0)
@@ -455,8 +393,10 @@ class JobManager:
                     reserved_before = float(gpu_stats.get("reserved_before_mb") or 0.0)
                     reserved_freed = float(gpu_stats.get("reserved_freed_mb") or 0.0)
                     job.debug_logs.append(
-                        f"GPU cleanup: warm TRT kept (alloc {before:.0f} MB, "
-                        f"reserved {reserved:.0f} MB) — restart API for full VRAM release"
+                        "GPU cleanup after job: "
+                        f"alloc {before:.0f}->{after:.0f} MB (freed {freed:.0f}), "
+                        f"reserved {reserved_before:.0f}->{reserved:.0f} MB "
+                        f"(freed {reserved_freed:.0f}); TRT keep-warm"
                     )
                 except Exception as exc:
                     job.debug_logs.append(f"GPU cleanup failed: {exc}")

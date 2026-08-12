@@ -2,7 +2,7 @@
 
 Один контейнер **`yolo-drt-api`**: FastAPI + ядро пайплайна (`api/` + `app/`). GPU inference, очередь job'ов, результаты на диск.
 
-Образ: **`yolo-drt-api:V0.5`** (тег в `docker-compose.yml`).
+Образ: **`yolo-drt-api:latest`** (тег в `docker-compose.yml`). Краткие команды пересборки: **[BUILD.md](BUILD.md)**.
 
 ---
 
@@ -18,6 +18,8 @@
 
 Порт контейнера: **8080**. Swagger: http://localhost:8080/docs
 
+**Identity / ReID = person only.** Helmet (`helmet-26m.pt`) is a per-frame cross-check accessory detector (person∩helmet; missing det → `NO HELMET`) — no track IDs, no ReID embeds.
+
 ---
 
 ## Требования на хосте
@@ -25,9 +27,10 @@
 - **Docker** + **Docker Compose**
 - **NVIDIA Container Toolkit** (`runtime: nvidia`, одна GPU)
 - Перед `docker compose build` — веса в `YOLO_DOCKER/models/`:
-  - `YOLO/yolo26x-pose.pt`
-  - `YOLO/Helmet/helmet-26m.pt`
-  - `RD/osnet_ain_x1_0_…pth`
+  - `YOLO/yolo26x.pt` (person bbox detect; legacy pose: `YOLO/yolo26x-pose.pt` optional)
+  - `YOLO/Helmet/helmet-26m.pt` (helmet accessories — not tracked / not ReID)
+  - `RD/solider_swin_small_msmt17.pth` (person Pass2 / re-entry; default)
+  - optional rollback: `RD/osnet_ain_x1_0_…pth`
   - по желанию готовые TRT: `models/TRT/*.engine` (иначе соберутся при первом старте внутри контейнера)
 
 ---
@@ -37,7 +40,7 @@
 ```bash
 cd YOLO_DOCKER
 docker compose build
-docker compose up -d
+docker compose up -d --force-recreate yolo-drt-api
 docker compose logs -f yolo-drt-api   # первый старт: возможна долгая сборка TRT
 curl http://localhost:8080/health
 ```
@@ -45,8 +48,8 @@ curl http://localhost:8080/health
 Остановка:
 
 ```bash
-docker compose down          # volume yolo_work сохраняется
-docker compose down -v       # + удалить yolo_work (uploads/staging)
+docker compose down          # volume yolo_work / yolo_trt сохраняются
+docker compose down -v       # + удалить named volumes (uploads/staging/TRT)
 ```
 
 Пересборка после смены кода или моделей:
@@ -54,7 +57,7 @@ docker compose down -v       # + удалить yolo_work (uploads/staging)
 ```bash
 cd YOLO_DOCKER
 docker compose build         # --no-cache если меняли models/ или Dockerfile
-docker compose up -d
+docker compose up -d --force-recreate yolo-drt-api
 ```
 
 ---
@@ -116,10 +119,12 @@ JSON: `GET /v1/admin/status`, отмена `POST /v1/admin/jobs/latest/cancel`, 
 
 | Параметр | Значение |
 |----------|----------|
-| Pass 1 ID | SAM identity (memory), без live OSNet |
-| Pass 2 | Offline tracklet link + OSNet |
+| Pass 1 ID | SAM identity + **CPU identity gallery** (SQLite spill); SOLIDER re-entry без хранения эмбеддингов в VRAM |
+| Pass 2 | Offline tracklet link + SOLIDER, **gap=unlimited** (весь ролик) |
+| Rollback Pass2 | `YOLO_DRT_REID_BACKEND=osnet` + OSNet `.pth` in `models/RD/` |
 | Кадры | `windowed`, batch **64**, TRT max batch **32** |
-| Каска | cross-check helmet, сглаживание нарушений |
+| Каска | person∩helmet cross-check (no ReID on helmet), сглаживание нарушений |
+| WEB clip-by-ID | host `WEB_app/` — clips/reports per person `stable_id` (not in API image) |
 | RAM (host в контейнере) | smart budget **10 GB**, окно до **4 GB**, preload cap **12 GB** |
 
 Полный список env — `.env.example` и блок `environment:` в `docker-compose.yml`.
@@ -150,6 +155,7 @@ environment:
 YOLO_DOCKER/
   Dockerfile
   docker-compose.yml
+  BUILD.md             → rebuild / recreate commands
   requirements-api.txt
   .env.example
   models/              → COPY в образ → /data/models
@@ -157,6 +163,7 @@ YOLO_DOCKER/
   app/                 → ядро pipeline
   api/                 → FastAPI
   config/              → ui_fast_profile.json
+  WEB_app/             → host UI (clip-by-ID); not in API image
   notebooks/           → docker_api_benchmark.ipynb
 ```
 
@@ -180,3 +187,14 @@ YOLO_DOCKER/
 
 - Swagger: http://localhost:8080/docs
 - TensorRT / batch по VRAM: `../models/TRT/TENSORRT_INSTRUCTIONS.md`
+
+## SOLIDER Pass2 ReID weights
+
+Download MSMT17 Swin-S checkpoint into `models/RD/solider_swin_small_msmt17.pth` (also under `YOLO_DOCKER/models/RD/` before image build):
+
+```bash
+python -m gdown "https://drive.google.com/uc?id=1C-aIZdFyjFsZX4W4feG-Ex39RU2Qvu3b" -O models/RD/solider_swin_small_msmt17.pth
+```
+
+Rollback to OSNet: `YOLO_DRT_REID_BACKEND=osnet` and point `YOLO_DRT_REID_MODEL` at the OSNet `.pth`.
+

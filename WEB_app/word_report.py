@@ -22,6 +22,7 @@ from WEB_app.video_builder import (
     stamp_all_people_boxes_rgb,
     stamp_all_poses_rgb,
     stamp_debug_hud_rgb,
+    stamp_helmet_accessories_rgb,
     web_debug_show_all_dets,
 )
 
@@ -245,10 +246,6 @@ def render_person_frame_rgb(
     if debug_all:
         # Full scene for debug; still require this ID to be present.
         draw_packet = packet
-        force_hl = True
-        if prefer_violation:
-            viol = filter_violator_single_id(packet, stable_id)
-            force_hl = viol.n_inst > 0
     else:
         filtered = (
             filter_violator_single_id(packet, stable_id)
@@ -258,7 +255,6 @@ def render_person_frame_rgb(
         if filtered.n_inst <= 0:
             filtered = person
         draw_packet = filtered
-        force_hl = False
 
     prompt = str(meta.get("prompt") or "person").strip().casefold() or "person"
     ctx = _RenderContext(
@@ -269,36 +265,45 @@ def render_person_frame_rgb(
     )
     job = _EncodeJob(src_i=int(frame_idx), carry=draw_packet, frame_bgr=frame_bgr)
     _, rgb = _render_encode_job(job, ctx)
-    if debug_all:
+    pkt = replace(draw_packet, frame_idx=int(frame_idx))
+    # Stills prioritize person + helmet boxes; pose only if enabled and keypoints exist.
+    rgb = stamp_all_people_boxes_rgb(
+        rgb,
+        pkt,
+        target_w=ctx.target_w,
+        target_h=ctx.target_h,
+        focus_sid=int(stable_id),
+    )
+    rgb = stamp_helmet_accessories_rgb(
+        rgb,
+        pkt,
+        target_w=ctx.target_w,
+        target_h=ctx.target_h,
+    )
+    if bool(overlay.get("draw_pose", False)):
         rgb = stamp_all_poses_rgb(
             rgb,
-            replace(draw_packet, frame_idx=int(frame_idx)),
+            pkt,
             target_w=ctx.target_w,
             target_h=ctx.target_h,
             pose_kpt_conf=float(overlay.get("pose_kpt_conf", 0.25)),
             pose_point_radius=int(overlay.get("pose_point_radius", 6) or 6),
             pose_line_thickness=int(overlay.get("pose_line_thickness", 3) or 3),
         )
-        rgb = stamp_all_people_boxes_rgb(
-            rgb,
-            replace(draw_packet, frame_idx=int(frame_idx)),
-            target_w=ctx.target_w,
-            target_h=ctx.target_h,
-            focus_sid=int(stable_id),
-        )
-        rgb = highlight_no_helmet_on_rgb(
-            rgb,
-            replace(draw_packet, frame_idx=int(frame_idx)),
-            int(stable_id),
-            target_w=ctx.target_w,
-            target_h=ctx.target_h,
-            frame_bgr=frame_bgr,
-            force=force_hl,
-        )
+    rgb = highlight_no_helmet_on_rgb(
+        rgb,
+        pkt,
+        int(stable_id),
+        target_w=ctx.target_w,
+        target_h=ctx.target_h,
+        frame_bgr=frame_bgr,
+        force=True,
+    )
+    if debug_all:
         rgb = stamp_debug_hud_rgb(
             rgb,
-            replace(draw_packet, frame_idx=int(frame_idx)),
-            draw_pose=bool(overlay.get("draw_pose", True)),
+            pkt,
+            draw_pose=bool(overlay.get("draw_pose", False)),
         )
     return _annotate_stable_id(rgb, int(stable_id), int(frame_idx))
 

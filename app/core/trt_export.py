@@ -489,7 +489,10 @@ def build_all_engines(
     *,
     log: LogFn | None = None,
 ) -> list[TrtBuildResult]:
-    """Собрать .engine для detect, cross-check (helmet), ReID."""
+    """Собрать .engine для detect, cross-check (helmet), ReID (person OSNet).
+
+    Helmet/cross-check TRT is detect-only inference — never used for track/ReID.
+    """
     strategy = str(settings.tensorrt_engine_strategy)
     central_dir = Path(settings.models_dir) / "TRT"
     manifest_dir = Path(settings.tensorrt_manifest_dir)
@@ -510,12 +513,17 @@ def build_all_engines(
     specs: list[tuple[str, Path]] = [("detect", Path(settings.detect_model))]
     if settings.cross_check_enabled and settings.cross_check_model is not None:
         specs.append(("cross_check", Path(settings.cross_check_model)))
+    from app.core.reid_engine import resolve_reid_backend
     from app.core.sam_memory_tracker import needs_osnet_embed
 
-    # OSNet TRT only when live embeds are required (classic ReID / SAM re-entry).
-    # Pass 2 can load .pth on demand without a prebuilt engine.
-    if needs_osnet_embed(settings):
+    # OSNet TRT only when live embeds need OSNet (not SOLIDER — PyTorch-only).
+    reid_backend = resolve_reid_backend(
+        getattr(settings, "reid_backend", None), settings.reid_model
+    )
+    if needs_osnet_embed(settings) and reid_backend == "osnet":
         specs.append(("reid", Path(settings.reid_model)))
+    elif needs_osnet_embed(settings):
+        _log(log, f"ReID TRT пропуск: backend={reid_backend} (SOLIDER = PyTorch-only)")
 
     _log(
         log,
@@ -690,7 +698,7 @@ def write_instructions(settings: PipelineSettings, *, trt_dir: Path | None = Non
 
 ## Быстрый способ (UI)
 
-1. Выбери модели на вкладке Pipeline (detect = **yolo26x-pose.pt**, cross = **helmet-26m.pt**, ReID = OSNet .pth).
+1. Выбери модели на вкладке Pipeline (detect = **yolo26x.pt**, cross = **helmet-26m.pt**, ReID = OSNet .pth).
 2. Нажми **«Собрать TensorRT engines»** — создаст `.engine` и этот файл.
 3. Включи галочку **«Использовать TensorRT»**.
 4. **Init engines** → **Run**.

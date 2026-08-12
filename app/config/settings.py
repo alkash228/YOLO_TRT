@@ -34,19 +34,27 @@ def _default_upload_dir() -> Path:
 
 UPLOAD_DIR = _default_upload_dir()
 
+# Default person detector: Ultralytics YOLO detect (bbox), not pose.
+# Place weights at models/YOLO/yolo26x.pt (repo also has a copy at PROJECT_ROOT/yolo26x.pt).
+DEFAULT_DETECT_MODEL = YOLO_DIR / "yolo26x.pt"
+# Optional legacy pose weights (keypoints optional; cross-check no longer requires them).
 DEFAULT_DETECT_POSE = YOLO_DIR / "yolo26x-pose.pt"
 DEFAULT_HELMET_MODEL = YOLO_HELMET_DIR / "helmet-26m.pt"
 
 OSNET_FILENAME = (
     "osnet_ain_x1_0_msmt17_256x128_amsgrad_ep50_lr0.0015_coslr_b64_fb10_softmax_labsmth_flip_jitter.pth"
 )
+SOLIDER_FILENAME = "solider_swin_small_msmt17.pth"
 
 
 @dataclass(slots=True)
 class PipelineSettings:
-    detect_model: Path = field(default_factory=lambda: DEFAULT_DETECT_POSE)
+    detect_model: Path = field(default_factory=lambda: DEFAULT_DETECT_MODEL)
     seg_model: Path = field(default_factory=lambda: YOLO_SEG_DIR / "yolo26x-seg.pt")
-    reid_model: Path = field(default_factory=lambda: RD_DIR / OSNET_FILENAME)
+    # Default Pass2 ReID: SOLIDER Swin-S (rollback: reid_backend=osnet + OSNET weights).
+    reid_model: Path = field(default_factory=lambda: RD_DIR / SOLIDER_FILENAME)
+    # osnet | solider | auto (filename heuristic)
+    reid_backend: str = "solider"
     output_dir: Path = field(default_factory=lambda: OUTPUT_DIR)
     # Docker: /data/models; host: PROJECT_ROOT/models
     models_dir: Path = field(default_factory=lambda: MODELS_DIR)
@@ -69,27 +77,37 @@ class PipelineSettings:
     sam_identity_backend: str = "memory"  # memory | mock | ultralytics_sam2
     sam_model: Path | None = None
     sam_match_iou: float = 0.30
-    # If True and use_reid: OSNet only for long-lost re-entry (not frame-to-frame).
-    sam_osnet_reentry: bool = False
-    sam_osnet_reentry_thresh: float = 0.70
-    sam_osnet_reentry_min_miss: int = 30
+    # If True: SOLIDER/OSNet only for long-lost re-entry (not frame-to-frame).
+    # Default on — returning workers keep the same ID without waiting for Pass2.
+    sam_osnet_reentry: bool = True
+    sam_osnet_reentry_thresh: float = 0.65
+    sam_osnet_reentry_min_miss: int = 15
+    # CPU identity "DB" for full-video leave/return (numpy + optional SQLite spill).
+    # Does not keep embeddings in VRAM — only current crop batch hits the GPU model.
+    identity_gallery_enabled: bool = True
+    identity_gallery_min_sim: float = 0.65
+    identity_gallery_ema_alpha: float = 0.35
+    identity_gallery_spill: bool = True
     # Offline Pass 2: re-merge F2F tracklets after long occlusions (full-video only).
     # Does not change live SamMemoryTracker / ReidTracker matching.
     # Enabled by default: Pass 2 keeps long-gap identity merging without slowing
     # the per-frame live tracker.
     use_offline_tracklet_link: bool = True
-    tracklet_link_max_gap_frames: int = 300
-    tracklet_link_min_sim: float = 0.60
-    # Load/use OSNet only for this pass when embeddings were not stored in Pass 1.
+    # 0 = unlimited (full video). Positive = max frames between tracklets to merge.
+    tracklet_link_max_gap_frames: int = 0
+    tracklet_link_min_sim: float = 0.65
+    # Load/use ReID only for this pass when embeddings were not stored in Pass 1.
     tracklet_link_use_reid: bool = True
-    tracklet_link_samples_per_tracklet: int = 5
+    tracklet_link_samples_per_tracklet: int = 8
     tracklet_link_spatial_weight: float = 0.15
     match_iou_min: float = 0.45
     seg_fallback_iou_min: float = 0.25
 
     # Active-track Hungarian / motion continuity appearance floor (cosine).
     appearance_thresh: float = 0.55
-    track_buffer: int = 300
+    # Active→lost demote window. 0 = full video (never purge lost IDs; same idea as
+    # tracklet_link_max_gap_frames=0). Positive = frames before demote + TTL purge.
+    track_buffer: int = 0
     # Lost-track re-ID by appearance alone (same-PPE lookalikes need this high).
     recovery_thresh: float = 0.50
     # Center distance / avg bbox diagonal; above + IoU≈0 → spatial_gap (pan to other person).
@@ -136,7 +154,8 @@ class PipelineSettings:
     draw_boxes: bool = True
     draw_masks: bool = True
     draw_centers: bool = True
-    draw_pose: bool = True
+    # Pose overlay only when detect model yields keypoints (off by default for bbox detect).
+    draw_pose: bool = False
     pose_kpt_conf: float = 0.25
     preview_every_n: int = 5
 
@@ -226,6 +245,11 @@ class PipelineSettings:
     tensorrt_rebuild_policy: str = "missing_only"  # missing_only | always
     tensorrt_manifest_dir: Path = field(default_factory=lambda: TRT_DIR)
 
+    # Helmet cross-check: person bbox ∩ helmet bbox (not pose-head).
+    # Accessories-only path: helmet-26m.pt is predict() per frame — no BoT-SORT,
+    # no ReID embed, no stable_id. Identity (SAM / SOLIDER / OSNet) is person-only.
+    # OK only if a helmet det intersects the person (area and/or IoU);
+    # missing/non-overlapping helmet → NO HELMET (not left as OK).
     cross_check_enabled: bool = False
     cross_check_model: Path | None = field(default_factory=lambda: DEFAULT_HELMET_MODEL)
     cross_check_object_prompt: str = "helmet"
@@ -236,6 +260,7 @@ class PipelineSettings:
     cross_check_min_violation_streak: int = 2
     cross_check_verdict_history: int = 5
     cross_check_warning_text: str = "NO HELMET"
+    # Draw highlight region (person∩helmet when OK, person-top when NO HELMET).
     cross_check_draw_head_box: bool = True
     cross_check_draw_boxes: bool = True
 

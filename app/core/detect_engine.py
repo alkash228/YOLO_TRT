@@ -1,4 +1,4 @@
-"""YOLO26x detect + BoT-SORT track / batched predict."""
+"""YOLO detect (bbox; pose optional) + BoT-SORT track / batched predict."""
 from __future__ import annotations
 
 from dataclasses import dataclass

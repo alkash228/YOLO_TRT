@@ -78,9 +78,14 @@ def _bootstrap() -> None:
         return
 
     central = Path(_settings.models_dir) / "TRT"
+    from app.core.reid_engine import resolve_reid_backend
     from app.core.sam_memory_tracker import needs_osnet_embed
 
-    need_osnet = needs_osnet_embed(_settings)
+    # SOLIDER is PyTorch-only — do not require an OSNet-style .engine for it.
+    reid_backend = resolve_reid_backend(
+        getattr(_settings, "reid_backend", None), _settings.reid_model
+    )
+    need_reid_trt = bool(needs_osnet_embed(_settings)) and reid_backend == "osnet"
     if _settings.use_tensorrt:
         _engines_ready_map = engines_ready(
             detect_pt=Path(_settings.detect_model),
@@ -90,7 +95,7 @@ def _bootstrap() -> None:
             max_batch=int(_settings.tensorrt_max_batch),
             fp16=bool(_settings.tensorrt_fp16),
             need_cross=bool(_settings.cross_check_enabled),
-            need_reid=need_osnet,
+            need_reid=need_reid_trt,
             strategy=str(_settings.tensorrt_engine_strategy),
             central_dir=central,
         )
@@ -106,7 +111,7 @@ def _bootstrap() -> None:
                 max_batch=int(_settings.tensorrt_max_batch),
                 fp16=bool(_settings.tensorrt_fp16),
                 need_cross=bool(_settings.cross_check_enabled),
-                need_reid=need_osnet,
+                need_reid=need_reid_trt,
                 strategy=str(_settings.tensorrt_engine_strategy),
                 central_dir=central,
             )
@@ -116,10 +121,25 @@ def _bootstrap() -> None:
     _log("Загрузка processor...")
     _processor = build_processor(_settings, warmup=True, on_log=_log)
     job_manager.set_processor(_processor, _settings)
+    # Keep api.server_state in sync — jobs.py prefers it when the module exists.
+    try:
+        from api.server_state import server_state
+        from app.core.shared_processor import attach as shared_attach
+
+        server_state.configure(_settings)
+        shared_attach(_processor, _settings, "api")
+        with server_state._lock:
+            server_state.processor = _processor
+            server_state.status = "ready"
+            server_state.engines_ready = dict(_engines_ready_map)
+        job_manager.set_processor(_processor, _settings)
+    except Exception as exc:  # noqa: BLE001
+        _log(f"server_state sync skipped: {exc}")
     _app_status = "ready"
     identity = (
         f"sam={_settings.use_sam_identity} reid={_settings.use_reid} "
-        f"tracklet_link={_settings.use_offline_tracklet_link}"
+        f"tracklet_link={_settings.use_offline_tracklet_link} "
+        f"reid_backend={reid_backend}"
     )
     _log(f"Сервис готов ({identity})")
 

@@ -266,7 +266,7 @@ def _render_encode_job(job: _EncodeJob, ctx: _RenderContext) -> tuple[int, np.nd
         draw_boxes=bool(ctx.overlay.get("draw_boxes", True)),
         draw_masks=bool(ctx.overlay.get("draw_masks", True)),
         draw_centers=bool(ctx.overlay.get("draw_centers", True)),
-        draw_pose=bool(ctx.overlay.get("draw_pose", True)),
+        draw_pose=bool(ctx.overlay.get("draw_pose", False)),
         pose_kpt_conf=float(ctx.overlay.get("pose_kpt_conf", 0.25)),
         cross_check_enabled=bool(ctx.overlay.get("cross_check_enabled", False)),
         cross_check_draw_head_box=bool(ctx.overlay.get("cross_check_draw_head_box", True)),

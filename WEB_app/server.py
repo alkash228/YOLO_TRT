@@ -29,6 +29,17 @@ WEB_APP_DIR = Path(__file__).resolve().parent
 WEB_OUTPUT_DIR = WEB_APP_DIR / "output"
 
 
+def _httpx_client(**kwargs: Any) -> httpx.Client:
+    """Local API must not go through Windows/system HTTP proxy (often 127.0.0.1:10809)."""
+    kwargs.setdefault("trust_env", False)
+    return httpx.Client(**kwargs)
+
+
+def _httpx_async_client(**kwargs: Any) -> httpx.AsyncClient:
+    kwargs.setdefault("trust_env", False)
+    return httpx.AsyncClient(**kwargs)
+
+
 _env_api = os.environ.get("YOLO_DRT_API_URL", "").strip()
 WEB_HOST = os.environ.get("WEB_APP_HOST", "0.0.0.0")
 WEB_PORT = int(os.environ.get("WEB_APP_PORT", "8088"))
@@ -59,7 +70,7 @@ def _normalize_api_url(raw: str) -> str:
 def _probe_api(url: str) -> tuple[bool, str]:
     """Return (ok, status_string). ok=True on HTTP 200 /health."""
     try:
-        with httpx.Client(timeout=2.0) as client:
+        with _httpx_client(timeout=2.0) as client:
             response = client.get(f"{url.rstrip('/')}/health")
             if response.status_code != 200:
                 return False, ""
@@ -385,7 +396,7 @@ def _materialize_run_from_api(job_id: str, *, run_id_hint: str | None = None) ->
     if not job_id:
         raise ValueError("job_id required")
     base = api_base()
-    with httpx.Client(timeout=300.0) as client:
+    with _httpx_client(timeout=300.0) as client:
         art = client.get(f"{base}/v1/jobs/{job_id}/artifacts")
         if art.status_code >= 400:
             raise RuntimeError(f"API artifacts {art.status_code}: {art.text[:300]}")
@@ -647,7 +658,8 @@ class WordReportResponse(BaseModel):
 
 class SettingsUpdateProxy(BaseModel):
     settings: dict[str, Any] = Field(default_factory=dict)
-    reload_processor: bool = True
+    # Default False: never rebuild GPU load on profile sync (was causing double TRT load).
+    reload_processor: bool = False
     ui_equivalent: bool = False
 
 
@@ -783,7 +795,7 @@ async def proxy_health() -> dict[str, Any]:
     base = api_base()
     url = f"{base}/health"
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        async with _httpx_async_client(timeout=10.0) as client:
             r = await client.get(url)
             r.raise_for_status()
             data = r.json()
@@ -807,7 +819,7 @@ async def proxy_get_settings() -> dict[str, Any]:
     """Desktop API has /v1/settings; Docker API uses env — soft-fallback."""
     url = f"{api_base()}/v1/settings"
     try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        async with _httpx_async_client(timeout=30.0) as client:
             r = await client.get(url)
             if r.status_code == 404:
                 return {
@@ -826,7 +838,7 @@ async def proxy_get_settings() -> dict[str, Any]:
 async def proxy_put_settings(body: SettingsUpdateProxy) -> dict[str, Any]:
     url = f"{api_base()}/v1/settings"
     try:
-        async with httpx.AsyncClient(timeout=600.0) as client:
+        async with _httpx_async_client(timeout=600.0) as client:
             r = await client.put(url, json=body.model_dump())
             if r.status_code == 404:
                 # Docker: profile already baked in compose — accept and continue.
@@ -846,7 +858,7 @@ async def proxy_put_settings(body: SettingsUpdateProxy) -> dict[str, Any]:
 async def proxy_models() -> dict[str, Any]:
     url = f"{api_base()}/v1/models"
     try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        async with _httpx_async_client(timeout=30.0) as client:
             r = await client.get(url)
             if r.status_code == 404:
                 return {"detect": [], "seg": [], "reid": [], "docker_mode": True}
@@ -863,7 +875,7 @@ async def proxy_bootstrap(body: BootstrapProxy | None = None) -> dict[str, Any]:
     url = f"{api_base()}/v1/admin/bootstrap"
     force = bool(body.force) if body is not None else False
     try:
-        async with httpx.AsyncClient(timeout=600.0) as client:
+        async with _httpx_async_client(timeout=600.0) as client:
             r = await client.post(url, json={"force": force})
             if r.status_code == 404:
                 hr = await client.get(f"{api_base()}/health")
@@ -884,7 +896,7 @@ async def proxy_bootstrap(body: BootstrapProxy | None = None) -> dict[str, Any]:
 async def proxy_build_trt() -> dict[str, Any]:
     url = f"{api_base()}/v1/admin/build-trt"
     try:
-        async with httpx.AsyncClient(timeout=3600.0) as client:
+        async with _httpx_async_client(timeout=3600.0) as client:
             r = await client.post(url)
             if r.status_code == 404:
                 return {
@@ -912,7 +924,7 @@ async def proxy_upload(
         data["max_duration_seconds"] = str(max_duration_seconds)
     files = {"file": (file.filename or "video.mp4", content, file.content_type or "video/mp4")}
     try:
-        async with httpx.AsyncClient(timeout=600.0) as client:
+        async with _httpx_async_client(timeout=600.0) as client:
             r = await client.post(url, data=data, files=files)
             if r.status_code >= 400:
                 raise HTTPException(r.status_code, r.text)
@@ -925,7 +937,7 @@ async def proxy_upload(
 async def proxy_job(job_id: str) -> dict[str, Any]:
     url = f"{api_base()}/v1/jobs/{job_id}"
     try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        async with _httpx_async_client(timeout=30.0) as client:
             r = await client.get(url)
             if r.status_code >= 400:
                 raise HTTPException(r.status_code, r.text)

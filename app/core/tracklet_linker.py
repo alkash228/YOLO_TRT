@@ -205,7 +205,8 @@ def pair_link_score(
     if a.end_frame >= b.start_frame:
         return None
     gap = temporal_gap(a, b)
-    if gap > int(max_gap_frames):
+    # max_gap_frames <= 0 → full-video / unlimited temporal window
+    if int(max_gap_frames) > 0 and gap > int(max_gap_frames):
         return None
 
     app = 0.0
@@ -218,7 +219,8 @@ def pair_link_score(
         return None
     else:
         # Spatial-only fallback: require small gap and close centers
-        if gap > max(5, int(max_gap_frames) // 20):
+        soft_cap = 5 if int(max_gap_frames) <= 0 else max(5, int(max_gap_frames) // 20)
+        if gap > soft_cap:
             return None
         app = float(min_sim)
 
@@ -230,7 +232,9 @@ def pair_link_score(
         diag = 0.5 * (_bbox_diag(a.bboxes_xyxy[-1]) + _bbox_diag(b.bboxes_xyxy[0]))
         spatial_pen = min(1.0, dist / max(1.0, diag)) * float(spatial_weight)
 
-    gap_pen = (gap / max(1.0, float(max_gap_frames))) * float(gap_weight)
+    gap_pen = 0.0
+    if int(max_gap_frames) > 0:
+        gap_pen = (gap / max(1.0, float(max_gap_frames))) * float(gap_weight)
     return float(app - gap_pen - spatial_pen)
 
 
@@ -382,7 +386,7 @@ def enrich_tracklets_from_video(
     video_path: str | Path,
     embed_fn: Callable[[list[np.ndarray]], np.ndarray],
     *,
-    samples_per_tracklet: int = 5,
+    samples_per_tracklet: int = 8,
     pad: float = 0.05,
     on_log: Callable[[str], None] | None = None,
 ) -> int:
@@ -418,6 +422,7 @@ def enrich_tracklets_from_video(
     from app.core.reid_engine import ReidEngine
 
     crops_by_ti: dict[int, list[np.ndarray]] = defaultdict(list)
+    rejected = 0
     # Single jump to first needed frame, then only forward reads.
     start_fi = int(targets[0])
     if start_fi > 0:
@@ -435,9 +440,14 @@ def enrich_tracklets_from_video(
         ok, frame_bgr = cap.read()
         if not ok or frame_bgr is None:
             break
+        fh, fw = int(frame_bgr.shape[0]), int(frame_bgr.shape[1])
         for ti, xyxy in by_frame[want]:
             crop = ReidEngine.crop_from_bbox(frame_bgr, xyxy, pad=pad)
             if crop is None or crop.size == 0:
+                rejected += 1
+                continue
+            if not ReidEngine.crop_quality_ok(fh, fw, xyxy, crop):
+                rejected += 1
                 continue
             crops_by_ti[ti].append(crop)
         cur = want + 1
@@ -456,6 +466,7 @@ def enrich_tracklets_from_video(
             continue
         if embs is None or len(embs) == 0:
             continue
+        # Mean of quality-passed sample embeds, then L2.
         mean = np.mean(np.asarray(embs, dtype=np.float32), axis=0)
         need[ti].embedding = _normalize_embedding(mean)
         if need[ti].embedding is not None:
@@ -463,7 +474,9 @@ def enrich_tracklets_from_video(
     if on_log:
         on_log(
             f"Tracklet link: computed embeddings for {filled}/{len(need)} tracklets "
-            f"({samples_per_tracklet} samples/tracklet)"
+            f"({samples_per_tracklet} samples/tracklet"
+            + (f", rejected_crops={rejected}" if rejected else "")
+            + ")"
         )
     return filled
 

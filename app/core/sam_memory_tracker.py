@@ -3,10 +3,12 @@ SAM-style identity: masklet / memory-bank association for stable object_id.
 
 Architecture (hybrid YOLO + SAM identity)
 ----------------------------------------
-1. YOLO (pose/detect + optional seg + helmet cross-check) stays the *speed* path.
+1. YOLO person detect (+ optional seg) is the *speed* path for boxes/track IDs.
+   Helmet cross-check is a separate per-frame accessory detector — not identity.
 2. Frame-to-frame identity uses masklet memory (IoU + motion_id), NOT OSNet gallery
-   thresholds. This mirrors SAM2/SAM3 video masklet association.
-3. OSNet is optional and only for long re-entry (`sam_osnet_reentry=True`).
+   thresholds. This mirrors SAM2/SAM3 video masklet association. Person-only.
+3. OSNet/SOLIDER is optional and only for person long re-entry / Pass2
+   (`sam_osnet_reentry=True` / tracklet link) — never applied to helmet boxes.
 4. Real SAM2/SAM3 neural memory (`backend=ultralytics_sam2` / parent `sam3` weights)
    is a drop-in upgrade behind the same update() API; default `memory` works offline.
 5. Default: `use_sam_identity=True` → SamMemoryTracker; `False` keeps OSNet ReidTracker.
@@ -37,6 +39,7 @@ import numpy as np
 
 from app.core.detect_engine import DetectItem
 from app.core.fusion import box_iou
+from app.core.identity_gallery import IdentityGallery
 from app.core.reid_tracker import TrackerUpdateResult
 
 
@@ -102,14 +105,15 @@ def uses_stable_identity(settings: Any) -> bool:
 
 def needs_osnet_embed(settings: Any) -> bool:
     """
-    OSNet crops/embed only when classic ReID is on, or SAM asks for long re-entry.
-    F2F SAM identity does not need OSNet.
+    ReID crops/embed when classic ReID is on, or SAM asks for long re-entry.
+    F2F SAM identity does not need embeddings for IoU/masklet matching.
     """
+    if bool(getattr(settings, "use_reid", False)):
+        return True
     if uses_sam_identity(settings):
-        return bool(getattr(settings, "sam_osnet_reentry", False)) and bool(
-            getattr(settings, "use_reid", False)
-        )
-    return bool(getattr(settings, "use_reid", False))
+        # Re-entry must not also require use_reid — that flag means classic ReidTracker.
+        return bool(getattr(settings, "sam_osnet_reentry", False))
+    return False
 
 
 class SamMemoryTracker:
@@ -130,6 +134,7 @@ class SamMemoryTracker:
         osnet_reentry_thresh: float = 0.70,
         osnet_reentry_min_miss: int = 30,
         backend: str = "memory",
+        identity_gallery: IdentityGallery | None = None,
     ) -> None:
         self.match_iou = float(match_iou)
         self.track_buffer = int(track_buffer)
@@ -138,6 +143,8 @@ class SamMemoryTracker:
         self.osnet_reentry_thresh = float(osnet_reentry_thresh)
         self.osnet_reentry_min_miss = int(osnet_reentry_min_miss)
         self.backend = str(backend or "memory")
+        # CPU gallery survives full video; short-term _lost is only for IoU recover.
+        self.gallery = identity_gallery
         self._masklets: dict[int, MaskletState] = {}
         self._lost: dict[int, MaskletState] = {}
         self._motion_to_oid: dict[int, int] = {}
@@ -152,6 +159,9 @@ class SamMemoryTracker:
                 "see module docstring for full SAM2/SAM3 TODO."
             )
 
+    def set_identity_gallery(self, gallery: IdentityGallery | None) -> None:
+        self.gallery = gallery
+
     def reset(self) -> None:
         self._masklets.clear()
         self._lost.clear()
@@ -159,6 +169,8 @@ class SamMemoryTracker:
         self._next_id = 1
         self.total_id_switches = 0
         self.total_reid_recoveries = 0
+        if self.gallery is not None:
+            self.gallery.clear()
 
     def _mint(self, det: DetectItem) -> int:
         oid = self._next_id
@@ -175,7 +187,7 @@ class SamMemoryTracker:
             self._motion_to_oid[int(det.motion_id)] = oid
         return oid
 
-    def _bind(self, oid: int, det: DetectItem, emb: np.ndarray | None) -> None:
+    def _bind(self, oid: int, det: DetectItem, emb: np.ndarray | None, *, frame_idx: int = -1) -> None:
         tr = self._masklets.get(oid) or self._lost.pop(oid, None)
         if tr is None:
             return
@@ -196,18 +208,67 @@ class SamMemoryTracker:
             else:
                 mixed = 0.35 * vec + 0.65 * tr.ema_embedding
                 tr.ema_embedding = mixed / (np.linalg.norm(mixed) + 1e-8)
+            if self.gallery is not None:
+                self.gallery.upsert(oid, vec, frame_idx=frame_idx)
         self._masklets[oid] = tr
         if det.motion_id >= 0:
             self._motion_to_oid[int(det.motion_id)] = oid
 
+    def _ensure_slot(self, oid: int, det: DetectItem) -> None:
+        """Re-materialize a gallery identity that left short-term masklet memory."""
+        if oid in self._masklets or oid in self._lost:
+            return
+        self._lost[oid] = MaskletState(
+            object_id=oid,
+            label=det.label,
+            last_bbox=det.xyxy.astype(np.float32, copy=True),
+            last_motion_id=int(det.motion_id),
+            miss_count=max(self.osnet_reentry_min_miss, self.track_buffer + 1),
+            active=False,
+            ema_embedding=None if self.gallery is None else self.gallery.get(oid),
+        )
+        self._next_id = max(self._next_id, oid + 1)
+
+    def _gallery_query(
+        self,
+        emb: np.ndarray,
+        *,
+        exclude: set[int],
+        frame_idx: int,
+    ) -> tuple[int, float] | None:
+        if self.gallery is None:
+            return None
+        if float(np.linalg.norm(emb)) < 1e-3:
+            return None
+        hit = self.gallery.query(
+            emb,
+            exclude=exclude,
+            min_sim=self.osnet_reentry_thresh,
+        )
+        if hit is None:
+            return None
+        return int(hit.object_id), float(hit.similarity)
+
     def _increment_miss_all(self) -> None:
-        """Bump miss on unmatched masklets; expire past track_buffer into _lost."""
+        """Bump miss on unmatched masklets; demote past track_buffer into _lost.
+
+        ``track_buffer <= 0`` = full-video memory: demote after a short grace so
+        IoU/re-entry can use ``_lost``, but **never purge** lost IDs by TTL.
+        """
+        full_video = self.track_buffer <= 0
+        # Demote active→lost so Phase-2/3 can recover; keep a small grace even in
+        # full-video mode (does not drop identity — only moves pool).
+        demote_after = (
+            max(30, int(self.osnet_reentry_min_miss))
+            if full_video
+            else int(self.track_buffer)
+        )
         for oid in list(self._masklets.keys()):
             tr = self._masklets[oid]
             if tr.active:
                 continue
             tr.miss_count += 1
-            if tr.miss_count > self.track_buffer:
+            if tr.miss_count > demote_after:
                 mid = tr.last_motion_id
                 if mid >= 0 and self._motion_to_oid.get(mid) == oid:
                     del self._motion_to_oid[mid]
@@ -216,7 +277,15 @@ class SamMemoryTracker:
             if oid in self._masklets:
                 continue
             tr.miss_count += 1
-            if tr.miss_count > self.track_buffer * 2:
+            if full_video:
+                # Full-video: identity lives in _lost + CPU gallery for the whole run.
+                continue
+            # Finite buffer: keep lost IDs long enough for leave/return.
+            # With re-entry: 10× track_buffer (900 → 9000 frames ≈ 5 min @ 30 fps).
+            lost_ttl = max(self.track_buffer * 2, self.track_buffer * 6)
+            if self.allow_osnet_reentry:
+                lost_ttl = max(lost_ttl, self.track_buffer * 10)
+            if tr.miss_count > lost_ttl:
                 mid = tr.last_motion_id
                 if mid >= 0 and self._motion_to_oid.get(mid) == oid:
                     del self._motion_to_oid[mid]
@@ -240,7 +309,8 @@ class SamMemoryTracker:
         if self._backend_note and self.debug_log and frame_idx <= 0:
             debug_lines.append(f"sam_backend_note: {self._backend_note}")
 
-        if len(self._lost) > 64:
+        # Cap only for finite buffer; full-video (track_buffer<=0) keeps every lost ID.
+        if self.track_buffer > 0 and len(self._lost) > 64:
             keep = sorted(self._lost.items(), key=lambda kv: kv[1].miss_count)[:64]
             self._lost = dict(keep)
 
@@ -331,7 +401,8 @@ class SamMemoryTracker:
                         f"f{frame_idx} det{di} {tag} oid={oid} iou={iou:.2f}"
                     )
 
-        # Phase 3 (optional): long-lost OSNet re-entry — never used for F2F.
+        # Phase 3 (optional): long-lost appearance re-entry via CPU gallery / lost EMA.
+        # Gallery lives for the full video on host RAM/SQLite — not VRAM.
         if self.allow_osnet_reentry:
             for di in range(n):
                 if di in assigned_det:
@@ -341,7 +412,9 @@ class SamMemoryTracker:
                     continue
                 emb_n = emb.astype(np.float32, copy=False).reshape(-1)
                 emb_n = emb_n / (np.linalg.norm(emb_n) + 1e-8)
+
                 best_oid, best_sim = -1, -1.0
+                # Prefer short-term lost EMA when available.
                 for oid, tr in list(self._lost.items()):
                     if oid in assigned_oid:
                         continue
@@ -352,7 +425,18 @@ class SamMemoryTracker:
                     sim = self._cosine(emb_n, tr.ema_embedding)
                     if sim > best_sim:
                         best_sim, best_oid = sim, oid
+
+                # Full-video CPU gallery (covers IDs already purged from _lost).
+                ghit = self._gallery_query(
+                    emb_n, exclude=assigned_oid | set(self._masklets.keys()), frame_idx=frame_idx
+                )
+                if ghit is not None:
+                    g_oid, g_sim = ghit
+                    if g_sim > best_sim:
+                        best_sim, best_oid = g_sim, g_oid
+
                 if best_oid >= 0 and best_sim >= self.osnet_reentry_thresh:
+                    self._ensure_slot(best_oid, detections[di])
                     det_to_oid[di] = best_oid
                     assigned_det.add(di)
                     assigned_oid.add(best_oid)
@@ -360,22 +444,43 @@ class SamMemoryTracker:
                     self.total_reid_recoveries += 1
                     if self.debug_log:
                         debug_lines.append(
-                            f"f{frame_idx} det{di} osnet_reentry oid={best_oid} sim={best_sim:.2f}"
+                            f"f{frame_idx} det{di} gallery_reentry oid={best_oid} sim={best_sim:.2f}"
                         )
 
         stable_ids: list[int] = []
         for di, det in enumerate(detections):
             if di in det_to_oid:
                 oid = det_to_oid[di]
-                self._bind(oid, det, embs[di])
+                self._bind(oid, det, embs[di], frame_idx=frame_idx)
                 stable_ids.append(oid)
             else:
-                oid = self._mint(det)
+                # Last chance: query gallery before minting a brand-new ID.
+                reused = None
                 if self.allow_osnet_reentry:
-                    self._bind(oid, det, embs[di])
-                stable_ids.append(oid)
-                if self.debug_log:
-                    debug_lines.append(f"f{frame_idx} det{di} new_masklet oid={oid}")
+                    reused = self._gallery_query(
+                        embs[di],
+                        exclude=assigned_oid | set(self._masklets.keys()),
+                        frame_idx=frame_idx,
+                    )
+                if reused is not None and reused[1] >= self.osnet_reentry_thresh:
+                    oid, sim = reused
+                    self._ensure_slot(oid, det)
+                    self._bind(oid, det, embs[di], frame_idx=frame_idx)
+                    assigned_oid.add(oid)
+                    frame_recoveries += 1
+                    self.total_reid_recoveries += 1
+                    stable_ids.append(oid)
+                    if self.debug_log:
+                        debug_lines.append(
+                            f"f{frame_idx} det{di} gallery_mint_reuse oid={oid} sim={sim:.2f}"
+                        )
+                else:
+                    oid = self._mint(det)
+                    if self.allow_osnet_reentry:
+                        self._bind(oid, det, embs[di], frame_idx=frame_idx)
+                    stable_ids.append(oid)
+                    if self.debug_log:
+                        debug_lines.append(f"f{frame_idx} det{di} new_masklet oid={oid}")
 
         self._increment_miss_all()
 
@@ -408,12 +513,37 @@ class MockSamMemoryTracker(SamMemoryTracker):
         return result
 
 
-def build_identity_tracker(settings: Any) -> IdentityTracker:
+def build_identity_tracker(
+    settings: Any,
+    *,
+    identity_gallery: IdentityGallery | None = None,
+) -> IdentityTracker:
     """
     Factory: SAM masklet tracker when use_sam_identity, else classic ReidTracker.
     """
     if uses_sam_identity(settings):
         backend = str(getattr(settings, "sam_identity_backend", "memory") or "memory")
+        gallery = identity_gallery
+        if gallery is None and bool(getattr(settings, "identity_gallery_enabled", True)):
+            spill = None
+            if bool(getattr(settings, "identity_gallery_spill", True)):
+                work = getattr(settings, "work_dir", None)
+                if work is not None:
+                    spill = Path(work) / "identity_gallery.sqlite"
+            gallery = IdentityGallery(
+                min_sim=float(
+                    getattr(
+                        settings,
+                        "identity_gallery_min_sim",
+                        getattr(settings, "sam_osnet_reentry_thresh", 0.65),
+                    )
+                ),
+                ema_alpha=float(getattr(settings, "identity_gallery_ema_alpha", 0.35)),
+                update_min_sim=float(
+                    getattr(settings, "reid_gallery_update_min_sim", 0.45)
+                ),
+                spill_path=spill,
+            )
         common = dict(
             match_iou=float(getattr(settings, "sam_match_iou", 0.30)),
             track_buffer=int(getattr(settings, "track_buffer", 150)),
@@ -422,6 +552,7 @@ def build_identity_tracker(settings: Any) -> IdentityTracker:
             osnet_reentry_thresh=float(getattr(settings, "sam_osnet_reentry_thresh", 0.70)),
             osnet_reentry_min_miss=int(getattr(settings, "sam_osnet_reentry_min_miss", 30)),
             backend=backend,
+            identity_gallery=gallery,
         )
         if backend == "mock":
             return MockSamMemoryTracker(**common)
@@ -433,7 +564,6 @@ def build_identity_tracker(settings: Any) -> IdentityTracker:
 
     from app.core.reid_tracker import ReidTracker
 
-    # Docker ReidTracker accepts the classic gallery kwargs only (fork lag vs desktop).
     return ReidTracker(
         appearance_thresh=settings.appearance_thresh,
         track_buffer=settings.track_buffer,
@@ -441,5 +571,26 @@ def build_identity_tracker(settings: Any) -> IdentityTracker:
         w_iou=settings.w_iou,
         w_app=settings.w_app,
         recovery_thresh=settings.recovery_thresh,
-        min_match_score=float(getattr(settings, "reid_min_match_score", 0.30)),
+        min_match_score=float(getattr(settings, "reid_min_match_score", 0.35)),
+        iou_recovery_thresh=float(getattr(settings, "iou_recovery_thresh", 0.55)),
+        iou_recovery_min_app=float(getattr(settings, "iou_recovery_min_app", 0.28)),
+        debug_log=bool(getattr(settings, "reid_debug_log", False)),
+        gallery_ema_alpha=float(getattr(settings, "reid_gallery_ema_alpha", 0.35)),
+        gallery_update_min_sim=float(
+            getattr(settings, "reid_gallery_update_min_sim", 0.45)
+        ),
+        lost_spatial_sep=float(getattr(settings, "lost_spatial_sep", 1.25)),
+        lost_spatial_strict_app=float(
+            getattr(settings, "lost_spatial_strict_app", 0.72)
+        ),
+        lost_stale_frames=int(getattr(settings, "lost_stale_frames", 45)),
+        lost_stale_app=float(getattr(settings, "lost_stale_app", 0.65)),
+        lost_reacquire_app=float(getattr(settings, "lost_reacquire_app", 0.70)),
+        sole_gap_frames=int(getattr(settings, "sole_gap_frames", 10)),
+        centered_reacquire_app=float(
+            getattr(settings, "centered_reacquire_app", 0.74)
+        ),
+        motion_app_break=float(getattr(settings, "motion_app_break", 0.40)),
+        motion_app_drop=float(getattr(settings, "motion_app_drop", 0.20)),
+        motion_app_break_miss=int(getattr(settings, "motion_app_break_miss", 3)),
     )

@@ -2,15 +2,22 @@
 
 FROM nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04
 
+# Defaults match docker-compose.yml / config/ui_fast_profile.json.
+# ReID (SOLIDER/OSNet) + SAM identity = person only; helmet = cross-check predict only.
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     PYTHONPATH=/app:/opt/deep-person-reid \
     YOLO_DRT_MODELS_DIR=/data/models \
     YOLO_DRT_OUTPUT_DIR=/data/output \
+    YOLO_DRT_DETECT_MODEL=/data/models/YOLO/yolo26x.pt \
+    YOLO_DRT_CROSS_MODEL=/data/models/YOLO/Helmet/helmet-26m.pt \
+    YOLO_DRT_REID_BACKEND=solider \
+    YOLO_DRT_REID_MODEL=/data/models/RD/solider_swin_small_msmt17.pth \
+    YOLO_DRT_DEFAULT_PROMPT=person \
     YOLO_DRT_USE_SAM_IDENTITY=true \
     YOLO_DRT_USE_REID=false \
-    YOLO_DRT_SAM_OSNET_REENTRY=false \
+    YOLO_DRT_SAM_OSNET_REENTRY=true \
     YOLO_DRT_USE_OFFLINE_TRACKLET_LINK=true \
     YOLO_DRT_TRACKLET_LINK_USE_REID=true \
     YOLO_DRT_USE_SEG=false \
@@ -20,9 +27,10 @@ ENV DEBIAN_FRONTEND=noninteractive \
     YOLO_DRT_FRAME_STRIDE=0 \
     YOLO_DRT_INFER_BATCH_SIZE=64 \
     YOLO_DRT_REALTIME_MODE=true \
-    YOLO_DRT_TRACK_BUFFER=300 \
+    YOLO_DRT_TRACK_BUFFER=900 \
     YOLO_DRT_USE_TENSORRT=true \
     YOLO_DRT_CROSS_CHECK_ENABLED=true \
+    YOLO_DRT_CROSS_CHECK_OBJECT_PROMPT=helmet \
     YOLO_DRT_ENCODE_MODE=manual \
     YOLO_DRT_INFERENCE_DEVICE=cuda
 
@@ -42,12 +50,17 @@ COPY requirements-api.txt .
 RUN python3.11 -m pip install -r requirements-api.txt
 RUN git clone --depth 1 https://github.com/KaiyangZhou/deep-person-reid.git /opt/deep-person-reid
 
-# Модели (.pt/.pth и опционально TRT/*.engine) — положи в ./models перед docker compose build
+# Weights baked at build time (host paths → /data/models):
+#   models/YOLO/yolo26x.pt
+#   models/YOLO/Helmet/helmet-26m.pt
+#   models/RD/solider_swin_small_msmt17.pth  (+ optional OSNet rollback .pth)
+#   models/TRT/*.engine                      (optional; else built on first run)
 COPY models /data/models
 
 COPY app ./app
 COPY api ./api
 COPY config ./config
+# WEB_app runs on the host (not in this API image); keep tree next to compose for UI.
 
 EXPOSE 8080
 

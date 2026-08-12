@@ -119,15 +119,27 @@
     },
     {
       id: "cross",
-      title: "Cross-check (helmet)",
+      title: "Cross-check (person ∩ helmet)",
       open: true,
       fields: [
-        { key: "cross_check_enabled", label: "Enable cross-check", type: "bool" },
-        { key: "cross_check_object_prompt", label: "Object class prompt", type: "text" },
-        { key: "cross_check_warning_text", label: "Warning text", type: "text" },
-        { key: "cross_check_conf", label: "Cross-check conf", type: "float", min: 0.01, max: 1, step: 0.05 },
-        { key: "cross_check_draw_head_box", label: "Draw head box", type: "bool" },
-        { key: "cross_check_draw_boxes", label: "Draw cross-check boxes", type: "bool" },
+        { key: "cross_check_enabled", label: "Enable helmet cross-check", type: "bool" },
+        {
+          key: "cross_check_object_prompt",
+          label: "Helmet class prompt",
+          type: "text",
+        },
+        { key: "cross_check_warning_text", label: "Warning text (e.g. NO HELMET)", type: "text" },
+        { key: "cross_check_conf", label: "Helmet detect conf", type: "float", min: 0.01, max: 1, step: 0.05 },
+        {
+          key: "cross_check_draw_head_box",
+          label: "Draw check-region box (person∩helmet verdict)",
+          type: "bool",
+        },
+        {
+          key: "cross_check_draw_boxes",
+          label: "Draw helmet accessory boxes",
+          type: "bool",
+        },
       ],
     },
     {
@@ -135,11 +147,22 @@
       title: "Overlay",
       fields: [
         { key: "overlay_alpha", label: "Overlay alpha", type: "float", min: 0.1, max: 0.9, step: 0.05 },
-        { key: "draw_boxes", label: "Draw boxes", type: "bool" },
+        { key: "draw_boxes", label: "Draw person boxes", type: "bool" },
         { key: "draw_masks", label: "Draw masks", type: "bool" },
         { key: "draw_centers", label: "Draw centers", type: "bool" },
-        { key: "draw_pose", label: "Draw pose", type: "bool" },
-        { key: "pose_kpt_conf", label: "Pose keypoint conf", type: "float", min: 0.05, max: 0.99, step: 0.05 },
+        {
+          key: "draw_pose",
+          label: "Draw pose skeletons (optional; no-op without keypoints)",
+          type: "bool",
+        },
+        {
+          key: "pose_kpt_conf",
+          label: "Pose keypoint conf (only if pose on)",
+          type: "float",
+          min: 0.05,
+          max: 0.99,
+          step: 0.05,
+        },
       ],
     },
     {
@@ -186,8 +209,22 @@
         { key: "encode_crf", label: "Encode CRF", type: "int", min: 0, max: 51 },
         { key: "encode_codec", label: "Encode codec", type: "text" },
         { key: "encode_workers", label: "Encode workers (0=post)", type: "int", min: 0, max: 32 },
-        { key: "cross_check_min_intersection_px", label: "Cross min intersection px", type: "float", min: 0, max: 100, step: 0.5 },
-        { key: "cross_check_min_iou", label: "Cross min IoU", type: "float", min: 0, max: 1, step: 0.05 },
+        {
+          key: "cross_check_min_intersection_px",
+          label: "Person∩helmet min intersection px",
+          type: "float",
+          min: 0,
+          max: 100,
+          step: 0.5,
+        },
+        {
+          key: "cross_check_min_iou",
+          label: "Person∩helmet min IoU",
+          type: "float",
+          min: 0,
+          max: 1,
+          step: 0.05,
+        },
         { key: "ram_budget_system_reserve_gb", label: "RAM system reserve (GB)", type: "float", min: 0, max: 16, step: 0.25 },
         { key: "ram_budget_models_gb", label: "RAM models (GB, 0=auto)", type: "float", min: 0, max: 32, step: 0.5 },
         { key: "ram_budget_spill_gb", label: "RAM spill (GB)", type: "float", min: 0, max: 8, step: 0.25 },
@@ -218,6 +255,13 @@
     realtime_mode: true,
     use_seg: false,
     sam_osnet_reentry: false,
+    // Person-detect + helmet cross-check — do not force pose overlay/model UX.
+    draw_pose: false,
+    draw_boxes: true,
+    cross_check_enabled: true,
+    cross_check_draw_boxes: true,
+    cross_check_draw_head_box: true,
+    default_prompt: "person",
   };
 
   function fieldId(key) {

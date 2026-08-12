@@ -229,7 +229,7 @@
     await pollJob(jobId);
   }
 
-  /** Baked fast profile — same as app/config/ui_fast_profile.json */
+  /** Baked fast profile — same keys as app/config/ui_fast_profile.json (person∩helmet). */
   const FAST_PROFILE = {
     use_reid: false,
     use_sam_identity: true,
@@ -244,12 +244,21 @@
     sam_osnet_reentry: false,
     encode_mode: "manual",
     cross_check_enabled: true,
+    cross_check_object_prompt: "helmet",
+    cross_check_warning_text: "NO HELMET",
     cross_check_conf: 0.35,
     cross_check_min_intersection_px: 20,
     cross_check_min_iou: 0.03,
     cross_check_helmet_min_conf: 0.30,
     cross_check_min_violation_streak: 2,
     cross_check_verdict_history: 5,
+    cross_check_draw_head_box: true,
+    cross_check_draw_boxes: true,
+    draw_boxes: true,
+    draw_masks: false,
+    draw_centers: false,
+    // Overlay only — WEB must not force pose skeletons / pose model UX.
+    draw_pose: false,
     pose_kpt_conf: 0.30,
     default_prompt: "person",
   };
@@ -380,7 +389,15 @@
   }
 
   function fastProfilePatch(base) {
-    return { ...FAST_PROFILE, ...(base || {}) };
+    const out = { ...FAST_PROFILE, ...(base || {}) };
+    // Pin person-detect + helmet cross-check; never force pose overlay from WEB.
+    out.draw_pose = false;
+    out.cross_check_enabled = true;
+    out.default_prompt = (out.default_prompt || "person").trim() || "person";
+    if (out.cross_check_object_prompt == null || out.cross_check_object_prompt === "") {
+      out.cross_check_object_prompt = "helmet";
+    }
+    return out;
   }
 
   async function applyFastProfile() {

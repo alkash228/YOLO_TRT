@@ -562,6 +562,8 @@ class GpuInferWorker:
         self._on_batch_log = on_batch_log
         self._use_seg = bool(settings.use_seg and seg_engine is not None)
         self._use_cross = bool(settings.cross_check_enabled and cross_engine is not None)
+        # Person detect may use BoT-SORT track for stable motion_id.
+        # Cross-check (helmet) always predict_batch only — never track / ReID.
         # ReID / SAM identity нужен BoT-SORT (track persist); predict_batch + MotionTracker даёт скачки ID.
         from app.core.sam_memory_tracker import uses_stable_identity
 
