@@ -244,6 +244,8 @@ class PipelineSettings:
     tensorrt_engine_strategy: str = "central"  # central | beside_weights
     tensorrt_rebuild_policy: str = "missing_only"  # missing_only | always
     tensorrt_manifest_dir: Path = field(default_factory=lambda: TRT_DIR)
+    # Docker sets this to /data/models/TRT. Empty → central_trt_dir() uses models_dir/TRT.
+    tensorrt_central_dir: Path | None = None
 
     # Helmet cross-check: person bbox ∩ helmet bbox (not pose-head).
     # Accessories-only path: helmet-26m.pt is predict() per frame — no BoT-SORT,

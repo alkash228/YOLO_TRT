@@ -32,6 +32,8 @@ class DetectEngine:
         tensorrt_imgsz: int = 640,
         tensorrt_max_batch: int = 200,
         tensorrt_fp16: bool = True,
+        tensorrt_engine_strategy: str = "central",
+        tensorrt_central_dir: Path | None = None,
     ) -> None:
         from ultralytics import YOLO
 
@@ -46,6 +48,8 @@ class DetectEngine:
                 imgsz=int(tensorrt_imgsz),
                 max_batch=int(tensorrt_max_batch),
                 fp16=bool(tensorrt_fp16),
+                strategy=str(tensorrt_engine_strategy or "central"),
+                central_dir=tensorrt_central_dir,
             )
             if eng.exists():
                 load_path = eng

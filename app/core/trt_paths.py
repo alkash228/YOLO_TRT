@@ -38,6 +38,21 @@ def reid_onnx_name(stem: str) -> str:
     return f"{stem}_256x128.onnx"
 
 
+def central_trt_dir(settings: object | None = None) -> Path:
+    """Docker: /data/models/TRT. Never fall back to /app/models/TRT when models_dir is set."""
+    if settings is not None:
+        custom = getattr(settings, "tensorrt_central_dir", None)
+        if custom is not None and str(custom).strip():
+            return Path(custom)
+        models_dir = getattr(settings, "models_dir", None)
+        if models_dir is not None and str(models_dir).strip():
+            return Path(models_dir) / "TRT"
+        manifest = getattr(settings, "tensorrt_manifest_dir", None)
+        if manifest is not None and str(manifest).strip():
+            return Path(manifest)
+    return TRT_DIR
+
+
 def engine_root_for_model(
     model_path: Path,
     *,

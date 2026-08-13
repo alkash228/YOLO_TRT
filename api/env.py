@@ -281,6 +281,7 @@ def load_settings_from_env() -> PipelineSettings:
         tensorrt_engine_strategy=strategy,
         tensorrt_rebuild_policy=rebuild,
         tensorrt_manifest_dir=manifest_dir,
+        tensorrt_central_dir=manifest_dir,
         inference_device=(
             os.environ.get(
                 "YOLO_DRT_INFERENCE_DEVICE",

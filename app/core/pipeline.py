@@ -11,7 +11,7 @@ from app.config.settings import PipelineSettings
 from app.core.batch_utils import effective_speed_tuning
 from app.core.detect_engine import DetectEngine
 from app.core.seg_engine import SegEngine
-from app.core.trt_paths import engines_ready
+from app.core.trt_paths import central_trt_dir, engines_ready
 from app.core.video_processor import VideoProcessor
 
 
@@ -32,6 +32,10 @@ def _trt_kwargs(settings: PipelineSettings) -> dict:
         tensorrt_imgsz=int(settings.tensorrt_imgsz or settings.infer_imgsz or 640),
         tensorrt_max_batch=int(settings.tensorrt_max_batch),
         tensorrt_fp16=bool(settings.tensorrt_fp16),
+        tensorrt_engine_strategy=str(
+            getattr(settings, "tensorrt_engine_strategy", "central") or "central"
+        ),
+        tensorrt_central_dir=central_trt_dir(settings),
     )
 
 
@@ -115,7 +119,7 @@ def build_processor(
             strategy=str(
                 getattr(settings, "tensorrt_engine_strategy", "central") or "central"
             ),
-            central_dir=getattr(settings, "tensorrt_central_dir", None),
+            central_dir=central_trt_dir(settings),
         )
         if on_log:
             on_log(
@@ -124,10 +128,13 @@ def build_processor(
                 f"cross={ready['cross_check']}"
             )
         if not ready.get("detect", False) and on_log:
+            want = Path(settings.detect_model).stem
+            trt_root = central_trt_dir(settings)
             on_log(
-                f"TensorRT: нет engine для detect «{Path(settings.detect_model).stem}» "
-                f"(в models/TRT лежит другой stem, напр. yolo26x-pose). "
-                f"Собери engines под текущую detect-модель или fallback -> PyTorch."
+                f"TensorRT: нет engine для detect «{want}» в {trt_root} "
+                f"(ищу {want}_i{int(settings.tensorrt_imgsz or 640)}"
+                f"_b{int(settings.tensorrt_max_batch)}_fp16.engine). "
+                f"Fallback -> PyTorch."
             )
         if need_reid_trt and not ready.get("reid", False) and on_log:
             on_log("TensorRT: нет OSNet .engine — ReID fallback PyTorch")
