@@ -242,6 +242,39 @@ class JobManager:
         job.cancel()
         return job
 
+    def _refresh_progress(self, job: JobState) -> JobState:
+        if job.status == "running" and not job.bench_mode:
+            job.progress = job.materialize_progress()
+        return job
+
+    def latest(self) -> JobState | None:
+        with self._lock:
+            if not self._jobs:
+                return None
+            job = max(self._jobs.values(), key=lambda j: float(j.created_at or 0.0))
+        return self._refresh_progress(job)
+
+    def active_job(self) -> JobState | None:
+        with self._lock:
+            running = [j for j in self._jobs.values() if j.status in ("queued", "running")]
+            if not running:
+                return None
+            job = max(
+                running,
+                key=lambda j: float(j.started_at or j.created_at or 0.0),
+            )
+        return self._refresh_progress(job)
+
+    def list_jobs(self, limit: int = 15) -> list[JobState]:
+        n = max(0, int(limit))
+        with self._lock:
+            jobs = sorted(
+                self._jobs.values(),
+                key=lambda j: float(j.created_at or 0.0),
+                reverse=True,
+            )[:n]
+        return [self._refresh_progress(j) for j in jobs]
+
     def _worker_loop(self) -> None:
         while True:
             job_id = self._queue.get()
