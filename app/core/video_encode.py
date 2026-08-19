@@ -693,7 +693,7 @@ def _encode_timeline_streaming(
     elif clip_mode and resolved_input and Path(resolved_input).is_file():
         if on_log:
             on_log(
-                f"Decode: grab-skip to {len(encode_src_indices or [])} violation frames "
+                f"Decode: ffmpeg seek-window {len(encode_src_indices or [])} frames "
                 f"(not full {n_src}-frame scan)"
             )
     elif on_log:
@@ -760,18 +760,35 @@ def _encode_timeline_streaming(
             needed = sorted({int(i) for i in (encode_src_indices or set())})
             encode_total = max(1, len(needed))
             if resolved_input and Path(resolved_input).is_file():
-                from app.core.frame_io import iter_selected_bgr_frames
+                from app.core.frame_io import (
+                    iter_seek_selected_bgr_frames,
+                    iter_selected_bgr_frames,
+                )
 
                 def _on_scan(cur: int, last: int) -> None:
-                    if on_log and cur % 900 == 0:
-                        on_log(f"Decode scan {cur}/{last} (grab-skip)")
+                    if on_log and cur % 60 == 0:
+                        on_log(f"Decode window {cur}/{last}")
 
-                for src_i, frame_bgr in iter_selected_bgr_frames(
+                got = 0
+                for src_i, frame_bgr in iter_seek_selected_bgr_frames(
                     str(resolved_input),
                     needed,
+                    fps=float(fps),
+                    width=int(target_w),
+                    height=int(target_h),
                     on_scan=_on_scan,
                 ):
                     _submit_clip_frame(src_i, frame_bgr)
+                    got += 1
+                if got <= 0 and needed[0] <= 150:
+                    if on_log:
+                        on_log("Decode seek missed — fallback grab-skip (short clip)")
+                    for src_i, frame_bgr in iter_selected_bgr_frames(
+                        str(resolved_input),
+                        needed,
+                        on_scan=_on_scan,
+                    ):
+                        _submit_clip_frame(src_i, frame_bgr)
             else:
                 for src_i in needed:
                     _submit_clip_frame(src_i, None)

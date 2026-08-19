@@ -91,7 +91,7 @@
         <h2>Отчёты Word</h2>
         <dl class="meta" id="run-meta"></dl>
         <p class="warn hidden" id="cross-warn"></p>
-        <p class="hint">Клипы не нужны: в акт идёт один кадр без каски выбранного ID (без перекодировки видео).</p>
+        <p class="hint">Клипы — короткий MP4 вокруг первого кадра без каски. Word-акт строится отдельно.</p>
         <div class="report-panel" id="report-panel">
           <h3 class="report-panel-title">Параметры отчёта Word</h3>
           <div class="report-grid">
@@ -115,7 +115,7 @@
               <input type="time" id="report-time" class="input-time" step="60" />
             </label>
           </div>
-          <p class="hint report-hint">Фото в отчёте — первый кадр NO HELMET этого ID, с подписью ID на снимке.</p>
+          <p class="hint report-hint">Фото в отчёте — первый кадр NO HELMET этого ID, все детекции на снимке.</p>
           <div class="report-violators hidden" id="report-violators-wrap">
             <label class="field">
               <span>Нарушитель (ID)</span>
@@ -131,34 +131,17 @@
           <span>Исходное видео (если прогон с другой машины)</span>
           <input type="text" id="source-video-input" placeholder="C:\\videos\\source.mp4" autocomplete="off" spellcheck="false" />
         </label>
-        <p class="hint">Нужен оригинал: кадр в Word и превью с боксами. Положи <code>RUNID_source.mp4</code> в папку прогона или укажи путь здесь.</p>
-        <div class="overlay-player hidden" id="overlay-player">
-          <h3 class="report-panel-title">Видео в браузере</h3>
-          <p class="hint" id="overlay-play-warn">HEVC в Chrome не играет. «Смотреть» перегоняет H.264 на хосте кусками по 2 сек — плеер стартует сразу и подгружает дальше.</p>
-          <div class="overlay-downloads">
-            <button type="button" class="btn btn-primary" id="btn-hls-play">Смотреть с нарушения</button>
-            <button type="button" class="btn btn-secondary" id="btn-hls-from-start">С начала ролика</button>
-            <button type="button" class="btn btn-secondary" id="btn-hls-stop">Стоп</button>
-            <a class="btn btn-secondary" id="btn-dl-source" download>Скачать исходник</a>
-            <button type="button" class="btn btn-secondary" id="btn-dl-mkv">MKV для VLC</button>
-            <a class="btn btn-secondary" id="btn-dl-player" download>HTML-плеер</a>
-          </div>
-          <div class="overlay-stage hidden" id="overlay-stage">
-            <video id="overlay-video" controls playsinline></video>
-            <canvas id="overlay-canvas"></canvas>
-          </div>
-          <p class="hint">Прогрессивный плеер: первые секунды сразу, дальше NVENC дожимает. Стоп — выключить ffmpeg. Контейнер не участвует.</p>
-        </div>
-        <details class="clips-optional" id="clips-optional">
-          <summary>Клипы MP4 — необязательно, на HEVC очень долго</summary>
-          <p class="hint">Полная перекодировка присутствия ID. Для Word-актов не требуется.</p>
+        <p class="hint">Нужен оригинал: кадр в Word и короткие клипы. Положи <code>RUNID_source.mp4</code> в папку прогона или укажи путь здесь.</p>
+        <div class="report-panel" id="clips-panel">
+          <h3 class="report-panel-title">Клипы MP4</h3>
+          <p class="hint">Короткий ролик (~12 с) вокруг первого NO HELMET, NVENC. Не весь прогон.</p>
           <button type="button" class="btn btn-accent" id="btn-build">Собрать клипы</button>
           <div class="progress-wrap hidden" id="build-progress-wrap">
             <div class="progress-bar"><div class="progress-fill" id="build-progress"></div></div>
             <p class="progress-text" id="build-status">—</p>
           </div>
           <div class="video-list hidden" id="video-list"></div>
-        </details>
+        </div>
       </section>
     </main>
 
@@ -167,7 +150,6 @@
     </footer>
   </div>
   <div class="toast-stack" id="toast-stack" aria-live="polite" aria-atomic="true"></div>
-  <script src="/static/vendor/hls.min.js"></script>
   <script src="/static/js/app.js"></script>
 </body>
 </html>

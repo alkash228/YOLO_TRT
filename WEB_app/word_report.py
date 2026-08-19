@@ -21,6 +21,7 @@ from WEB_app.video_builder import (
     resolve_overlay,
     stamp_all_people_boxes_rgb,
     stamp_all_poses_rgb,
+    stamp_cross_check_verdicts_rgb,
     stamp_debug_hud_rgb,
     stamp_helmet_accessories_rgb,
     web_debug_show_all_dets,
@@ -153,18 +154,35 @@ def _read_still_from_violation_clip(run_dir: Path, run_id: str, stable_id: int) 
     return None
 
 
-def _annotate_stable_id(rgb: np.ndarray, stable_id: int, frame_idx: int) -> np.ndarray:
+def _annotate_stable_id(
+    rgb: np.ndarray,
+    stable_id: int,
+    frame_idx: int,
+    packet: FramePacket | None = None,
+) -> np.ndarray:
     """Burn ID into the still so reports for different IDs cannot be confused."""
     out = np.ascontiguousarray(rgb.copy())
     bgr = cv2.cvtColor(out, cv2.COLOR_RGB2BGR)
     label = f"ID {int(stable_id)}  |  frame {int(frame_idx)}"
-    cv2.rectangle(bgr, (8, 8), (8 + 12 * len(label) + 24, 48), (0, 0, 0), -1)
+    if packet is not None:
+        n_helm = len(packet.cross_check_accessories or [])
+        n_fail = sum(
+            1
+            for v in (packet.cross_check_verdicts or [])
+            if _verdict_is_violation(v)
+        )
+        label = (
+            f"{label}  |  people={int(packet.n_inst)} "
+            f"helmets={n_helm} NO_HELMET={n_fail}"
+        )
+    (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
+    cv2.rectangle(bgr, (8, 8), (8 + tw + 24, 44), (0, 0, 0), -1)
     cv2.putText(
         bgr,
         label,
-        (16, 38),
+        (16, 36),
         cv2.FONT_HERSHEY_SIMPLEX,
-        0.9,
+        0.7,
         (0, 255, 255),
         2,
         cv2.LINE_AA,
@@ -176,20 +194,29 @@ def read_source_frame_bgr(
     frame_idx: int,
     *,
     fps: float | None = None,
+    accurate: bool = False,
 ) -> np.ndarray | None:
     """Grab one source frame via ffmpeg timestamp seek (no OpenCV on HEVC)."""
     from app.core.frame_io import read_frame_bgr_ffmpeg
 
     if not input_path:
         return None
-    return read_frame_bgr_ffmpeg(str(input_path), int(frame_idx), fps=fps)
+    return read_frame_bgr_ffmpeg(
+        str(input_path), int(frame_idx), fps=fps, accurate=bool(accurate)
+    )
 
 
-def _imwrite_bgr(path: Path, bgr: np.ndarray, *, quality: int = 92) -> None:
+def _imwrite_bgr(path: Path, bgr: np.ndarray, *, quality: int = 95) -> None:
     """cv2.imwrite breaks on non-ASCII Windows paths — encode then write bytes."""
-    ok, buf = cv2.imencode(".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)])
+    suffix = path.suffix.lower() or ".jpg"
+    if suffix == ".png":
+        ok, buf = cv2.imencode(".png", bgr)
+    else:
+        ok, buf = cv2.imencode(
+            ".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)]
+        )
     if not ok:
-        raise RuntimeError("Не удалось закодировать JPEG для отчёта")
+        raise RuntimeError("Не удалось закодировать кадр для отчёта")
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(buf.tobytes())
 
@@ -325,7 +352,7 @@ def render_person_frame_rgb(
             pkt,
             draw_pose=bool(overlay.get("draw_pose", False)),
         )
-    return _annotate_stable_id(rgb, int(stable_id), int(frame_idx))
+    return _annotate_stable_id(rgb, int(stable_id), int(frame_idx), packet=pkt)
 
 
 def render_report_still_rgb(
@@ -338,7 +365,7 @@ def render_report_still_rgb(
     run_id: str | None,
     source_override: str | None = None,
 ) -> np.ndarray:
-    """Word photo: ffmpeg keyframe + boxes from instance_meta. No RLE inflate."""
+    """Word photo: GOP-accurate ffmpeg still + every detection from this packet."""
     from app.core.video_encode import resolve_run_source_video
 
     recorded = str(meta.get("input_path") or meta.get("recorded_input_path") or "")
@@ -353,7 +380,11 @@ def render_report_still_rgb(
     )
     fps_raw = float(meta.get("fps") or 0.0)
     fps = fps_raw if fps_raw > 1.0 else None
-    frame_bgr = read_source_frame_bgr(input_path, frame_idx, fps=fps) if input_path else None
+    frame_bgr = (
+        read_source_frame_bgr(input_path, frame_idx, fps=fps, accurate=True)
+        if input_path
+        else None
+    )
     if frame_bgr is None:
         if packet.mask_hw:
             height, width = int(packet.mask_hw[0]), int(packet.mask_hw[1])
@@ -363,10 +394,13 @@ def render_report_still_rgb(
         frame_bgr = _blank_bgr(width, height)
     height, width = int(frame_bgr.shape[0]), int(frame_bgr.shape[1])
     rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+    # Full packet: all people, helmets, head-check boxes, poses if present.
     rgb = stamp_all_people_boxes_rgb(
-        rgb, packet, target_w=width, target_h=height, focus_sid=int(stable_id)
+        rgb, packet, target_w=width, target_h=height, focus_sid=None
     )
     rgb = stamp_helmet_accessories_rgb(rgb, packet, target_w=width, target_h=height)
+    rgb = stamp_cross_check_verdicts_rgb(rgb, packet, target_w=width, target_h=height)
+    rgb = stamp_all_poses_rgb(rgb, packet, target_w=width, target_h=height)
     rgb = highlight_no_helmet_on_rgb(
         rgb,
         packet,
@@ -376,7 +410,7 @@ def render_report_still_rgb(
         frame_bgr=frame_bgr,
         force=True,
     )
-    return _annotate_stable_id(rgb, int(stable_id), int(frame_idx))
+    return _annotate_stable_id(rgb, int(stable_id), int(frame_idx), packet=packet)
 
 
 def build_word_report(
@@ -431,12 +465,12 @@ def build_word_report(
 
     reports_dir = run_path / "reports"
     reports_dir.mkdir(parents=True, exist_ok=True)
-    image_path = reports_dir / f"{run_id}_id{sid}_frame{frame_idx}.jpg"
+    image_path = reports_dir / f"{run_id}_id{sid}_frame{frame_idx}.png"
     docx_path = reports_dir / f"{run_id}_akt_id{sid}.docx"
 
     bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
     try:
-        _imwrite_bgr(image_path, bgr, quality=92)
+        _imwrite_bgr(image_path, bgr)
     except OSError as exc:
         raise RuntimeError(f"Не удалось сохранить кадр для отчёта: {image_path} ({exc})") from exc
 
@@ -476,7 +510,7 @@ def build_word_report(
     add_row("Исходное видео", source_name)
 
     doc.add_paragraph()
-    cap = doc.add_paragraph("Фотофиксация нарушителя:")
+    cap = doc.add_paragraph("Фотофиксация кадра (все детекции):")
     cap.runs[0].bold = True
     from io import BytesIO
 

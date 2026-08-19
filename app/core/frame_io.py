@@ -165,7 +165,7 @@ def probe_video_fps(input_path: str) -> float:
     return 25.0
 
 
-def _decode_mjpeg_pipe(data: bytes) -> np.ndarray | None:
+def _decode_image_pipe(data: bytes) -> np.ndarray | None:
     if not data:
         return None
     arr = np.frombuffer(data, dtype=np.uint8)
@@ -196,6 +196,7 @@ def _ffmpeg_still_cmd(
     extra: list[str],
     *,
     timeout_sec: float,
+    vcodec: str = "mjpeg",
 ) -> np.ndarray | None:
     try:
         from app.core.ffmpeg_utils import _popen_kwargs, resolve_ffmpeg_exe
@@ -204,6 +205,7 @@ def _ffmpeg_still_cmd(
         kwargs = _popen_kwargs()
     except Exception:
         return None
+    codec = str(vcodec or "mjpeg").strip().lower() or "mjpeg"
     cmd = [
         exe,
         "-hide_banner",
@@ -216,7 +218,7 @@ def _ffmpeg_still_cmd(
         "-f",
         "image2pipe",
         "-vcodec",
-        "mjpeg",
+        codec,
         "pipe:1",
     ]
     try:
@@ -231,7 +233,7 @@ def _ffmpeg_still_cmd(
         return None
     if proc.returncode != 0:
         return None
-    return _decode_mjpeg_pipe(proc.stdout or b"")
+    return _decode_image_pipe(proc.stdout or b"")
 
 
 def read_frame_bgr_ffmpeg(
@@ -240,13 +242,18 @@ def read_frame_bgr_ffmpeg(
     *,
     max_skip: int = 500_000,
     fps: float | None = None,
+    accurate: bool = False,
 ) -> np.ndarray | None:
     """
     One still via ffmpeg timestamp seek (GOP-local decode).
 
     Does not walk the file from frame 0 — that is what made Word reports
-    crawl on long HEVC. Overlay may be ~1 GOP off if timestamps drift;
-    reports only need a recognizable NO-HELMET still.
+    crawl on long HEVC.
+
+    accurate=False: input-side -ss (nearest keyframe, ~1 GOP off).
+    accurate=True: coarse input -ss then short output -ss so boxes land on
+    the same pixels as packet.frame_idx. Decode window is a few seconds, not
+    the whole file.
     """
     target = max(0, int(frame_idx))
     if target > int(max_skip):
@@ -256,11 +263,22 @@ def read_frame_bgr_ffmpeg(
     if rate < 1.0:
         rate = 25.0
     t = target / rate
-    # Input-side -ss = keyframe seek. Do not decode from t=0 (that made Word hang).
-    return _ffmpeg_still_cmd(
-        ["-ss", f"{t:.3f}", "-i", path],
-        timeout_sec=20.0,
-    )
+    if not accurate:
+        return _ffmpeg_still_cmd(
+            ["-ss", f"{t:.3f}", "-i", path],
+            timeout_sec=20.0,
+        )
+    # Typical IP-cam GOP is 1–2 s; 3 s pad covers most without decoding from t=0.
+    pad = 3.0
+    in_ss = max(0.0, t - pad)
+    out_ss = t - in_ss
+    extra = ["-ss", f"{in_ss:.3f}", "-i", path]
+    if out_ss > 0.02:
+        extra.extend(["-ss", f"{out_ss:.3f}"])
+    hit = _ffmpeg_still_cmd(extra, timeout_sec=40.0, vcodec="png")
+    if hit is not None:
+        return hit
+    return _ffmpeg_still_cmd(extra, timeout_sec=40.0, vcodec="mjpeg")
 
 
 def read_frame_bgr_smart(
@@ -355,3 +373,97 @@ def iter_selected_bgr_frames(
                 on_scan(src_i, last)
     finally:
         cap.release()
+
+
+def iter_seek_selected_bgr_frames(
+    input_path: str,
+    indices: list[int] | set[int],
+    *,
+    fps: float,
+    width: int,
+    height: int,
+    on_scan: Callable[[int, int], None] | None = None,
+) -> Iterator[tuple[int, np.ndarray]]:
+    """
+    Yield selected (frame_idx, bgr) by seeking near the first index.
+
+    Decodes only the [min, max] window — not from t=0. Used for short WEB clips
+    so HEVC hour-long files do not grab-skip from the start.
+    """
+    needed = sorted({max(0, int(i)) for i in indices})
+    if not needed:
+        return
+    first, last = needed[0], needed[-1]
+    needed_set = set(needed)
+    rate = float(fps) if fps and fps > 1.0 else probe_video_fps(str(input_path))
+    if rate < 1.0:
+        rate = 25.0
+    tw, th = int(width), int(height)
+    if tw <= 0 or th <= 0:
+        return
+    frame_bytes = tw * th * 3
+    t0 = first / rate
+    n_decode = last - first + 1
+    pad = 2.5
+    in_ss = max(0.0, t0 - pad)
+    out_ss = t0 - in_ss
+    try:
+        from app.core.ffmpeg_utils import _popen_kwargs, resolve_ffmpeg_exe
+
+        exe = resolve_ffmpeg_exe()
+        kwargs = _popen_kwargs()
+    except Exception:
+        return
+    extra: list[str] = ["-ss", f"{in_ss:.3f}", "-i", str(input_path)]
+    if out_ss > 0.02:
+        extra.extend(["-ss", f"{out_ss:.3f}"])
+    cmd = [
+        exe,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        *extra,
+        "-frames:v",
+        str(max(1, n_decode)),
+        "-an",
+        "-vf",
+        f"scale={tw}:{th}:flags=fast_bilinear,format=bgr24",
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "bgr24",
+        "pipe:1",
+    ]
+    proc: subprocess.Popen[bytes] | None = None
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            **kwargs,
+        )
+        assert proc.stdout is not None
+        src_i = first
+        while src_i <= last:
+            raw = proc.stdout.read(frame_bytes)
+            if not raw or len(raw) < frame_bytes:
+                break
+            if src_i in needed_set:
+                frame = np.frombuffer(raw, dtype=np.uint8).reshape(th, tw, 3).copy()
+                yield src_i, frame
+                if on_scan is not None:
+                    on_scan(src_i, last)
+            src_i += 1
+    finally:
+        if proc is not None:
+            try:
+                if proc.stdout:
+                    proc.stdout.close()
+            except Exception:
+                pass
+            if proc.poll() is None:
+                proc.kill()
+            try:
+                proc.wait(timeout=8)
+            except Exception:
+                pass
