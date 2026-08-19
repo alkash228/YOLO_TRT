@@ -32,9 +32,13 @@
   const overlayPlayer = $("#overlay-player");
   const overlayVideo = $("#overlay-video");
   const overlayCanvas = $("#overlay-canvas");
+  const overlayStage = $("#overlay-stage");
   const overlayPlayWarn = $("#overlay-play-warn");
   const btnDlSource = $("#btn-dl-source");
   const btnDlMkv = $("#btn-dl-mkv");
+  const btnHlsPlay = $("#btn-hls-play");
+  const btnHlsFromStart = $("#btn-hls-from-start");
+  const btnHlsStop = $("#btn-hls-stop");
   const btnDlPlayer = $("#btn-dl-player");
   const jobIdInput = $("#job-id-input");
   const btnResumeJob = $("#btn-resume-job");
@@ -54,6 +58,9 @@
   let currentRunId = null;
   let overlayTimeline = null;
   let overlayEventIdx = 0;
+  let overlayHlsOffset = 0;
+  let overlayHls = null;
+  let currentViolators = [];
   let pollTimer = null;
   let pollJobId = null;
   let buildPollTimer = null;
@@ -298,14 +305,18 @@
   }
 
   function getReportPayload(stableId) {
+    const sid = Number(stableId);
+    const row = currentViolators.find((v) => Number(v.stable_id) === sid) || {};
     return {
       run_dir: currentRunDir,
       run_id: currentRunId,
-      stable_id: Number(stableId),
+      stable_id: sid,
       company: reportCompany?.value || "",
       organization: (reportOrganization?.value || reportCompany?.value || "").trim(),
       incident_datetime: getReportDatetimeIso(),
       source_video: (sourceVideoInput?.value || "").trim() || null,
+      violation_count: Number(row.violation_count) || null,
+      presence_frames: Number(row.presence_frames) || null,
     };
   }
 
@@ -431,7 +442,7 @@
     if (overlayCanvas.width !== w) overlayCanvas.width = w;
     if (overlayCanvas.height !== h) overlayCanvas.height = h;
     ctx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
-    const ev = findOverlayEvent(overlayVideo.currentTime || 0);
+    const ev = findOverlayEvent((overlayHlsOffset || 0) + (overlayVideo.currentTime || 0));
     if (!ev) return;
     const sx = overlayCanvas.width / Math.max(1, overlayTimeline.width || overlayCanvas.width);
     const sy = overlayCanvas.height / Math.max(1, overlayTimeline.height || overlayCanvas.height);
@@ -463,30 +474,139 @@
     if (!overlayPlayer || !currentRunDir || !currentRunId) return;
     const q = overlayQuery();
     overlayEventIdx = 0;
-    overlayTimeline = null;
+    overlayPlayer.classList.remove("hidden");
     if (btnDlSource) {
       btnDlSource.href = `/overlay/source?${q}`;
       btnDlSource.setAttribute("download", "");
     }
     if (btnDlPlayer) btnDlPlayer.href = `/overlay/player?${q}`;
     try {
-      const r = await fetch(`/overlay/timeline?${q}`);
+      const r = await fetch(`/overlay/info?${q}`);
       if (!r.ok) throw new Error(await r.text());
-      overlayTimeline = await r.json();
-      overlayPlayer.classList.remove("hidden");
-      if (overlayVideo) {
-        overlayVideo.src = `/overlay/source?${q}`;
-      }
-      if (overlayPlayWarn) overlayPlayWarn.classList.add("hidden");
-      drawOverlayBoxes();
-    } catch (e) {
-      overlayPlayer.classList.remove("hidden");
+      const info = await r.json();
       if (overlayPlayWarn) {
-        overlayPlayWarn.textContent =
-          "Превью недоступно (нет исходника или браузер не играет HEVC). Скачай исходник / MKV для VLC.";
+        if (!info.has_source) {
+          overlayPlayWarn.textContent =
+            "Исходник не найден. Положи RUNID_source.mp4 в папку прогона или укажи путь ниже.";
+        } else {
+          overlayPlayWarn.textContent =
+            "Нажми «Смотреть с нарушения» — H.264 начнёт играть через несколько секунд и будет подгружаться дальше.";
+        }
         overlayPlayWarn.classList.remove("hidden");
       }
-      showToast("Превью видео", String(e.message || e), "error", 7000);
+    } catch (_) {
+      if (overlayPlayWarn) overlayPlayWarn.classList.remove("hidden");
+    }
+  }
+
+  function destroyOverlayHls() {
+    if (overlayHls) {
+      try {
+        overlayHls.destroy();
+      } catch (_) {
+        /* ignore */
+      }
+      overlayHls = null;
+    }
+    if (overlayVideo) {
+      overlayVideo.pause();
+      overlayVideo.removeAttribute("src");
+      try {
+        overlayVideo.load();
+      } catch (_) {
+        /* ignore */
+      }
+    }
+  }
+
+  function attachHls(playlistUrl) {
+    destroyOverlayHls();
+    overlayStage?.classList.remove("hidden");
+    if (overlayVideo) overlayVideo.classList.remove("hidden");
+    if (overlayCanvas) overlayCanvas.classList.remove("hidden");
+    const HlsCtor = window.Hls;
+    if (HlsCtor && HlsCtor.isSupported()) {
+      overlayHls = new HlsCtor({
+        enableWorker: true,
+        lowLatencyMode: false,
+        liveDurationInfinity: true,
+      });
+      overlayHls.loadSource(playlistUrl);
+      overlayHls.attachMedia(overlayVideo);
+      overlayHls.on(HlsCtor.Events.MANIFEST_PARSED, () => {
+        overlayVideo?.play()?.catch(() => {});
+        startOverlayLoop();
+      });
+      overlayHls.on(HlsCtor.Events.ERROR, (_ev, data) => {
+        if (data?.fatal) {
+          showToast("Плеер", data.details || "HLS error", "error", 8000);
+        }
+      });
+      return;
+    }
+    if (overlayVideo?.canPlayType("application/vnd.apple.mpegurl")) {
+      overlayVideo.src = playlistUrl;
+      overlayVideo.play()?.catch(() => {});
+    } else {
+      showToast("Плеер", "Нужен Chrome/Edge с hls.js", "error");
+    }
+  }
+
+  async function playOverlayHls(btn, { fromStart } = {}) {
+    if (!currentRunDir || !currentRunId) {
+      showToast("Ошибка", "Сначала выполните анализ", "error");
+      return;
+    }
+    const sid = fromStart ? null : reportViolatorId?.value;
+    const prevText = btn?.textContent;
+    if (btn) {
+      btn.disabled = true;
+      btn.textContent = "Первый кусок…";
+    }
+    try {
+      const r = await fetch("/overlay/hls/start", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          run_dir: currentRunDir,
+          run_id: currentRunId,
+          source_video: (sourceVideoInput?.value || "").trim() || null,
+          stable_id: sid ? Number(sid) : null,
+          start_sec: fromStart ? 0 : null,
+          duration_sec: 0,
+        }),
+      });
+      if (!r.ok) throw new Error(await r.text());
+      const data = await r.json();
+      overlayHlsOffset = Number(data.start_sec) || 0;
+      attachHls(data.playlist_url);
+      if (overlayPlayWarn) {
+        overlayPlayWarn.textContent = `Играет H.264 (${data.codec || "encoder"}) с ${overlayHlsOffset.toFixed(1)}с — дальше подгружается само. Стоп выключает encode.`;
+      }
+      showToast("Плеер", "Уже можно смотреть, следующие секунды дожимаются");
+      fetch(`/overlay/timeline?${overlayQuery()}`)
+        .then((x) => (x.ok ? x.json() : null))
+        .then((tl) => {
+          if (tl) overlayTimeline = tl;
+        })
+        .catch(() => {});
+    } catch (e) {
+      showToast("Плеер", String(e.message || e), "error", 10000);
+    } finally {
+      if (btn) {
+        btn.disabled = false;
+        btn.textContent = prevText;
+      }
+    }
+  }
+
+  async function stopOverlayHls() {
+    destroyOverlayHls();
+    overlayStage?.classList.add("hidden");
+    try {
+      await fetch("/overlay/hls/stop", { method: "POST" });
+    } catch (_) {
+      /* ignore */
     }
   }
 
@@ -537,6 +657,7 @@
       if (!r.ok) throw new Error(await r.text());
       const data = await r.json();
       const list = data.violators || [];
+      currentViolators = list;
       if (!list.length) {
         reportViolatorsWrap.classList.add("hidden");
         showToast("Нарушителей нет", "В этом прогоне нет NO HELMET (или порог отсёк всех)", "error", 7000);
@@ -1284,13 +1405,9 @@
   overlayVideo?.addEventListener("timeupdate", drawOverlayBoxes);
   overlayVideo?.addEventListener("seeked", drawOverlayBoxes);
   overlayVideo?.addEventListener("play", startOverlayLoop);
-  overlayVideo?.addEventListener("error", () => {
-    if (overlayPlayWarn) {
-      overlayPlayWarn.textContent =
-        "Браузер не смог открыть исходник (часто HEVC без кодека). Скачай MKV и открой в VLC.";
-      overlayPlayWarn.classList.remove("hidden");
-    }
-  });
+  btnHlsPlay?.addEventListener("click", () => playOverlayHls(btnHlsPlay));
+  btnHlsFromStart?.addEventListener("click", () => playOverlayHls(btnHlsFromStart, { fromStart: true }));
+  btnHlsStop?.addEventListener("click", () => stopOverlayHls());
   btnDlMkv?.addEventListener("click", () => downloadOverlayMkv(btnDlMkv));
   sourceVideoInput?.addEventListener("change", () => {
     if (currentRunDir && currentRunId) loadOverlayPlayer();

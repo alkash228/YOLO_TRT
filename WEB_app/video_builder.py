@@ -58,6 +58,7 @@ def load_run_metadata(
     run_id: str,
     *,
     source_video: str | None = None,
+    scan_source_frames: bool = True,
 ) -> dict[str, Any]:
     run_dir = Path(run_dir)
     result_path = run_dir / f"{run_id}_result.json"
@@ -114,7 +115,7 @@ def load_run_metadata(
         or (summary.get("stats_summary") or meta.get("stats_summary") or {}).get("frame_stride")
         or 1
     )
-    if source_frame_count <= 0:
+    if source_frame_count <= 0 and scan_source_frames:
         max_idx = -1
         for packet in iter_run_packets(data, run_dir):
             max_idx = max(max_idx, int(packet.frame_idx))

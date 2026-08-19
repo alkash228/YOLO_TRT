@@ -76,16 +76,22 @@ def _scan_violator_packets(
     data: dict[str, Any],
     run_dir: Path,
     stable_id: int,
-) -> tuple[list[int], list[int], FramePacket | None, int]:
+    *,
+    stop_after_first_violation: bool = True,
+) -> tuple[int, int, FramePacket | None, int]:
     """
-    One pass over spill packets:
-    presence frames, violation frames, a packet for the chosen report frame, counts.
-    Prefers a NO HELMET frame (middle of violations) for the photo.
+    Find the first NO HELMET packet for this ID.
+
+    Default stops at the first violation so Word does not walk hours of spill.
+    Counts are complete only if stop_after_first_violation is False.
     """
     sid = int(stable_id)
-    presence: list[int] = []
-    violations: list[int] = []
-    packets_by_frame: dict[int, FramePacket] = {}
+    presence_n = 0
+    viol_n = 0
+    first_presence: FramePacket | None = None
+    first_presence_idx = -1
+    first_viol: FramePacket | None = None
+    first_viol_idx = -1
     for packet in iter_run_packets(data, Path(run_dir)):
         n = int(packet.n_inst)
         if n <= 0 or packet.stable_ids is None:
@@ -103,20 +109,23 @@ def _scan_violator_packets(
         if not hit:
             continue
         fi = int(packet.frame_idx)
-        presence.append(fi)
-        packets_by_frame[fi] = packet
+        presence_n += 1
+        if first_presence is None:
+            first_presence = packet
+            first_presence_idx = fi
         if viol:
-            violations.append(fi)
+            viol_n += 1
+            if first_viol is None:
+                first_viol = packet
+                first_viol_idx = fi
+                if stop_after_first_violation:
+                    break
 
-    if violations:
-        # Earliest NO HELMET — much faster on long HEVC than mid-video frame.
-        frame_idx = int(violations[0])
-    elif presence:
-        frame_idx = int(presence[0])
-    else:
-        return [], [], None, -1
-
-    return presence, violations, packets_by_frame.get(frame_idx), frame_idx
+    if first_viol is not None:
+        return presence_n, viol_n, first_viol, first_viol_idx
+    if first_presence is not None:
+        return presence_n, viol_n, first_presence, first_presence_idx
+    return 0, 0, None, -1
 
 
 def _clip_path_for_id(run_dir: Path, run_id: str, stable_id: int) -> Path:
@@ -168,12 +177,12 @@ def read_source_frame_bgr(
     *,
     fps: float | None = None,
 ) -> np.ndarray | None:
-    """Grab one source frame. HEVC uses ffmpeg timestamp seek, not a full-file decode."""
-    from app.core.frame_io import read_frame_bgr_smart
+    """Grab one source frame via ffmpeg timestamp seek (no OpenCV on HEVC)."""
+    from app.core.frame_io import read_frame_bgr_ffmpeg
 
     if not input_path:
         return None
-    return read_frame_bgr_smart(str(input_path), int(frame_idx), fps=fps)
+    return read_frame_bgr_ffmpeg(str(input_path), int(frame_idx), fps=fps)
 
 
 def _imwrite_bgr(path: Path, bgr: np.ndarray, *, quality: int = 92) -> None:
@@ -319,6 +328,57 @@ def render_person_frame_rgb(
     return _annotate_stable_id(rgb, int(stable_id), int(frame_idx))
 
 
+def render_report_still_rgb(
+    *,
+    packet: FramePacket,
+    stable_id: int,
+    meta: dict[str, Any],
+    frame_idx: int,
+    run_dir: Path,
+    run_id: str | None,
+    source_override: str | None = None,
+) -> np.ndarray:
+    """Word photo: ffmpeg keyframe + boxes from instance_meta. No RLE inflate."""
+    from app.core.video_encode import resolve_run_source_video
+
+    recorded = str(meta.get("input_path") or meta.get("recorded_input_path") or "")
+    input_path = (
+        resolve_run_source_video(
+            Path(run_dir),
+            recorded,
+            run_id=run_id,
+            override=source_override,
+        )
+        or recorded
+    )
+    fps_raw = float(meta.get("fps") or 0.0)
+    fps = fps_raw if fps_raw > 1.0 else None
+    frame_bgr = read_source_frame_bgr(input_path, frame_idx, fps=fps) if input_path else None
+    if frame_bgr is None:
+        if packet.mask_hw:
+            height, width = int(packet.mask_hw[0]), int(packet.mask_hw[1])
+        else:
+            width = int(meta.get("width") or 1280)
+            height = int(meta.get("height") or 720)
+        frame_bgr = _blank_bgr(width, height)
+    height, width = int(frame_bgr.shape[0]), int(frame_bgr.shape[1])
+    rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+    rgb = stamp_all_people_boxes_rgb(
+        rgb, packet, target_w=width, target_h=height, focus_sid=int(stable_id)
+    )
+    rgb = stamp_helmet_accessories_rgb(rgb, packet, target_w=width, target_h=height)
+    rgb = highlight_no_helmet_on_rgb(
+        rgb,
+        packet,
+        int(stable_id),
+        target_w=width,
+        target_h=height,
+        frame_bgr=frame_bgr,
+        force=True,
+    )
+    return _annotate_stable_id(rgb, int(stable_id), int(frame_idx))
+
+
 def build_word_report(
     run_dir: str | Path,
     run_id: str,
@@ -329,6 +389,8 @@ def build_word_report(
     incident_datetime: datetime,
     overlay_override: dict[str, Any] | None = None,
     source_video: str | None = None,
+    violation_count: int | None = None,
+    presence_frames: int | None = None,
 ) -> Path:
     try:
         from docx import Document
@@ -341,32 +403,31 @@ def build_word_report(
 
     run_path = Path(run_dir)
     sid = int(stable_id)
-    meta = load_run_metadata(run_path, run_id)
+    meta = load_run_metadata(run_path, run_id, source_video=source_video, scan_source_frames=False)
     data, _ = resolve_run_packets(run_path, run_id=run_id)
-    overlay = resolve_overlay(meta, overlay_override=overlay_override)
 
-    presence, violations, packet, frame_idx = _scan_violator_packets(
-        data, run_path, sid
+    have_counts = violation_count is not None and presence_frames is not None
+    presence_n, viol_n, packet, frame_idx = _scan_violator_packets(
+        data,
+        run_path,
+        sid,
+        stop_after_first_violation=True,
     )
     if frame_idx < 0 or packet is None:
         raise RuntimeError(f"Нет кадров с нарушителем ID {sid}")
 
-    # Always render from packets filtered by THIS stable_id.
-    # Do not reuse clip stills — old/wrong clips produced the same photo for every ID.
-    rgb = render_person_frame_rgb(
+    rgb = render_report_still_rgb(
         packet=packet,
         stable_id=sid,
         meta=meta,
-        overlay=overlay,
         frame_idx=frame_idx,
-        prefer_violation=bool(violations),
         run_dir=run_path,
         run_id=run_id,
         source_override=source_video,
     )
 
-    violation_count = len(violations)
-    presence_count = len(presence)
+    viol_count = int(violation_count) if have_counts else int(viol_n)
+    presence_count = int(presence_frames) if have_counts else int(presence_n)
 
     reports_dir = run_path / "reports"
     reports_dir.mkdir(parents=True, exist_ok=True)
@@ -410,7 +471,7 @@ def build_word_report(
     add_row("Вид нарушения", "Работа без защитной каски (NO HELMET)")
     add_row("Идентификатор нарушителя", f"№ {sid}")
     add_row("Кадров присутствия в видео", str(presence_count))
-    add_row("Срабатываний без каски", str(violation_count))
+    add_row("Срабатываний без каски", str(viol_count))
     add_row("Кадр в отчёте", str(frame_idx))
     add_row("Исходное видео", source_name)
 

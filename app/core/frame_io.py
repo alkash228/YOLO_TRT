@@ -33,39 +33,15 @@ def _fourcc_to_str(fourcc: int) -> str:
     return "".join(chars)
 
 
-def is_hevc_video(input_path: str, cap: cv2.VideoCapture | None = None) -> bool:
-    """True when container/codec looks like H.265 — OpenCV POS_FRAMES seek corrupts it."""
-    own = False
-    if cap is None:
-        cap = cv2.VideoCapture(str(input_path))
-        own = True
-    try:
-        if not cap.isOpened():
-            return "hevc" in str(input_path).casefold() or str(input_path).lower().endswith(
-                (".h265", ".hevc")
-            )
-        code = _fourcc_to_str(int(cap.get(cv2.CAP_PROP_FOURCC) or 0)).casefold().strip()
-        if code in _HEVC_FOURCC or "hevc" in code or "h265" in code or "hvc" in code:
-            return True
-        # Some builds report 0 fourcc; sniff with ffprobe when available.
-    finally:
-        if own:
-            cap.release()
-    try:
-        from app.core.ffmpeg_utils import resolve_ffmpeg_exe
-
-        exe = resolve_ffmpeg_exe().replace("ffmpeg", "ffprobe")
-        # resolve_ffmpeg_exe returns ffmpeg path — derive ffprobe sibling
-        from pathlib import Path
-
-        ff = Path(resolve_ffmpeg_exe())
-        probe = ff.with_name("ffprobe.exe" if ff.suffix.lower() == ".exe" else "ffprobe")
-        if not probe.is_file():
-            probe = ff.with_name("ffprobe")
-        if probe.is_file():
+@lru_cache(maxsize=64)
+def probe_video_codec(input_path: str) -> str:
+    """Video codec_name (lowercase). ffprobe, else ffmpeg -i stderr. No OpenCV."""
+    probe = _ffprobe_exe()
+    if probe:
+        try:
             proc = subprocess.run(
                 [
-                    str(probe),
+                    probe,
                     "-v",
                     "error",
                     "-select_streams",
@@ -82,10 +58,46 @@ def is_hevc_video(input_path: str, cap: cv2.VideoCapture | None = None) -> bool:
                 check=False,
             )
             name = (proc.stdout or "").strip().casefold()
-            if "hevc" in name or "h265" in name:
-                return True
+            if name:
+                return name
+        except (OSError, subprocess.SubprocessError):
+            pass
+    try:
+        from app.core.ffmpeg_utils import resolve_ffmpeg_exe
+
+        exe = resolve_ffmpeg_exe()
+        proc = subprocess.run(
+            [exe, "-hide_banner", "-i", str(input_path)],
+            capture_output=True,
+            timeout=20,
+            check=False,
+        )
+        text = ((proc.stderr or b"") + (proc.stdout or b"")).decode("utf-8", errors="replace").casefold()
+        if "video: hevc" in text or "video: h265" in text:
+            return "hevc"
+        if "video: h264" in text or "video: avc" in text:
+            return "h264"
+        for token in ("hevc", "h265", "h264", "av1", "mpeg4"):
+            if f"video: {token}" in text:
+                return token
     except Exception:
         pass
+    return ""
+
+
+def is_hevc_video(input_path: str, cap: cv2.VideoCapture | None = None) -> bool:
+    """True when container/codec looks like H.265 — OpenCV POS_FRAMES seek corrupts it."""
+    path = str(input_path)
+    low = path.casefold()
+    if low.endswith((".h265", ".hevc")) or "hevc" in Path(path).name.casefold():
+        return True
+    codec = probe_video_codec(path)
+    if codec:
+        return "hevc" in codec or "h265" in codec
+    if cap is not None and cap.isOpened():
+        code = _fourcc_to_str(int(cap.get(cv2.CAP_PROP_FOURCC) or 0)).casefold().strip()
+        if code in _HEVC_FOURCC or "hevc" in code or "h265" in code or "hvc" in code:
+            return True
     return False
 
 
@@ -107,57 +119,49 @@ def _ffprobe_exe() -> str | None:
 
 @lru_cache(maxsize=64)
 def probe_video_fps(input_path: str) -> float:
-    """Best-effort fps for timestamp seeks. Never raises."""
+    """Best-effort fps for timestamp seeks. Never opens OpenCV (slow on long HEVC)."""
     path = str(input_path)
-    cap = cv2.VideoCapture(path)
-    try:
-        if cap.isOpened():
-            fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
-            if 1.0 <= fps <= 240.0:
-                return fps
-    finally:
-        cap.release()
     probe = _ffprobe_exe()
-    if not probe:
-        return 25.0
-    try:
-        proc = subprocess.run(
-            [
-                probe,
-                "-v",
-                "error",
-                "-select_streams",
-                "v:0",
-                "-show_entries",
-                "stream=avg_frame_rate,r_frame_rate",
-                "-of",
-                "default=noprint_wrappers=1:nokey=1",
-                path,
-            ],
-            capture_output=True,
-            text=True,
-            timeout=15,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return 25.0
-    for line in (proc.stdout or "").splitlines():
-        text = line.strip()
-        if not text or text in {"0/0", "N/A"}:
-            continue
-        if "/" in text:
-            num, den = text.split("/", 1)
-            try:
-                fps = float(num) / float(den)
-            except (TypeError, ValueError, ZeroDivisionError):
-                continue
-        else:
-            try:
-                fps = float(text)
-            except ValueError:
-                continue
-        if 1.0 <= fps <= 240.0:
-            return fps
+    if probe:
+        try:
+            proc = subprocess.run(
+                [
+                    probe,
+                    "-v",
+                    "error",
+                    "-select_streams",
+                    "v:0",
+                    "-show_entries",
+                    "stream=avg_frame_rate,r_frame_rate",
+                    "-of",
+                    "default=noprint_wrappers=1:nokey=1",
+                    path,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            proc = None
+        if proc is not None:
+            for line in (proc.stdout or "").splitlines():
+                text = line.strip()
+                if not text or text in {"0/0", "N/A"}:
+                    continue
+                if "/" in text:
+                    num, den = text.split("/", 1)
+                    try:
+                        fps = float(num) / float(den)
+                    except (TypeError, ValueError, ZeroDivisionError):
+                        continue
+                else:
+                    try:
+                        fps = float(text)
+                    except ValueError:
+                        continue
+                if 1.0 <= fps <= 240.0:
+                    return fps
     return 25.0
 
 
@@ -252,27 +256,10 @@ def read_frame_bgr_ffmpeg(
     if rate < 1.0:
         rate = 25.0
     t = target / rate
-    # Input -ss jumps near a keyframe; output -ss finishes the last few seconds.
-    pad = 4.0
-    input_ss = max(0.0, t - pad)
-    output_ss = max(0.0, t - input_ss)
-    hit = _ffmpeg_still_cmd(
-        [
-            "-ss",
-            f"{input_ss:.3f}",
-            "-i",
-            path,
-            "-ss",
-            f"{output_ss:.3f}",
-        ],
-        timeout_sec=45.0,
-    )
-    if hit is not None:
-        return hit
-    # Keyframe-only (faster, slightly less exact).
+    # Input-side -ss = keyframe seek. Do not decode from t=0 (that made Word hang).
     return _ffmpeg_still_cmd(
         ["-ss", f"{t:.3f}", "-i", path],
-        timeout_sec=30.0,
+        timeout_sec=20.0,
     )
 
 
@@ -291,6 +278,8 @@ def read_frame_bgr_smart(
     if target > int(max_skip):
         return None
     path = str(input_path)
+    if is_hevc_video(path):
+        return read_frame_bgr_ffmpeg(path, target, max_skip=max_skip, fps=fps)
 
     cap = cv2.VideoCapture(path)
     if not cap.isOpened():

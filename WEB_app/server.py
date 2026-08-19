@@ -649,6 +649,8 @@ class WordReportBody(BaseModel):
     incident_datetime: str = ""
     job_id: str | None = None
     source_video: str | None = None
+    violation_count: int | None = None
+    presence_frames: int | None = None
 
 
 class WordReportResponse(BaseModel):
@@ -661,6 +663,15 @@ class OverlayBody(BaseModel):
     run_dir: str
     run_id: str
     source_video: str | None = None
+
+
+class OverlayHlsBody(BaseModel):
+    run_dir: str
+    run_id: str
+    source_video: str | None = None
+    start_sec: float | None = None
+    duration_sec: float = 0.0
+    stable_id: int | None = None
 
 
 class SettingsUpdateProxy(BaseModel):
@@ -1092,6 +1103,60 @@ def _overlay_timeline_or_400(
         raise HTTPException(500, str(exc)) from exc
 
 
+def _resolve_overlay_source(
+    run_dir: str,
+    run_id: str,
+    source_video: str | None = None,
+) -> tuple[Path, str | None]:
+    import json as _json
+
+    from app.core.video_encode import resolve_run_source_video
+
+    host = _resolve_host_run_dir(run_dir)
+    if not host.is_dir():
+        raise HTTPException(400, _run_dir_missing_detail(run_dir, host))
+    recorded = ""
+    result_path = host / f"{run_id}_result.json"
+    if result_path.is_file():
+        try:
+            payload = _json.loads(result_path.read_text(encoding="utf-8"))
+            recorded = str(
+                payload.get("input_path")
+                or (payload.get("record") or {}).get("input_path")
+                or ""
+            )
+        except (OSError, ValueError):
+            recorded = ""
+    source = resolve_run_source_video(
+        host,
+        recorded,
+        run_id=run_id,
+        override=(source_video or "").strip() or None,
+    )
+    return host, source
+
+
+@app.get("/overlay/info")
+def overlay_info(
+    run_dir: str,
+    run_id: str,
+    source_video: str | None = None,
+) -> dict[str, Any]:
+    """Cheap source/codec probe — does not walk packets or open HEVC in OpenCV."""
+    from app.core.frame_io import is_hevc_video, probe_video_codec
+
+    _host, source = _resolve_overlay_source(run_dir, run_id, source_video)
+    has = bool(source and Path(source).is_file())
+    codec = probe_video_codec(source) if has else ""
+    hevc = bool(has and is_hevc_video(source))
+    return {
+        "has_source": has,
+        "filename": Path(source).name if has else None,
+        "codec": codec or None,
+        "hevc": hevc,
+    }
+
+
 @app.get("/overlay/timeline")
 def overlay_timeline(
     run_dir: str,
@@ -1110,8 +1175,8 @@ def overlay_source(
     run_id: str,
     source_video: str | None = None,
 ) -> FileResponse:
-    timeline = _overlay_timeline_or_400(run_dir, run_id, source_video)
-    path = Path(str(timeline.get("source_path") or ""))
+    _host, source = _resolve_overlay_source(run_dir, run_id, source_video)
+    path = Path(str(source or ""))
     if not path.is_file():
         raise HTTPException(
             404,
@@ -1124,6 +1189,72 @@ def overlay_source(
         media_type="video/mp4",
         headers={"Accept-Ranges": "bytes"},
     )
+
+
+@app.post("/overlay/hls/start")
+def overlay_hls_start(body: OverlayHlsBody) -> dict[str, Any]:
+    from WEB_app.hls_stream import start_hls
+    from WEB_app.video_builder import load_run_metadata
+    from WEB_app.word_report import _scan_violator_packets
+
+    host, source = _resolve_overlay_source(body.run_dir, body.run_id, body.source_video)
+    if not source or not Path(source).is_file():
+        raise HTTPException(404, "Исходное видео не найдено")
+    start_sec = body.start_sec
+    if start_sec is None and body.stable_id is not None:
+        meta = load_run_metadata(
+            host, body.run_id, source_video=body.source_video, scan_source_frames=False
+        )
+        data = meta["packets_data"]
+        fps = float(meta.get("fps") or 25.0) or 25.0
+        _pn, _vn, packet, frame_idx = _scan_violator_packets(
+            data, host, int(body.stable_id), stop_after_first_violation=True
+        )
+        if packet is None or frame_idx < 0:
+            start_sec = 0.0
+        else:
+            start_sec = max(0.0, float(frame_idx) / fps - 1.0)
+    if start_sec is None:
+        start_sec = 0.0
+    try:
+        info = start_hls(
+            run_dir=host,
+            run_id=body.run_id,
+            source=str(source),
+            start_sec=float(start_sec),
+            duration_sec=float(body.duration_sec or 0.0),
+        )
+    except Exception as exc:
+        raise HTTPException(500, str(exc)) from exc
+    return info
+
+
+@app.post("/overlay/hls/stop")
+def overlay_hls_stop() -> dict[str, bool]:
+    from WEB_app.hls_stream import stop_hls
+
+    stop_hls()
+    return {"ok": True}
+
+
+@app.get("/overlay/hls/{run_id}/{filename}")
+def overlay_hls_file(run_id: str, filename: str) -> FileResponse:
+    from WEB_app.hls_stream import active_hls_dir
+
+    if ".." in filename or ".." in run_id or "/" in filename or "\\" in filename:
+        raise HTTPException(400, "Invalid path")
+    folder = active_hls_dir(run_id)
+    if folder is None:
+        raise HTTPException(404, "HLS сессия не запущена")
+    path = (folder / filename).resolve()
+    if folder.resolve() not in path.parents and path.parent.resolve() != folder.resolve():
+        raise HTTPException(400, "Invalid path")
+    if not path.is_file():
+        raise HTTPException(404, filename)
+    suffix = path.suffix.lower()
+    media = "application/vnd.apple.mpegurl" if suffix == ".m3u8" else "video/mp2t"
+    headers = {"Cache-Control": "no-cache"} if suffix == ".m3u8" else {"Cache-Control": "public, max-age=5"}
+    return FileResponse(path, media_type=media, headers=headers)
 
 
 @app.get("/overlay/player")
@@ -1199,6 +1330,8 @@ def create_word_report(body: WordReportBody) -> WordReportResponse:
             organization=str(body.organization or body.company or "").strip(),
             incident_datetime=parse_incident_datetime(body.incident_datetime),
             source_video=(body.source_video or "").strip() or None,
+            violation_count=body.violation_count,
+            presence_frames=body.presence_frames,
         )
     except Exception as exc:
         raise HTTPException(500, str(exc)) from exc

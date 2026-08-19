@@ -67,7 +67,7 @@ def build_overlay_timeline(
     """Keyframe boxes from packets (instance_meta only — no RLE inflate)."""
     run_path = Path(run_dir)
     rid = str(run_id)
-    meta = load_run_metadata(run_path, rid, source_video=source_video)
+    meta = load_run_metadata(run_path, rid, source_video=source_video, scan_source_frames=False)
     data = meta["packets_data"]
     fps = float(meta.get("fps") or data.get("fps") or 25.0) or 25.0
     width = int(meta.get("width") or data.get("width") or 0)
