@@ -33,6 +33,7 @@
   const playerHint = $("#player-hint");
   const playerStage = $("#player-stage");
   const playerVideo = $("#player-video");
+  const playerCanvas = $("#player-canvas");
   const btnPlayViol = $("#btn-play-viol");
   const btnPlayStart = $("#btn-play-start");
   const btnPlayStop = $("#btn-play-stop");
@@ -54,6 +55,13 @@
   let currentRunId = null;
   let currentViolators = [];
   let overlayHls = null;
+  let overlayTimeline = null;
+  let overlayEventIdx = 0;
+  let overlayHlsOffset = 0;
+  let overlayRaf = 0;
+  let overlayUseRvfc = false;
+  let overlayLastEvent = null;
+  let overlayComposite = false;
   let pollTimer = null;
   let pollJobId = null;
   let buildPollTimer = null;
@@ -429,7 +437,25 @@
     return probe.canPlayType('video/mp4; codecs="hvc1.1.6.L93.B0"') === "probably";
   }
 
+  function stopOverlayLoop() {
+    if (!overlayRaf) return;
+    if (overlayUseRvfc && playerVideo?.cancelVideoFrameCallback) {
+      try {
+        playerVideo.cancelVideoFrameCallback(overlayRaf);
+      } catch (_) {
+        /* ignore */
+      }
+    } else {
+      cancelAnimationFrame(overlayRaf);
+    }
+    overlayRaf = 0;
+  }
+
   function destroyOverlayHls() {
+    stopOverlayLoop();
+    overlayComposite = false;
+    overlayLastEvent = null;
+    playerStage?.classList.remove("is-composite");
     if (overlayHls) {
       try {
         overlayHls.destroy();
@@ -437,6 +463,10 @@
         /* ignore */
       }
       overlayHls = null;
+    }
+    if (playerCanvas) {
+      const ctx = playerCanvas.getContext("2d");
+      if (ctx) ctx.clearRect(0, 0, playerCanvas.width, playerCanvas.height);
     }
     if (playerVideo) {
       playerVideo.pause();
@@ -447,6 +477,111 @@
         /* ignore */
       }
     }
+  }
+
+  function mediaAbsTime() {
+    return (overlayHlsOffset || 0) + (playerVideo?.currentTime || 0);
+  }
+
+  function findOverlayEvent(t) {
+    const events = overlayTimeline?.events || [];
+    if (!events.length) return overlayLastEvent;
+    while (overlayEventIdx + 1 < events.length && events[overlayEventIdx + 1].t0 <= t) {
+      overlayEventIdx += 1;
+    }
+    while (overlayEventIdx > 0 && events[overlayEventIdx].t0 > t) {
+      overlayEventIdx -= 1;
+    }
+    const ev = events[overlayEventIdx];
+    if (!ev) return overlayLastEvent;
+    if (t < ev.t0 - 0.25) return overlayLastEvent;
+    if (ev.t1 != null && t > ev.t1 + 1.5) return overlayLastEvent;
+    overlayLastEvent = ev;
+    return ev;
+  }
+
+  function drawOverlayBoxes() {
+    if (!playerVideo || !playerCanvas) return;
+    const ctx = playerCanvas.getContext("2d", { alpha: true });
+    if (!ctx) return;
+    const w = playerVideo.videoWidth || overlayTimeline?.width || 0;
+    const h = playerVideo.videoHeight || overlayTimeline?.height || 0;
+    if (!w || !h) return;
+    if (playerCanvas.width !== w) playerCanvas.width = w;
+    if (playerCanvas.height !== h) playerCanvas.height = h;
+    ctx.clearRect(0, 0, w, h);
+    if (playerVideo.readyState >= 2) {
+      try {
+        ctx.drawImage(playerVideo, 0, 0, w, h);
+        if (!overlayComposite) {
+          overlayComposite = true;
+          playerStage?.classList.add("is-composite");
+        }
+      } catch (_) {
+        overlayComposite = false;
+        playerStage?.classList.remove("is-composite");
+      }
+    }
+    const ev = findOverlayEvent(mediaAbsTime());
+    if (!ev) return;
+    const sx = w / Math.max(1, overlayTimeline?.width || w);
+    const sy = h / Math.max(1, overlayTimeline?.height || h);
+    ctx.lineJoin = "round";
+    ctx.font = "bold 18px Segoe UI, system-ui, sans-serif";
+    for (const b of ev.boxes || []) {
+      const x = b.x * sx;
+      const y = b.y * sy;
+      const bw = b.w * sx;
+      const bh = b.h * sy;
+      const helmet = b.k === "h";
+      const color = helmet ? "#38bdf8" : b.v ? "#ef4444" : "#22c55e";
+      ctx.lineWidth = helmet ? 2 : b.v ? 5 : 3;
+      ctx.strokeStyle = color;
+      ctx.strokeRect(x, y, bw, bh);
+      ctx.fillStyle = color;
+      const label = helmet ? "helmet" : b.v ? `NO HELMET ID ${b.id}` : `ID ${b.id}`;
+      ctx.fillText(label, x, Math.max(18, y - 6));
+    }
+  }
+
+  function startOverlayLoop() {
+    const loop = () => {
+      drawOverlayBoxes();
+      if (!playerVideo || playerVideo.paused || playerVideo.ended) {
+        overlayRaf = 0;
+        return;
+      }
+      if (playerVideo.requestVideoFrameCallback) {
+        overlayUseRvfc = true;
+        overlayRaf = playerVideo.requestVideoFrameCallback(loop);
+      } else {
+        overlayUseRvfc = false;
+        overlayRaf = requestAnimationFrame(loop);
+      }
+    };
+    stopOverlayLoop();
+    overlayRaf = requestAnimationFrame(loop);
+  }
+
+  async function loadOverlayWindow(startSec, durationSec) {
+    overlayTimeline = null;
+    overlayEventIdx = 0;
+    overlayLastEvent = null;
+    const q = overlayQuery();
+    const t0 = Math.max(0, Number(startSec) || 0);
+    const span = Math.max(8, Number(durationSec) || 90);
+    q.set("t0", String(Math.max(0, t0 - 2)));
+    q.set("t1", String(t0 + span + 4));
+    const r = await fetch(`/overlay/timeline?${q}`);
+    if (!r.ok) throw new Error(await r.text());
+    overlayTimeline = await r.json();
+    overlayEventIdx = 0;
+    const n = overlayTimeline?.events?.length || 0;
+    if (!n) {
+      showToast("Оверлей", "В этом окне нет пакетов детекции", "error", 8000);
+    }
+    drawOverlayBoxes();
+    return n;
   }
 
   async function preparePlayer() {
@@ -488,6 +623,7 @@
       overlayHls.attachMedia(playerVideo);
       overlayHls.on(HlsCtor.Events.MANIFEST_PARSED, () => {
         playerVideo?.play()?.catch(() => {});
+        startOverlayLoop();
       });
       overlayHls.on(HlsCtor.Events.ERROR, (_ev, data) => {
         if (data?.fatal) {
@@ -506,19 +642,13 @@
 
   async function playNativeSource(startSec) {
     destroyOverlayHls();
+    overlayHlsOffset = 0;
     playerStage?.classList.remove("hidden");
     playerVideo.src = `/overlay/source?${overlayQuery()}`;
     await new Promise((resolve, reject) => {
       const onMeta = () => {
         playerVideo.removeEventListener("loadedmetadata", onMeta);
         playerVideo.removeEventListener("error", onErr);
-        if (startSec > 0.2 && Number.isFinite(playerVideo.duration)) {
-          try {
-            playerVideo.currentTime = Math.min(startSec, Math.max(0, playerVideo.duration - 0.2));
-          } catch (_) {
-            /* ignore */
-          }
-        }
         resolve();
       };
       const onErr = () => {
@@ -530,6 +660,26 @@
       playerVideo.addEventListener("error", onErr);
       playerVideo.load();
     });
+    if (startSec > 0.2 && Number.isFinite(playerVideo.duration)) {
+      const target = Math.min(startSec, Math.max(0, playerVideo.duration - 0.2));
+      await new Promise((resolve) => {
+        let settled = false;
+        const done = () => {
+          if (settled) return;
+          settled = true;
+          playerVideo.removeEventListener("seeked", done);
+          resolve();
+        };
+        playerVideo.addEventListener("seeked", done);
+        try {
+          playerVideo.currentTime = target;
+        } catch (_) {
+          done();
+          return;
+        }
+        setTimeout(done, 1800);
+      });
+    }
     await playerVideo.play();
   }
 
@@ -546,7 +696,10 @@
     try {
       const infoR = await fetch(`/overlay/info?${overlayQuery()}`);
       const info = infoR.ok ? await infoR.json() : {};
-      const sid = fromStart ? null : reportViolatorId?.value;
+      let sid = fromStart ? null : reportViolatorId?.value;
+      if (!fromStart && !sid && currentViolators.length) {
+        sid = String(currentViolators[0].stable_id);
+      }
       let startSec = fromStart ? 0 : null;
       if (startSec == null && sid) {
         const s = await fetch(`/overlay/seek?${overlayQuery()}&stable_id=${encodeURIComponent(sid)}`);
@@ -562,8 +715,16 @@
       if (nativeOk && info.has_source) {
         try {
           await playNativeSource(startSec);
-          showToast("Плеер", "Исходник в браузере (без перекодирования на сервере)");
-          playerHint.textContent = "Играет исходный файл. Сервер только отдаёт байты.";
+          overlayHlsOffset = 0;
+          let nEv = 0;
+          try {
+            nEv = await loadOverlayWindow(startSec, 120);
+          } catch (err) {
+            showToast("Оверлей", String(err.message || err), "error", 8000);
+          }
+          startOverlayLoop();
+          showToast("Плеер", "Исходник в браузере, рамки рисуются на кадре");
+          playerHint.textContent = `Исходник с ${startSec.toFixed(1)}с. Рамки: ${nEv || 0} ключ.кадров.`;
           return;
         } catch (_) {
           if (!info.hevc) throw new Error("Не удалось открыть исходник");
@@ -583,9 +744,16 @@
       });
       if (!r.ok) throw new Error(await r.text());
       const data = await r.json();
+      overlayHlsOffset = Number(data.start_sec) || 0;
       attachHls(data.playlist_url);
-      playerHint.textContent = `CPU-превью libx264 ~${Number(data.duration_sec || 90)}с с ${Number(data.start_sec || 0).toFixed(1)}с. Стоп гасит ffmpeg.`;
-      showToast("Плеер", "Первый кусок на CPU, дальше подгружается");
+      let nEv = 0;
+      try {
+        nEv = await loadOverlayWindow(overlayHlsOffset, Number(data.duration_sec) || 90);
+      } catch (err) {
+        showToast("Оверлей", String(err.message || err), "error", 8000);
+      }
+      playerHint.textContent = `CPU-превью ~${Number(data.duration_sec || 90)}с с ${overlayHlsOffset.toFixed(1)}с. Рамки: ${nEv || 0} ключ.кадров.`;
+      showToast("Плеер", "Превью на CPU, детекции рисуются на кадре");
     } catch (e) {
       showToast("Плеер", String(e.message || e), "error", 10000);
     } finally {
@@ -1362,6 +1530,9 @@
   btnPlayViol?.addEventListener("click", () => playInBrowser(btnPlayViol));
   btnPlayStart?.addEventListener("click", () => playInBrowser(btnPlayStart, { fromStart: true }));
   btnPlayStop?.addEventListener("click", () => stopPlayer());
+  playerVideo?.addEventListener("timeupdate", drawOverlayBoxes);
+  playerVideo?.addEventListener("seeked", drawOverlayBoxes);
+  playerVideo?.addEventListener("play", startOverlayLoop);
   sourceVideoInput?.addEventListener("change", () => {
     if (currentRunDir && currentRunId) preparePlayer();
   });

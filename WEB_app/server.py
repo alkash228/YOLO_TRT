@@ -1169,6 +1169,34 @@ def overlay_info(
     }
 
 
+@app.get("/overlay/timeline")
+def overlay_timeline(
+    run_dir: str,
+    run_id: str,
+    source_video: str | None = None,
+    t0: float | None = None,
+    t1: float | None = None,
+) -> dict[str, Any]:
+    from WEB_app.overlay_timeline import build_overlay_timeline
+
+    host = _resolve_host_run_dir(run_dir)
+    if not host.is_dir():
+        raise HTTPException(400, _run_dir_missing_detail(run_dir, host))
+    try:
+        timeline = build_overlay_timeline(
+            host,
+            run_id,
+            source_video=(source_video or "").strip() or None,
+            t0=t0,
+            t1=t1,
+        )
+    except Exception as exc:
+        raise HTTPException(500, str(exc)) from exc
+    public = dict(timeline)
+    public.pop("source_path", None)
+    return public
+
+
 @app.get("/overlay/source")
 def overlay_source(
     run_dir: str,

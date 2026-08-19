@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+import tempfile
 from collections.abc import Callable, Iterator
 from functools import lru_cache
 from pathlib import Path
@@ -216,6 +217,84 @@ def _decode_image_pipe(data: bytes) -> np.ndarray | None:
     return frame if frame is not None and frame.size > 0 else None
 
 
+def _even_wh(width: int, height: int) -> tuple[int, int]:
+    tw, th = int(width), int(height)
+    if tw <= 0 or th <= 0:
+        return (0, 0)
+    return (tw - (tw % 2), th - (th % 2))
+
+
+def _keyframe_pts_at_or_before(input_path: str, t: float, *, lookback: float = 30.0) -> float:
+    """Last keyframe PTS <= t. Mid-GOP HEVC decode is the smeared Word photo."""
+    probe = _ffprobe_exe()
+    target = max(0.0, float(t))
+    start = max(0.0, target - max(2.0, float(lookback)))
+    if not probe:
+        return start
+    cmd = [
+        probe,
+        "-v",
+        "error",
+        "-skip_frame",
+        "nokey",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "frame=pts_time,pkt_pts_time,best_effort_timestamp_time",
+        "-read_intervals",
+        f"{start:.3f}%{target + 0.08:.3f}",
+        "-of",
+        "csv=p=0",
+        str(input_path),
+    ]
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=25,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return start
+    best: float | None = None
+    for line in (proc.stdout or "").splitlines():
+        for part in line.strip().replace(",", " ").replace("|", " ").split():
+            try:
+                pts = float(part)
+            except ValueError:
+                continue
+            if pts < 0.0 or pts > target + 0.08:
+                continue
+            if best is None or pts > best:
+                best = pts
+    return best if best is not None else start
+
+
+def _ffmpeg_exe_kwargs() -> tuple[str, dict[str, object]] | None:
+    try:
+        from app.core.ffmpeg_utils import _popen_kwargs, resolve_ffmpeg_exe
+
+        return resolve_ffmpeg_exe(), _popen_kwargs()  # type: ignore[return-value]
+    except Exception:
+        return None
+
+
+def _reshape_bgr24(raw: bytes, width: int, height: int) -> np.ndarray | None:
+    tw, th = int(width), int(height)
+    if tw <= 0 or th <= 0 or not raw:
+        return None
+    need = tw * th * 3
+    if len(raw) >= need:
+        return np.frombuffer(raw[:need], dtype=np.uint8).reshape(th, tw, 3).copy()
+    # ffmpeg sometimes emits a different height; keep stride = width.
+    if len(raw) >= tw * 3 and len(raw) % (tw * 3) == 0:
+        got_h = len(raw) // (tw * 3)
+        if got_h > 0:
+            return np.frombuffer(raw, dtype=np.uint8).reshape(got_h, tw, 3).copy()
+    return None
+
+
 def _ffmpeg_raw_still(
     extra: list[str],
     *,
@@ -224,30 +303,29 @@ def _ffmpeg_raw_still(
     timeout_sec: float,
 ) -> np.ndarray | None:
     """One still as raw BGR24 — no JPEG/PNG re-encode (that smeared Word photos)."""
-    tw, th = int(width), int(height)
+    tw, th = _even_wh(width, height)
     if tw <= 0 or th <= 0:
         return None
-    frame_bytes = tw * th * 3
-    try:
-        from app.core.ffmpeg_utils import _popen_kwargs, resolve_ffmpeg_exe
-
-        exe = resolve_ffmpeg_exe()
-        kwargs = _popen_kwargs()
-    except Exception:
+    resolved = _ffmpeg_exe_kwargs()
+    if resolved is None:
         return None
+    exe, kwargs = resolved
+    vf = (
+        f"scale={tw}:{th}:flags=neighbor+accurate_rnd+full_chroma_int+full_chroma_inp,"
+        "format=bgr24"
+    )
     cmd = [
         exe,
         "-hide_banner",
+        "-nostdin",
         "-loglevel",
         "error",
         *extra,
         "-frames:v",
         "1",
         "-an",
-        "-sws_flags",
-        "lanczos+accurate_rnd+full_chroma_int+full_chroma_inp",
         "-vf",
-        "format=bgr24",
+        vf,
         "-f",
         "rawvideo",
         "-pix_fmt",
@@ -264,10 +342,58 @@ def _ffmpeg_raw_still(
         )
     except (OSError, subprocess.SubprocessError):
         return None
-    raw = proc.stdout or b""
-    if len(raw) < frame_bytes:
+    return _reshape_bgr24(proc.stdout or b"", tw, th)
+
+
+def _ffmpeg_bmp_still(
+    extra: list[str],
+    *,
+    timeout_sec: float,
+) -> np.ndarray | None:
+    """Lossless BMP on disk — last resort, never JPEG/PNG pipe."""
+    resolved = _ffmpeg_exe_kwargs()
+    if resolved is None:
         return None
-    return np.frombuffer(raw[:frame_bytes], dtype=np.uint8).reshape(th, tw, 3).copy()
+    exe, kwargs = resolved
+    tmp = tempfile.NamedTemporaryFile(prefix="yolo_still_", suffix=".bmp", delete=False)
+    tmp_path = Path(tmp.name)
+    tmp.close()
+    cmd = [
+        exe,
+        "-hide_banner",
+        "-nostdin",
+        "-y",
+        "-loglevel",
+        "error",
+        *extra,
+        "-frames:v",
+        "1",
+        "-an",
+        "-update",
+        "1",
+        str(tmp_path),
+    ]
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            timeout=max(15.0, float(timeout_sec)),
+            check=False,
+            **kwargs,
+        )
+        if proc.returncode != 0 or not tmp_path.is_file() or tmp_path.stat().st_size < 64:
+            return None
+        frame = cv2.imread(str(tmp_path), cv2.IMREAD_COLOR)
+        if frame is None or frame.size <= 0:
+            return None
+        return frame
+    except (OSError, subprocess.SubprocessError):
+        return None
+    finally:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def read_frame_bgr_sequential(
@@ -346,8 +472,9 @@ def read_frame_bgr_ffmpeg(
     """
     One still via ffmpeg timestamp seek (GOP-local decode).
 
-    accurate=True (Word): GOP-local dual -ss + raw BGR24. image2pipe mjpeg/png
-    was smearing the photo while Python boxes stayed sharp.
+    accurate=True (Word): seek to the real keyframe before t, then decode that
+    GOP to raw BGR24. A short pad (4s) lands mid-GOP on camera HEVC → smeared
+    photo with sharp Python boxes. Never JPEG/PNG pipe on this path.
     """
     target = max(0, int(frame_idx))
     if target > int(max_skip):
@@ -366,22 +493,25 @@ def read_frame_bgr_ffmpeg(
     if tw <= 0 or th <= 0:
         tw = int(width or 0)
         th = int(height or 0)
+    key = _keyframe_pts_at_or_before(path, t, lookback=30.0)
+    in_ss = max(0.0, key)
+    out_ss = max(0.0, t - in_ss)
+    extra = ["-ss", f"{in_ss:.3f}", "-i", path]
+    if out_ss > 0.01:
+        extra.extend(["-ss", f"{out_ss:.3f}"])
     if tw > 0 and th > 0:
-        # Input -ss ≈ keyframe, output -ss reconstructs the GOP. Raw BGR, no JPEG.
-        pad = 4.0
-        in_ss = max(0.0, t - pad)
-        out_ss = t - in_ss
-        extra = ["-ss", f"{in_ss:.3f}", "-i", path]
-        if out_ss > 0.02:
-            extra.extend(["-ss", f"{out_ss:.3f}"])
-        hit = _ffmpeg_raw_still(extra, width=tw, height=th, timeout_sec=40.0)
+        hit = _ffmpeg_raw_still(extra, width=tw, height=th, timeout_sec=50.0)
         if hit is not None:
             return hit
-    extra = ["-i", path, "-ss", f"{t:.3f}"]
-    hit = _ffmpeg_still_cmd(extra, timeout_sec=40.0, vcodec="png")
+    hit = _ffmpeg_bmp_still(extra, timeout_sec=50.0)
     if hit is not None:
         return hit
-    return _ffmpeg_still_cmd(extra, timeout_sec=40.0, vcodec="mjpeg")
+    extra_slow = ["-i", path, "-ss", f"{t:.3f}"]
+    if tw > 0 and th > 0:
+        hit = _ffmpeg_raw_still(extra_slow, width=tw, height=th, timeout_sec=90.0)
+        if hit is not None:
+            return hit
+    return _ffmpeg_bmp_still(extra_slow, timeout_sec=90.0)
 
 
 def read_frame_bgr_smart(

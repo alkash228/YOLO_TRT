@@ -218,7 +218,7 @@ def _imwrite_bgr(path: Path, bgr: np.ndarray, *, quality: int = 95) -> None:
     suffix = path.suffix.lower() or ".jpg"
     if suffix == ".png":
         ok, buf = cv2.imencode(
-            ".png", bgr, [int(cv2.IMWRITE_PNG_COMPRESSION), 3]
+            ".png", bgr, [int(cv2.IMWRITE_PNG_COMPRESSION), 1]
         )
     else:
         ok, buf = cv2.imencode(
@@ -267,7 +267,16 @@ def render_person_frame_rgb(
     fps_raw = float(meta.get("fps") or 0.0)
     fps = fps_raw if fps_raw > 1.0 else None
     frame_bgr = (
-        read_source_frame_bgr(input_path, frame_idx, fps=fps) if input_path else None
+        read_source_frame_bgr(
+            input_path,
+            frame_idx,
+            fps=fps,
+            accurate=True,
+            width=width or None,
+            height=height or None,
+        )
+        if input_path
+        else None
     )
 
     if packet is None:

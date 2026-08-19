@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Контроль касок — YOLO_DRT</title>
-  <link rel="stylesheet" href="/static/css/app.css" />
+  <link rel="stylesheet" href="/static/css/app.css?v=overlay-boxes2" />
 </head>
 <body>
   <div class="page">
@@ -142,6 +142,7 @@
           </div>
           <div class="player-stage hidden" id="player-stage">
             <video id="player-video" controls playsinline></video>
+            <canvas id="player-canvas"></canvas>
           </div>
         </div>
         <div class="report-panel" id="clips-panel">
@@ -163,6 +164,6 @@
   </div>
   <div class="toast-stack" id="toast-stack" aria-live="polite" aria-atomic="true"></div>
   <script src="/static/vendor/hls.min.js"></script>
-  <script src="/static/js/app.js"></script>
+  <script src="/static/js/app.js?v=overlay-boxes2"></script>
 </body>
 </html>
