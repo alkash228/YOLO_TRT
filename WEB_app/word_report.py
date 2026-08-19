@@ -162,13 +162,18 @@ def _annotate_stable_id(rgb: np.ndarray, stable_id: int, frame_idx: int) -> np.n
     )
     return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
 
-def read_source_frame_bgr(input_path: str, frame_idx: int) -> np.ndarray | None:
-    """Grab one source frame. HEVC-safe (no OpenCV seek — that yields corrupt frames)."""
+def read_source_frame_bgr(
+    input_path: str,
+    frame_idx: int,
+    *,
+    fps: float | None = None,
+) -> np.ndarray | None:
+    """Grab one source frame. HEVC uses ffmpeg timestamp seek, not a full-file decode."""
     from app.core.frame_io import read_frame_bgr_smart
 
     if not input_path:
         return None
-    return read_frame_bgr_smart(str(input_path), int(frame_idx))
+    return read_frame_bgr_smart(str(input_path), int(frame_idx), fps=fps)
 
 
 def _imwrite_bgr(path: Path, bgr: np.ndarray, *, quality: int = 92) -> None:
@@ -196,6 +201,7 @@ def render_person_frame_rgb(
     prefer_violation: bool = True,
     run_dir: Path | None = None,
     run_id: str | None = None,
+    source_override: str | None = None,
 ) -> np.ndarray:
     from app.core.video_encode import resolve_run_source_video
 
@@ -206,13 +212,18 @@ def render_person_frame_rgb(
             Path(run_dir),
             recorded,
             run_id=run_id,
+            override=source_override,
         )
         if resolved:
             input_path = resolved
 
     width = int(meta.get("width") or 0)
     height = int(meta.get("height") or 0)
-    frame_bgr = read_source_frame_bgr(input_path, frame_idx) if input_path else None
+    fps_raw = float(meta.get("fps") or 0.0)
+    fps = fps_raw if fps_raw > 1.0 else None
+    frame_bgr = (
+        read_source_frame_bgr(input_path, frame_idx, fps=fps) if input_path else None
+    )
 
     if packet is None:
         if frame_bgr is None:
@@ -317,6 +328,7 @@ def build_word_report(
     organization: str,
     incident_datetime: datetime,
     overlay_override: dict[str, Any] | None = None,
+    source_video: str | None = None,
 ) -> Path:
     try:
         from docx import Document
@@ -350,6 +362,7 @@ def build_word_report(
         prefer_violation=bool(violations),
         run_dir=run_path,
         run_id=run_id,
+        source_override=source_video,
     )
 
     violation_count = len(violations)

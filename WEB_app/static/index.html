@@ -11,7 +11,7 @@
     <header class="header">
       <div class="header-main">
         <h1>Контроль касок</h1>
-        <p class="subtitle">Загрузите видео — система найдёт нарушения и соберёт клипы</p>
+        <p class="subtitle">Загрузите видео — система найдёт нарушения и сформирует отчёты Word</p>
       </div>
       <div class="status-pill" id="status-pill" aria-live="polite">
         <span class="status-dot" id="status-dot"></span>
@@ -88,10 +88,10 @@
 
       <section class="card hidden" id="card-video">
         <div class="step-label">Шаг 3</div>
-        <h2>Клипы нарушений</h2>
+        <h2>Отчёты Word</h2>
         <dl class="meta" id="run-meta"></dl>
         <p class="warn hidden" id="cross-warn"></p>
-        <p class="hint">Фрагменты по каждому нарушителю — person∩helmet (без каски) выделены на видео</p>
+        <p class="hint">Клипы не нужны: в акт идёт один кадр без каски выбранного ID (без перекодировки видео).</p>
         <div class="report-panel" id="report-panel">
           <h3 class="report-panel-title">Параметры отчёта Word</h3>
           <div class="report-grid">
@@ -115,26 +115,47 @@
               <input type="time" id="report-time" class="input-time" step="60" />
             </label>
           </div>
-          <p class="hint report-hint">В отчёт — кадр NO HELMET выбранного ID с подписью ID на фото (не общий кадр с клипа)</p>
+          <p class="hint report-hint">Фото в отчёте — первый кадр NO HELMET этого ID, с подписью ID на снимке.</p>
           <div class="report-violators hidden" id="report-violators-wrap">
             <label class="field">
               <span>Нарушитель (ID)</span>
               <select id="report-violator-id"></select>
             </label>
-            <button type="button" class="btn btn-primary btn-lg" id="btn-report-one">Сформировать отчёт Word</button>
+            <div class="report-actions">
+              <button type="button" class="btn btn-primary btn-lg" id="btn-report-one">Сформировать отчёт Word</button>
+              <button type="button" class="btn btn-secondary btn-lg" id="btn-report-all">Все нарушители</button>
+            </div>
           </div>
         </div>
         <label class="field">
           <span>Исходное видео (если прогон с другой машины)</span>
-          <input type="text" id="source-video-input" placeholder="C:\\videos\\clip.mp4" autocomplete="off" spellcheck="false" />
+          <input type="text" id="source-video-input" placeholder="C:\\videos\\source.mp4" autocomplete="off" spellcheck="false" />
         </label>
-        <p class="hint">В пакетах нет пикселей — нужен оригинал. Положи <code>RUNID_source.mp4</code> в папку прогона или укажи путь здесь.</p>
-        <button type="button" class="btn btn-accent btn-lg" id="btn-build">Собрать клипы NO HELMET</button>
-        <div class="progress-wrap hidden" id="build-progress-wrap">
-          <div class="progress-bar"><div class="progress-fill" id="build-progress"></div></div>
-          <p class="progress-text" id="build-status">—</p>
+        <p class="hint">Нужен оригинал: кадр в Word и превью с боксами. Положи <code>RUNID_source.mp4</code> в папку прогона или укажи путь здесь.</p>
+        <div class="overlay-player hidden" id="overlay-player">
+          <h3 class="report-panel-title">Видео с боксами</h3>
+          <div class="overlay-stage">
+            <video id="overlay-video" controls playsinline preload="metadata"></video>
+            <canvas id="overlay-canvas"></canvas>
+          </div>
+          <p class="hint hidden" id="overlay-play-warn"></p>
+          <div class="overlay-downloads">
+            <a class="btn btn-secondary" id="btn-dl-source" download>Скачать исходник</a>
+            <button type="button" class="btn btn-primary" id="btn-dl-mkv">Скачать MKV с боксами (VLC)</button>
+            <a class="btn btn-secondary" id="btn-dl-player" download>Скачать HTML-плеер</a>
+          </div>
+          <p class="hint">Превью рисует боксы поверх оригинала — без перекодировки. MKV тоже без перекодировки (субтитры ASS), открывать в VLC. HTML-плеер положи в одну папку с исходником и открой в Chrome/Edge.</p>
         </div>
-        <div class="video-list hidden" id="video-list"></div>
+        <details class="clips-optional" id="clips-optional">
+          <summary>Клипы MP4 — необязательно, на HEVC очень долго</summary>
+          <p class="hint">Полная перекодировка присутствия ID. Для Word-актов не требуется.</p>
+          <button type="button" class="btn btn-accent" id="btn-build">Собрать клипы</button>
+          <div class="progress-wrap hidden" id="build-progress-wrap">
+            <div class="progress-bar"><div class="progress-fill" id="build-progress"></div></div>
+            <p class="progress-text" id="build-status">—</p>
+          </div>
+          <div class="video-list hidden" id="video-list"></div>
+        </details>
       </section>
     </main>
 

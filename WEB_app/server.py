@@ -648,12 +648,19 @@ class WordReportBody(BaseModel):
     organization: str = ""
     incident_datetime: str = ""
     job_id: str | None = None
+    source_video: str | None = None
 
 
 class WordReportResponse(BaseModel):
     ok: bool = True
     download_url: str
     filename: str
+
+
+class OverlayBody(BaseModel):
+    run_dir: str
+    run_id: str
+    source_video: str | None = None
 
 
 class SettingsUpdateProxy(BaseModel):
@@ -1065,6 +1072,116 @@ def report_companies() -> dict[str, list[str]]:
     return {"companies": list(TEST_COMPANIES)}
 
 
+def _overlay_timeline_or_400(
+    run_dir: str,
+    run_id: str,
+    source_video: str | None = None,
+) -> dict[str, Any]:
+    from WEB_app.overlay_timeline import build_overlay_timeline
+
+    host = _resolve_host_run_dir(run_dir)
+    if not host.is_dir():
+        raise HTTPException(400, _run_dir_missing_detail(run_dir, host))
+    try:
+        return build_overlay_timeline(
+            host,
+            run_id,
+            source_video=(source_video or "").strip() or None,
+        )
+    except Exception as exc:
+        raise HTTPException(500, str(exc)) from exc
+
+
+@app.get("/overlay/timeline")
+def overlay_timeline(
+    run_dir: str,
+    run_id: str,
+    source_video: str | None = None,
+) -> dict[str, Any]:
+    timeline = _overlay_timeline_or_400(run_dir, run_id, source_video)
+    public = dict(timeline)
+    public.pop("source_path", None)
+    return public
+
+
+@app.get("/overlay/source")
+def overlay_source(
+    run_dir: str,
+    run_id: str,
+    source_video: str | None = None,
+) -> FileResponse:
+    timeline = _overlay_timeline_or_400(run_dir, run_id, source_video)
+    path = Path(str(timeline.get("source_path") or ""))
+    if not path.is_file():
+        raise HTTPException(
+            404,
+            "Исходное видео не найдено. Положи RUNID_source.mp4 в папку прогона "
+            "или укажи путь в поле ниже.",
+        )
+    return FileResponse(
+        path,
+        filename=path.name,
+        media_type="video/mp4",
+        headers={"Accept-Ranges": "bytes"},
+    )
+
+
+@app.get("/overlay/player")
+def overlay_player(
+    run_dir: str,
+    run_id: str,
+    source_video: str | None = None,
+) -> FileResponse:
+    from WEB_app.overlay_timeline import write_standalone_player
+
+    timeline = _overlay_timeline_or_400(run_dir, run_id, source_video)
+    host = _resolve_host_run_dir(run_dir)
+    out = host / "reports" / f"{run_id}_overlay_player.html"
+    write_standalone_player(timeline, out)
+    return FileResponse(
+        out,
+        filename=out.name,
+        media_type="text/html; charset=utf-8",
+    )
+
+
+@app.post("/overlay/mkv")
+def overlay_mkv(body: OverlayBody) -> dict[str, Any]:
+    from WEB_app.overlay_timeline import mux_overlay_mkv, write_ass_file
+
+    timeline = _overlay_timeline_or_400(body.run_dir, body.run_id, body.source_video)
+    source = Path(str(timeline.get("source_path") or ""))
+    if not source.is_file():
+        raise HTTPException(404, "Исходное видео не найдено — mux невозможен")
+    host = _resolve_host_run_dir(body.run_dir)
+    reports = host / "reports"
+    ass_path = reports / f"{body.run_id}_overlay.ass"
+    mkv_path = reports / f"{body.run_id}_overlay.mkv"
+    write_ass_file(timeline, ass_path)
+    try:
+        mux_overlay_mkv(str(source), ass_path, mkv_path)
+    except Exception as exc:
+        raise HTTPException(500, str(exc)) from exc
+    run_q = _run_dir_query(str(host.resolve()))
+    return {
+        "ok": True,
+        "filename": mkv_path.name,
+        "download_url": f"/overlay/file/{quote(mkv_path.name)}?run_dir={run_q}",
+    }
+
+
+@app.get("/overlay/file/{filename}")
+def overlay_file(filename: str, run_dir: str) -> FileResponse:
+    if ".." in filename or ".." in run_dir:
+        raise HTTPException(400, "Invalid path")
+    host = _resolve_host_run_dir(run_dir)
+    path = (host / "reports" / filename).resolve()
+    if not path.is_file():
+        raise HTTPException(404, f"Not found: {filename}")
+    media = "video/x-matroska" if path.suffix.lower() == ".mkv" else "application/octet-stream"
+    return FileResponse(path, filename=filename, media_type=media)
+
+
 @app.post("/report/word", response_model=WordReportResponse)
 def create_word_report(body: WordReportBody) -> WordReportResponse:
     run_dir = _resolve_host_run_dir(body.run_dir)
@@ -1081,6 +1198,7 @@ def create_word_report(body: WordReportBody) -> WordReportResponse:
             company=str(body.company or "").strip(),
             organization=str(body.organization or body.company or "").strip(),
             incident_datetime=parse_incident_datetime(body.incident_datetime),
+            source_video=(body.source_video or "").strip() or None,
         )
     except Exception as exc:
         raise HTTPException(500, str(exc)) from exc
