@@ -165,12 +165,109 @@ def probe_video_fps(input_path: str) -> float:
     return 25.0
 
 
+@lru_cache(maxsize=64)
+def probe_video_wh(input_path: str) -> tuple[int, int]:
+    """Display width/height. Never opens OpenCV."""
+    path = str(input_path)
+    probe = _ffprobe_exe()
+    if not probe:
+        return (0, 0)
+    try:
+        proc = subprocess.run(
+            [
+                probe,
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=width,height",
+                "-of",
+                "csv=p=0",
+                path,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return (0, 0)
+    text = (proc.stdout or "").strip().replace(";", ",")
+    if not text:
+        return (0, 0)
+    parts = text.split(",")[0].split("x") if "x" in text.split(",")[0] else text.split(",")
+    if len(parts) < 2:
+        return (0, 0)
+    try:
+        w, h = int(float(parts[0])), int(float(parts[1]))
+    except (TypeError, ValueError):
+        return (0, 0)
+    if w <= 0 or h <= 0:
+        return (0, 0)
+    return (w, h)
+
+
 def _decode_image_pipe(data: bytes) -> np.ndarray | None:
     if not data:
         return None
     arr = np.frombuffer(data, dtype=np.uint8)
     frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
     return frame if frame is not None and frame.size > 0 else None
+
+
+def _ffmpeg_raw_still(
+    extra: list[str],
+    *,
+    width: int,
+    height: int,
+    timeout_sec: float,
+) -> np.ndarray | None:
+    """One still as raw BGR24 — no JPEG/PNG re-encode (that smeared Word photos)."""
+    tw, th = int(width), int(height)
+    if tw <= 0 or th <= 0:
+        return None
+    frame_bytes = tw * th * 3
+    try:
+        from app.core.ffmpeg_utils import _popen_kwargs, resolve_ffmpeg_exe
+
+        exe = resolve_ffmpeg_exe()
+        kwargs = _popen_kwargs()
+    except Exception:
+        return None
+    cmd = [
+        exe,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        *extra,
+        "-frames:v",
+        "1",
+        "-an",
+        "-sws_flags",
+        "lanczos+accurate_rnd+full_chroma_int+full_chroma_inp",
+        "-vf",
+        "format=bgr24",
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "bgr24",
+        "pipe:1",
+    ]
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            timeout=max(15.0, float(timeout_sec)),
+            check=False,
+            **kwargs,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    raw = proc.stdout or b""
+    if len(raw) < frame_bytes:
+        return None
+    return np.frombuffer(raw[:frame_bytes], dtype=np.uint8).reshape(th, tw, 3).copy()
 
 
 def read_frame_bgr_sequential(
@@ -243,17 +340,14 @@ def read_frame_bgr_ffmpeg(
     max_skip: int = 500_000,
     fps: float | None = None,
     accurate: bool = False,
+    width: int | None = None,
+    height: int | None = None,
 ) -> np.ndarray | None:
     """
     One still via ffmpeg timestamp seek (GOP-local decode).
 
-    Does not walk the file from frame 0 — that is what made Word reports
-    crawl on long HEVC.
-
-    accurate=False: input-side -ss (nearest keyframe, ~1 GOP off).
-    accurate=True: coarse input -ss then short output -ss so boxes land on
-    the same pixels as packet.frame_idx. Decode window is a few seconds, not
-    the whole file.
+    accurate=True (Word): GOP-local dual -ss + raw BGR24. image2pipe mjpeg/png
+    was smearing the photo while Python boxes stayed sharp.
     """
     target = max(0, int(frame_idx))
     if target > int(max_skip):
@@ -268,13 +362,22 @@ def read_frame_bgr_ffmpeg(
             ["-ss", f"{t:.3f}", "-i", path],
             timeout_sec=20.0,
         )
-    # Typical IP-cam GOP is 1–2 s; 3 s pad covers most without decoding from t=0.
-    pad = 3.0
-    in_ss = max(0.0, t - pad)
-    out_ss = t - in_ss
-    extra = ["-ss", f"{in_ss:.3f}", "-i", path]
-    if out_ss > 0.02:
-        extra.extend(["-ss", f"{out_ss:.3f}"])
+    tw, th = probe_video_wh(path)
+    if tw <= 0 or th <= 0:
+        tw = int(width or 0)
+        th = int(height or 0)
+    if tw > 0 and th > 0:
+        # Input -ss ≈ keyframe, output -ss reconstructs the GOP. Raw BGR, no JPEG.
+        pad = 4.0
+        in_ss = max(0.0, t - pad)
+        out_ss = t - in_ss
+        extra = ["-ss", f"{in_ss:.3f}", "-i", path]
+        if out_ss > 0.02:
+            extra.extend(["-ss", f"{out_ss:.3f}"])
+        hit = _ffmpeg_raw_still(extra, width=tw, height=th, timeout_sec=40.0)
+        if hit is not None:
+            return hit
+    extra = ["-i", path, "-ss", f"{t:.3f}"]
     hit = _ffmpeg_still_cmd(extra, timeout_sec=40.0, vcodec="png")
     if hit is not None:
         return hit

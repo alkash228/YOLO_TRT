@@ -195,6 +195,8 @@ def read_source_frame_bgr(
     *,
     fps: float | None = None,
     accurate: bool = False,
+    width: int | None = None,
+    height: int | None = None,
 ) -> np.ndarray | None:
     """Grab one source frame via ffmpeg timestamp seek (no OpenCV on HEVC)."""
     from app.core.frame_io import read_frame_bgr_ffmpeg
@@ -202,7 +204,12 @@ def read_source_frame_bgr(
     if not input_path:
         return None
     return read_frame_bgr_ffmpeg(
-        str(input_path), int(frame_idx), fps=fps, accurate=bool(accurate)
+        str(input_path),
+        int(frame_idx),
+        fps=fps,
+        accurate=bool(accurate),
+        width=width,
+        height=height,
     )
 
 
@@ -210,7 +217,9 @@ def _imwrite_bgr(path: Path, bgr: np.ndarray, *, quality: int = 95) -> None:
     """cv2.imwrite breaks on non-ASCII Windows paths — encode then write bytes."""
     suffix = path.suffix.lower() or ".jpg"
     if suffix == ".png":
-        ok, buf = cv2.imencode(".png", bgr)
+        ok, buf = cv2.imencode(
+            ".png", bgr, [int(cv2.IMWRITE_PNG_COMPRESSION), 3]
+        )
     else:
         ok, buf = cv2.imencode(
             ".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)]
@@ -381,7 +390,14 @@ def render_report_still_rgb(
     fps_raw = float(meta.get("fps") or 0.0)
     fps = fps_raw if fps_raw > 1.0 else None
     frame_bgr = (
-        read_source_frame_bgr(input_path, frame_idx, fps=fps, accurate=True)
+        read_source_frame_bgr(
+            input_path,
+            frame_idx,
+            fps=fps,
+            accurate=True,
+            width=int(meta.get("width") or 0) or None,
+            height=int(meta.get("height") or 0) or None,
+        )
         if input_path
         else None
     )

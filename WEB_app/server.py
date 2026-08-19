@@ -659,6 +659,15 @@ class WordReportResponse(BaseModel):
     filename: str
 
 
+class OverlayHlsBody(BaseModel):
+    run_dir: str
+    run_id: str
+    source_video: str | None = None
+    start_sec: float | None = None
+    duration_sec: float = 0.0
+    stable_id: int | None = None
+
+
 class SettingsUpdateProxy(BaseModel):
     settings: dict[str, Any] = Field(default_factory=dict)
     # Default False: never rebuild GPU load on profile sync (was causing double TRT load).
@@ -1066,6 +1075,177 @@ def report_companies() -> dict[str, list[str]]:
     from WEB_app.word_report import TEST_COMPANIES
 
     return {"companies": list(TEST_COMPANIES)}
+
+
+def _resolve_overlay_source(
+    run_dir: str,
+    run_id: str,
+    source_video: str | None = None,
+) -> tuple[Path, str | None]:
+    import json as _json
+
+    from app.core.video_encode import resolve_run_source_video
+
+    host = _resolve_host_run_dir(run_dir)
+    if not host.is_dir():
+        raise HTTPException(400, _run_dir_missing_detail(run_dir, host))
+    recorded = ""
+    result_path = host / f"{run_id}_result.json"
+    if result_path.is_file():
+        try:
+            payload = _json.loads(result_path.read_text(encoding="utf-8"))
+            recorded = str(
+                payload.get("input_path")
+                or (payload.get("record") or {}).get("input_path")
+                or ""
+            )
+        except (OSError, ValueError):
+            recorded = ""
+    source = resolve_run_source_video(
+        host,
+        recorded,
+        run_id=run_id,
+        override=(source_video or "").strip() or None,
+    )
+    return host, source
+
+
+def _violation_start_sec(
+    host: Path,
+    run_id: str,
+    stable_id: int | None,
+    source_video: str | None,
+) -> float:
+    if stable_id is None:
+        return 0.0
+    from WEB_app.video_builder import load_run_metadata
+    from WEB_app.word_report import _scan_violator_packets
+
+    meta = load_run_metadata(
+        host, run_id, source_video=source_video, scan_source_frames=False
+    )
+    data = meta["packets_data"]
+    fps = float(meta.get("fps") or 25.0) or 25.0
+    _pn, _vn, packet, frame_idx = _scan_violator_packets(
+        data, host, int(stable_id), stop_after_first_violation=True
+    )
+    if packet is None or frame_idx < 0:
+        return 0.0
+    return max(0.0, float(frame_idx) / fps - 1.0)
+
+
+@app.get("/overlay/seek")
+def overlay_seek(
+    run_dir: str,
+    run_id: str,
+    stable_id: int | None = None,
+    source_video: str | None = None,
+) -> dict[str, Any]:
+    host, source = _resolve_overlay_source(run_dir, run_id, source_video)
+    start_sec = _violation_start_sec(host, run_id, stable_id, source_video)
+    return {
+        "start_sec": start_sec,
+        "has_source": bool(source and Path(source).is_file()),
+    }
+
+
+@app.get("/overlay/info")
+def overlay_info(
+    run_dir: str,
+    run_id: str,
+    source_video: str | None = None,
+) -> dict[str, Any]:
+    from app.core.frame_io import is_hevc_video, probe_video_codec
+
+    _host, source = _resolve_overlay_source(run_dir, run_id, source_video)
+    has = bool(source and Path(source).is_file())
+    codec = probe_video_codec(source) if has else ""
+    hevc = bool(has and is_hevc_video(source))
+    return {
+        "has_source": has,
+        "filename": Path(source).name if has else None,
+        "codec": codec or None,
+        "hevc": hevc,
+    }
+
+
+@app.get("/overlay/source")
+def overlay_source(
+    run_dir: str,
+    run_id: str,
+    source_video: str | None = None,
+) -> FileResponse:
+    _host, source = _resolve_overlay_source(run_dir, run_id, source_video)
+    path = Path(str(source or ""))
+    if not path.is_file():
+        raise HTTPException(
+            404,
+            "Исходное видео не найдено. Положи RUNID_source.mp4 в папку прогона "
+            "или укажи путь в поле ниже.",
+        )
+    return FileResponse(
+        path,
+        filename=path.name,
+        media_type="video/mp4",
+        headers={"Accept-Ranges": "bytes"},
+    )
+
+
+@app.post("/overlay/hls/start")
+def overlay_hls_start(body: OverlayHlsBody) -> dict[str, Any]:
+    from WEB_app.hls_stream import start_hls
+
+    host, source = _resolve_overlay_source(body.run_dir, body.run_id, body.source_video)
+    if not source or not Path(source).is_file():
+        raise HTTPException(404, "Исходное видео не найдено")
+    start_sec = body.start_sec
+    if start_sec is None:
+        start_sec = _violation_start_sec(
+            host, body.run_id, body.stable_id, body.source_video
+        )
+    try:
+        info = start_hls(
+            run_dir=host,
+            run_id=body.run_id,
+            source=str(source),
+            start_sec=float(start_sec),
+            duration_sec=float(body.duration_sec or 0.0),
+        )
+    except Exception as exc:
+        raise HTTPException(500, str(exc)) from exc
+    return info
+
+
+@app.post("/overlay/hls/stop")
+def overlay_hls_stop() -> dict[str, bool]:
+    from WEB_app.hls_stream import stop_hls
+
+    stop_hls()
+    return {"ok": True}
+
+
+@app.get("/overlay/hls/{run_id}/{filename}")
+def overlay_hls_file(run_id: str, filename: str) -> FileResponse:
+    from WEB_app.hls_stream import active_hls_dir
+
+    if ".." in filename or ".." in run_id or "/" in filename or "\\" in filename:
+        raise HTTPException(400, "Invalid path")
+    folder = active_hls_dir(run_id)
+    if folder is None:
+        raise HTTPException(404, "HLS сессия не запущена")
+    path = (folder / filename).resolve()
+    if folder.resolve() not in path.parents and path.parent.resolve() != folder.resolve():
+        raise HTTPException(400, "Invalid path")
+    if not path.is_file():
+        raise HTTPException(404, filename)
+    suffix = path.suffix.lower()
+    media = "application/vnd.apple.mpegurl" if suffix == ".m3u8" else "video/mp2t"
+    headers = (
+        {"Cache-Control": "no-cache"}
+        if suffix == ".m3u8"
+        else {"Cache-Control": "public, max-age=5"}
+    )
+    return FileResponse(path, media_type=media, headers=headers)
 
 
 @app.post("/report/word", response_model=WordReportResponse)

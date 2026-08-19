@@ -1166,7 +1166,7 @@ def encode_violations_videos_per_id(
     post_workers: int = 4,
     encode_preset: str = "ultrafast",
     encode_crf: int = 28,
-    encode_codec: str = "auto",
+    encode_codec: str = "libx264",
     min_violation_frames: int = 3,
     min_violation_ratio: float = 0.0,
     min_relative_to_max: float = 0.0,
@@ -1177,7 +1177,7 @@ def encode_violations_videos_per_id(
     One MP4 per ID with enough NO HELMET frames (gate: min_violation_frames).
 
     Clip timeline = ~12s around the first NO HELMET (not hours of presence).
-    Overlay draws only that ID. NVENC ultrafast when available.
+    Overlay draws only that ID. libx264 ultrafast (WEB host has no GPU).
     """
     run_dir = Path(run_dir)
     rid = infer_run_id(run_dir, run_id)
@@ -1437,7 +1437,7 @@ def encode_violations_video(
     post_workers: int = 4,
     encode_preset: str = "ultrafast",
     encode_crf: int = 28,
-    encode_codec: str = "auto",
+    encode_codec: str = "libx264",
     on_progress: Callable[[int, int], None] | None = None,
     on_log: Callable[[str], None] | None = None,
 ) -> tuple[Path, dict[str, Any]]:
