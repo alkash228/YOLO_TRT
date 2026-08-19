@@ -34,6 +34,7 @@
   const playerStage = $("#player-stage");
   const playerVideo = $("#player-video");
   const playerCanvas = $("#player-canvas");
+  const playerBoxes = $("#player-boxes");
   const btnPlayViol = $("#btn-play-viol");
   const btnPlayStart = $("#btn-play-start");
   const btnPlayStop = $("#btn-play-stop");
@@ -61,7 +62,9 @@
   let overlayRaf = 0;
   let overlayUseRvfc = false;
   let overlayLastEvent = null;
-  let overlayComposite = false;
+  let overlayWin = { t0: 0, t1: -1 };
+  let overlayLoading = false;
+  let overlayFetchAt = 0;
   let pollTimer = null;
   let pollJobId = null;
   let buildPollTimer = null;
@@ -453,9 +456,9 @@
 
   function destroyOverlayHls() {
     stopOverlayLoop();
-    overlayComposite = false;
     overlayLastEvent = null;
-    playerStage?.classList.remove("is-composite");
+    overlayWin = { t0: 0, t1: -1 };
+    if (playerBoxes) playerBoxes.replaceChildren();
     if (overlayHls) {
       try {
         overlayHls.destroy();
@@ -500,6 +503,24 @@
     return ev;
   }
 
+  function renderDomBoxes(ev) {
+    if (!playerBoxes) return;
+    playerBoxes.replaceChildren();
+    if (!ev) return;
+    const srcW = Math.max(1, overlayTimeline?.width || 1);
+    const srcH = Math.max(1, overlayTimeline?.height || 1);
+    for (const b of ev.boxes || []) {
+      const el = document.createElement("div");
+      el.className = "player-box" + (b.k === "h" ? " helm" : b.v ? " viol" : "");
+      el.style.left = `${(b.x / srcW) * 100}%`;
+      el.style.top = `${(b.y / srcH) * 100}%`;
+      el.style.width = `${(b.w / srcW) * 100}%`;
+      el.style.height = `${(b.h / srcH) * 100}%`;
+      el.textContent = b.k === "h" ? "helmet" : b.v ? `NO HELMET ID ${b.id}` : `ID ${b.id}`;
+      playerBoxes.appendChild(el);
+    }
+  }
+
   function drawOverlayBoxes() {
     if (!playerVideo || !playerCanvas) return;
     const ctx = playerCanvas.getContext("2d", { alpha: true });
@@ -510,19 +531,8 @@
     if (playerCanvas.width !== w) playerCanvas.width = w;
     if (playerCanvas.height !== h) playerCanvas.height = h;
     ctx.clearRect(0, 0, w, h);
-    if (playerVideo.readyState >= 2) {
-      try {
-        ctx.drawImage(playerVideo, 0, 0, w, h);
-        if (!overlayComposite) {
-          overlayComposite = true;
-          playerStage?.classList.add("is-composite");
-        }
-      } catch (_) {
-        overlayComposite = false;
-        playerStage?.classList.remove("is-composite");
-      }
-    }
     const ev = findOverlayEvent(mediaAbsTime());
+    renderDomBoxes(ev);
     if (!ev) return;
     const sx = w / Math.max(1, overlayTimeline?.width || w);
     const sy = h / Math.max(1, overlayTimeline?.height || h);
@@ -563,25 +573,43 @@
     overlayRaf = requestAnimationFrame(loop);
   }
 
-  async function loadOverlayWindow(startSec, durationSec) {
+  async function loadOverlayWindow(startSec, durationSec, { quiet } = {}) {
     overlayTimeline = null;
     overlayEventIdx = 0;
     overlayLastEvent = null;
     const q = overlayQuery();
     const t0 = Math.max(0, Number(startSec) || 0);
     const span = Math.max(8, Number(durationSec) || 90);
-    q.set("t0", String(Math.max(0, t0 - 2)));
-    q.set("t1", String(t0 + span + 4));
+    const win0 = Math.max(0, t0 - 2);
+    const win1 = t0 + span + 4;
+    q.set("t0", String(win0));
+    q.set("t1", String(win1));
     const r = await fetch(`/overlay/timeline?${q}`);
     if (!r.ok) throw new Error(await r.text());
     overlayTimeline = await r.json();
     overlayEventIdx = 0;
+    overlayWin = { t0: win0, t1: win1 };
     const n = overlayTimeline?.events?.length || 0;
-    if (!n) {
+    if (!n && !quiet) {
       showToast("Оверлей", "В этом окне нет пакетов детекции", "error", 8000);
     }
     drawOverlayBoxes();
     return n;
+  }
+
+  function maybeSlideOverlay() {
+    const t = mediaAbsTime();
+    if (overlayLoading) return;
+    if (overlayWin.t1 >= 0 && t >= overlayWin.t0 && t <= overlayWin.t1 - 8) return;
+    const now = performance.now();
+    if (now - overlayFetchAt < 1200) return;
+    overlayFetchAt = now;
+    overlayLoading = true;
+    loadOverlayWindow(Math.max(0, t - 1), 180, { quiet: true })
+      .catch(() => {})
+      .finally(() => {
+        overlayLoading = false;
+      });
   }
 
   async function preparePlayer() {
@@ -718,7 +746,7 @@
           overlayHlsOffset = 0;
           let nEv = 0;
           try {
-            nEv = await loadOverlayWindow(startSec, 120);
+            nEv = await loadOverlayWindow(startSec, fromStart ? 180 : 120);
           } catch (err) {
             showToast("Оверлей", String(err.message || err), "error", 8000);
           }
@@ -1530,7 +1558,10 @@
   btnPlayViol?.addEventListener("click", () => playInBrowser(btnPlayViol));
   btnPlayStart?.addEventListener("click", () => playInBrowser(btnPlayStart, { fromStart: true }));
   btnPlayStop?.addEventListener("click", () => stopPlayer());
-  playerVideo?.addEventListener("timeupdate", drawOverlayBoxes);
+  playerVideo?.addEventListener("timeupdate", () => {
+    maybeSlideOverlay();
+    drawOverlayBoxes();
+  });
   playerVideo?.addEventListener("seeked", drawOverlayBoxes);
   playerVideo?.addEventListener("play", startOverlayLoop);
   sourceVideoInput?.addEventListener("change", () => {

@@ -295,12 +295,41 @@ def _reshape_bgr24(raw: bytes, width: int, height: int) -> np.ndarray | None:
     return None
 
 
+def _chroma_strength(bgr: np.ndarray | None) -> float:
+    """Mean |R-G|+|B-G|. Near 0 → luma-only / gray HEVC still."""
+    if bgr is None or bgr.size < 64:
+        return 0.0
+    s = bgr[::8, ::8]
+    if s.size < 16:
+        s = bgr
+    b = s[:, :, 0].astype(np.int16)
+    g = s[:, :, 1].astype(np.int16)
+    r = s[:, :, 2].astype(np.int16)
+    return float(np.abs(b - g).mean() + np.abs(r - g).mean())
+
+
+def _is_almost_gray(bgr: np.ndarray | None) -> bool:
+    return _chroma_strength(bgr) < 8.0
+
+
+def _still_vf(width: int, height: int, *, expand_tv: bool = False) -> str:
+    """8-bit 4:2:0 → BGR with chroma. neighbor+10-bit HEVC dropped chroma (gray photo)."""
+    tw, th = int(width), int(height)
+    scale = (
+        f"scale={tw}:{th}:flags=bicubic+accurate_rnd+full_chroma_int+full_chroma_inp"
+    )
+    if expand_tv:
+        scale += ":in_range=tv:out_range=pc"
+    return f"format=yuv420p,{scale},format=bgr24"
+
+
 def _ffmpeg_raw_still(
     extra: list[str],
     *,
     width: int,
     height: int,
     timeout_sec: float,
+    expand_tv: bool = False,
 ) -> np.ndarray | None:
     """One still as raw BGR24 — no JPEG/PNG re-encode (that smeared Word photos)."""
     tw, th = _even_wh(width, height)
@@ -310,10 +339,6 @@ def _ffmpeg_raw_still(
     if resolved is None:
         return None
     exe, kwargs = resolved
-    vf = (
-        f"scale={tw}:{th}:flags=neighbor+accurate_rnd+full_chroma_int+full_chroma_inp,"
-        "format=bgr24"
-    )
     cmd = [
         exe,
         "-hide_banner",
@@ -325,7 +350,7 @@ def _ffmpeg_raw_still(
         "1",
         "-an",
         "-vf",
-        vf,
+        _still_vf(tw, th, expand_tv=expand_tv),
         "-f",
         "rawvideo",
         "-pix_fmt",
@@ -343,6 +368,67 @@ def _ffmpeg_raw_still(
     except (OSError, subprocess.SubprocessError):
         return None
     return _reshape_bgr24(proc.stdout or b"", tw, th)
+
+
+def _ffmpeg_png_file_still(
+    extra: list[str],
+    *,
+    timeout_sec: float,
+) -> np.ndarray | None:
+    """Lossless PNG on disk after yuv420p — keeps chroma; not an image2pipe JPEG."""
+    resolved = _ffmpeg_exe_kwargs()
+    if resolved is None:
+        return None
+    exe, kwargs = resolved
+    tmp = tempfile.NamedTemporaryFile(prefix="yolo_still_", suffix=".png", delete=False)
+    tmp_path = Path(tmp.name)
+    tmp.close()
+    cmd = [
+        exe,
+        "-hide_banner",
+        "-nostdin",
+        "-y",
+        "-loglevel",
+        "error",
+        *extra,
+        "-frames:v",
+        "1",
+        "-an",
+        "-vf",
+        "format=yuv420p,format=rgb24",
+        "-update",
+        "1",
+        str(tmp_path),
+    ]
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            timeout=max(15.0, float(timeout_sec)),
+            check=False,
+            **kwargs,
+        )
+        if proc.returncode != 0 or not tmp_path.is_file() or tmp_path.stat().st_size < 64:
+            return None
+        frame = cv2.imread(str(tmp_path), cv2.IMREAD_COLOR)
+        if frame is None or frame.size <= 0:
+            return None
+        return frame
+    except (OSError, subprocess.SubprocessError):
+        return None
+    finally:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _best_still(*candidates: np.ndarray | None) -> np.ndarray | None:
+    ranked = [c for c in candidates if c is not None and c.size > 0]
+    if not ranked:
+        return None
+    ranked.sort(key=_chroma_strength, reverse=True)
+    return ranked[0]
 
 
 def _ffmpeg_bmp_still(
@@ -369,6 +455,8 @@ def _ffmpeg_bmp_still(
         "-frames:v",
         "1",
         "-an",
+        "-vf",
+        "format=yuv420p,format=bgr24",
         "-update",
         "1",
         str(tmp_path),
@@ -499,19 +587,35 @@ def read_frame_bgr_ffmpeg(
     extra = ["-ss", f"{in_ss:.3f}", "-i", path]
     if out_ss > 0.01:
         extra.extend(["-ss", f"{out_ss:.3f}"])
+    a: np.ndarray | None = None
     if tw > 0 and th > 0:
-        hit = _ffmpeg_raw_still(extra, width=tw, height=th, timeout_sec=50.0)
-        if hit is not None:
-            return hit
-    hit = _ffmpeg_bmp_still(extra, timeout_sec=50.0)
+        a = _ffmpeg_raw_still(extra, width=tw, height=th, timeout_sec=50.0)
+        if a is not None and not _is_almost_gray(a):
+            return a
+        b = _ffmpeg_raw_still(
+            extra, width=tw, height=th, timeout_sec=50.0, expand_tv=True
+        )
+        colored = _best_still(a, b)
+        if colored is not None and not _is_almost_gray(colored):
+            return colored
+    png = _ffmpeg_png_file_still(extra, timeout_sec=50.0)
+    if png is not None and not _is_almost_gray(png):
+        return png
+    bmp = _ffmpeg_bmp_still(extra, timeout_sec=50.0)
+    hit = _best_still(a, png, bmp)
     if hit is not None:
         return hit
     extra_slow = ["-i", path, "-ss", f"{t:.3f}"]
     if tw > 0 and th > 0:
-        hit = _ffmpeg_raw_still(extra_slow, width=tw, height=th, timeout_sec=90.0)
+        hit = _ffmpeg_raw_still(
+            extra_slow, width=tw, height=th, timeout_sec=90.0, expand_tv=True
+        )
         if hit is not None:
             return hit
-    return _ffmpeg_bmp_still(extra_slow, timeout_sec=90.0)
+    return _best_still(
+        _ffmpeg_png_file_still(extra_slow, timeout_sec=90.0),
+        _ffmpeg_bmp_still(extra_slow, timeout_sec=90.0),
+    )
 
 
 def read_frame_bgr_smart(
