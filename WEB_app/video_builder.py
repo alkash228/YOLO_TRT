@@ -455,33 +455,6 @@ def collect_presence_frame_indices(
     return sorted(set(frames))
 
 
-_CLIP_PRE_SEC = 4.0
-_CLIP_POST_SEC = 8.0
-
-
-def _clip_window_frame_indices(
-    presence: set[int],
-    violations: set[int],
-    fps: float,
-    *,
-    pre_sec: float = _CLIP_PRE_SEC,
-    post_sec: float = _CLIP_POST_SEC,
-) -> set[int]:
-    """Packet frames in a short window around the first NO HELMET (fast encode)."""
-    rate = float(fps) if fps and fps > 1.0 else 25.0
-    if violations:
-        anchor = min(violations)
-    elif presence:
-        anchor = min(presence)
-    else:
-        return set()
-    lo = max(0, int(anchor - float(pre_sec) * rate))
-    hi = int(anchor + float(post_sec) * rate)
-    pool = presence if presence else violations
-    hit = {int(i) for i in pool if lo <= int(i) <= hi}
-    return hit or {int(anchor)}
-
-
 def filter_person_single_id(packet: FramePacket, target_sid: int) -> FramePacket:
     """Keep one tracked person by stable ReID id (any cross-check state)."""
     n = int(packet.n_inst)
@@ -833,44 +806,6 @@ def stamp_helmet_accessories_rgb(
     return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
 
 
-def stamp_cross_check_verdicts_rgb(
-    rgb: np.ndarray,
-    packet: FramePacket,
-    *,
-    target_w: int,
-    target_h: int,
-) -> np.ndarray:
-    """Draw every helmet-check head box + NO HELMET label from this packet."""
-    from app.core.cross_check import draw_cross_check_overlay
-    from app.core.frame_pipeline import _scale_cross_check_geometry
-
-    verdicts = list(packet.cross_check_verdicts or [])
-    if not verdicts:
-        return rgb
-
-    tw, th = int(target_w), int(target_h)
-    src_h = src_w = 0
-    if packet.mask_hw:
-        src_h, src_w = int(packet.mask_hw[0]), int(packet.mask_hw[1])
-    elif packet.stack is not None and packet.stack.ndim == 3 and packet.stack.shape[0] > 0:
-        src_h, src_w = int(packet.stack.shape[1]), int(packet.stack.shape[2])
-    if src_h > 0 and src_w > 0 and (src_h != th or src_w != tw):
-        verdicts, _ = _scale_cross_check_geometry(
-            verdicts, None, float(tw) / float(src_w), float(th) / float(src_h)
-        )
-
-    ih, iw = int(rgb.shape[0]), int(rgb.shape[1])
-    if (ih, iw) != (th, tw) and ih > 0 and iw > 0:
-        verdicts, _ = _scale_cross_check_geometry(
-            verdicts, None, float(iw) / float(tw), float(ih) / float(th)
-        )
-
-    out = np.ascontiguousarray(rgb.copy())
-    bgr = cv2.cvtColor(out, cv2.COLOR_RGB2BGR)
-    bgr = draw_cross_check_overlay(bgr, verdicts, draw_head_box=True)
-    return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-
-
 def stamp_all_poses_rgb(
     rgb: np.ndarray,
     packet: FramePacket,
@@ -1163,9 +1098,9 @@ def encode_violations_videos_per_id(
     run_id: str | None = None,
     overlay_override: dict[str, Any] | None = None,
     source_video: str | None = None,
-    post_workers: int = 4,
-    encode_preset: str = "ultrafast",
-    encode_crf: int = 28,
+    post_workers: int = 6,
+    encode_preset: str = "fast",
+    encode_crf: int = 23,
     encode_codec: str = "libx264",
     min_violation_frames: int = 3,
     min_violation_ratio: float = 0.0,
@@ -1176,14 +1111,12 @@ def encode_violations_videos_per_id(
     """
     One MP4 per ID with enough NO HELMET frames (gate: min_violation_frames).
 
-    Clip timeline = ~12s around the first NO HELMET (not hours of presence).
-    Overlay draws only that ID. libx264 ultrafast (WEB host has no GPU).
+    Clip timeline = all presence keyframes for that stable_id (grab-skip), not a
+    sparse NO HELMET montage. Overlay draws only that ID.
     """
     run_dir = Path(run_dir)
     rid = infer_run_id(run_dir, run_id)
-    meta = load_run_metadata(
-        run_dir, rid, source_video=source_video, scan_source_frames=False
-    )
+    meta = load_run_metadata(run_dir, rid, source_video=source_video)
     data = meta["packets_data"]
     overlay = resolve_overlay(meta, overlay_override=overlay_override)
 
@@ -1254,20 +1187,18 @@ def encode_violations_videos_per_id(
     violation_sets: dict[int, set[int]] = {}
     presence_sets: dict[int, set[int]] = {}
     encode_is_presence: dict[int, bool] = {}
-    fps = float(meta.get("fps") or 25.0) or 25.0
     for sid in violator_ids:
         presence = set(collect_presence_frame_indices(data, run_dir, sid))
         violations = set(collect_violation_frame_indices(data, run_dir, sid))
-        use_frames = _clip_window_frame_indices(presence, violations, fps)
+        # Full presence timeline for this ID; fall back to violation frames if empty.
+        use_presence = bool(presence)
+        use_frames = presence if use_presence else violations
         if not use_frames:
             continue
         frame_sets[sid] = use_frames
         violation_sets[sid] = violations
         presence_sets[sid] = presence
-        encode_is_presence[sid] = bool(presence)
-    if int(meta.get("source_frame_count") or 0) <= 0:
-        mx = max((max(s) for s in frame_sets.values() if s), default=0)
-        meta["source_frame_count"] = mx + 1
+        encode_is_presence[sid] = use_presence
     total_steps = sum(len(frames) for frames in frame_sets.values()) or 1
     done_steps = 0
 
@@ -1282,14 +1213,13 @@ def encode_violations_videos_per_id(
         if on_log:
             if encode_is_presence.get(sid, False):
                 on_log(
-                    f"id{sid}: clip_frames={n_encode} (window ~{_CLIP_PRE_SEC:.0f}+{_CLIP_POST_SEC:.0f}s) "
-                    f"violation_frames={n_v} presence={n_presence} "
-                    f"({idx + 1}/{len(violator_ids)})"
+                    f"id{sid}: presence_frames={n_encode} violation_frames={n_v} "
+                    f"→ encoding all presence ({idx + 1}/{len(violator_ids)})"
                 )
             else:
                 on_log(
-                    f"id{sid}: clip_frames={n_encode} violation_frames={n_v} "
-                    f"→ window around first hit ({idx + 1}/{len(violator_ids)})"
+                    f"id{sid}: presence_frames={n_presence} violation_frames={n_v} "
+                    f"→ encoding violation frames fallback ({idx + 1}/{len(violator_ids)})"
                 )
         out_path = run_dir / f"{rid}_violation_id{sid}.mp4"
 
@@ -1434,10 +1364,10 @@ def encode_violations_video(
     run_id: str | None = None,
     video_path: Path | str | None = None,
     overlay_override: dict[str, Any] | None = None,
-    post_workers: int = 4,
-    encode_preset: str = "ultrafast",
-    encode_crf: int = 28,
-    encode_codec: str = "libx264",
+    post_workers: int = 6,
+    encode_preset: str = "fast",
+    encode_crf: int = 23,
+    encode_codec: str = "auto",
     on_progress: Callable[[int, int], None] | None = None,
     on_log: Callable[[str], None] | None = None,
 ) -> tuple[Path, dict[str, Any]]:
