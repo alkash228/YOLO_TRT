@@ -1373,7 +1373,9 @@ def encode_full_scene_video(
         raise ValueError("source_frame_count is missing — cannot encode the full scene")
     if on_log:
         on_log(f"Source video: {meta['input_path']}")
-        on_log(f"Full-scene encode: {n_src} frames, all people; OpenCV sequential, no hold-forward")
+        on_log(
+            f"Full-scene encode: {n_src} frames, all people; OpenCV sequential, hold overlay across infer stride"
+        )
 
     if data.get("format") == "chunked" and "chunks" in data:
         lookup: _ChunkPacketLookup | _SortedPacketLookup = _ChunkPacketLookup(data, run_dir)

@@ -411,6 +411,32 @@ def _empty_overlay_packet(src_i: int) -> FramePacket:
     )
 
 
+def _estimate_packet_stride(
+    lookup: _ChunkPacketLookup | _SortedPacketLookup,
+    n_src: int,
+    declared: int,
+) -> int:
+    """Infer analysis step (often 2) from packet spacing so overlay can fill skipped frames."""
+    declared_n = max(1, int(declared))
+    hits: list[int] = []
+    limit = min(max(1, int(n_src)), 600)
+    for i in range(limit):
+        if lookup.keyframe_at(i) is None:
+            continue
+        hits.append(i)
+        if len(hits) >= 12:
+            break
+    if len(hits) < 2:
+        return max(declared_n, 2)
+    gaps = [b - a for a, b in zip(hits, hits[1:]) if b > a]
+    small = [g for g in gaps if 1 <= g <= 8]
+    if not small:
+        return max(declared_n, 2)
+    small.sort()
+    med = int(small[len(small) // 2])
+    return max(declared_n, med, 1)
+
+
 _VIDEO_SUFFIXES = {".mp4", ".mkv", ".mov", ".webm", ".avi", ".m4v"}
 
 
@@ -733,6 +759,13 @@ def _encode_timeline_streaming(
 
     carry: FramePacket | None = None
     stride = max(1, int(frame_stride))
+    hold_max = stride
+    if keep_all_frames:
+        hold_max = _estimate_packet_stride(lookup, n_src, stride)
+        if on_log:
+            on_log(
+                f"Overlay hold: fill skipped infer frames (stride≈{hold_max}, no blink)"
+            )
     pending: dict[int, Future[tuple[int, np.ndarray]]] = {}
     next_write: int | None = 0 if clip_mode else None
     written = 0
@@ -770,7 +803,17 @@ def _encode_timeline_streaming(
 
             if keep_all_frames:
                 keyframe = lookup.keyframe_at(src_i)
-                carry = keyframe if keyframe is not None else _empty_overlay_packet(src_i)
+                if keyframe is not None:
+                    carry = keyframe
+                elif (
+                    carry is not None
+                    and int(carry.n_inst or 0) > 0
+                    and (int(src_i) - int(carry.frame_idx)) < hold_max
+                ):
+                    # Same detections on the skipped source frame (stride 2, 3, …).
+                    pass
+                else:
+                    carry = _empty_overlay_packet(src_i)
             elif clip_mode:
                 keyframe = lookup.keyframe_at(src_i)
                 if keyframe is None:
