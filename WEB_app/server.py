@@ -630,6 +630,7 @@ class BuildVideoBody(BaseModel):
     overlay: dict[str, Any] | None = None
     source_video: str | None = None
     job_id: str | None = None
+    mode: str = "clips"
 
 
 class BuildVideoResponse(BaseModel):
@@ -964,10 +965,11 @@ def _run_build(
     run_id: str,
     overlay: dict[str, Any] | None,
     source_video: str | None = None,
+    mode: str = "clips",
 ) -> None:
     job = _build_jobs[build_id]
     try:
-        from WEB_app.video_builder import encode_violations_videos_per_id
+        from WEB_app.video_builder import encode_full_scene_video, encode_violations_videos_per_id
 
         def on_progress(done: int, total: int) -> None:
             job["progress"] = {"done": done, "total": total}
@@ -978,14 +980,26 @@ def _run_build(
             if len(logs) > 100:
                 del logs[: len(logs) - 100]
 
-        videos, info = encode_violations_videos_per_id(
-            run_dir,
-            run_id=run_id,
-            overlay_override=overlay,
-            source_video=source_video,
-            on_progress=on_progress,
-            on_log=on_log,
-        )
+        encode_mode = "scene" if str(mode or "").strip().casefold() == "scene" else "clips"
+        job["mode"] = encode_mode
+        if encode_mode == "scene":
+            videos, info = encode_full_scene_video(
+                run_dir,
+                run_id=run_id,
+                overlay_override=overlay,
+                source_video=source_video,
+                on_progress=on_progress,
+                on_log=on_log,
+            )
+        else:
+            videos, info = encode_violations_videos_per_id(
+                run_dir,
+                run_id=run_id,
+                overlay_override=overlay,
+                source_video=source_video,
+                on_progress=on_progress,
+                on_log=on_log,
+            )
         job["status"] = "done"
         job["videos"] = videos
         job["info"] = info
@@ -1021,6 +1035,7 @@ def build_video(body: BuildVideoBody) -> BuildVideoResponse:
             "status": "running",
             "run_dir": str(run_dir),
             "run_id": body.run_id,
+            "mode": (body.mode or "clips"),
             "progress": {"done": 0, "total": 0},
             "logs": [],
         }
@@ -1032,6 +1047,7 @@ def build_video(body: BuildVideoBody) -> BuildVideoResponse:
             body.run_id,
             body.overlay,
             (body.source_video or "").strip() or None,
+            body.mode or "clips",
         ),
         name=f"web-build-{build_id}",
         daemon=True,
@@ -1338,6 +1354,7 @@ def build_status(build_id: str) -> dict[str, Any]:
             videos_out.append(
                 {
                     **_video_item(v.get("stable_id", 0), name, run_dir),
+                    "kind": str(v.get("kind") or "clip"),
                     "violation_frames": int(v.get("violation_frames") or 0),
                     "violation_count": int(v.get("violation_count") or 0),
                     "presence_frames": int(v.get("presence_frames") or 0),

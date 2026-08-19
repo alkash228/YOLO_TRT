@@ -137,17 +137,29 @@ def read_frame_bgr_sequential(
     *,
     max_skip: int = 500_000,
 ) -> np.ndarray | None:
-    """Read one frame by sequential decode (HEVC-safe; no POS_FRAMES seek)."""
+    """Read one frame by sequential decode (HEVC-safe; no POS_FRAMES seek).
+
+    Must use cap.read() every frame — grab() skips without retrieve() desync HEVC
+    (gray/smeared stills with sharp overlay boxes).
+    """
     target = max(0, int(frame_idx))
     if target > int(max_skip):
         return None
+    cap = cv2.VideoCapture(str(input_path))
+    if not cap.isOpened():
+        return None
     try:
-        for idx, frame in iter_selected_bgr_frames(str(input_path), [target]):
+        idx = 0
+        while idx <= target:
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                return None
             if idx == target:
                 return frame
-    except RuntimeError:
+            idx += 1
         return None
-    return None
+    finally:
+        cap.release()
 
 
 def read_frame_bgr_ffmpeg(

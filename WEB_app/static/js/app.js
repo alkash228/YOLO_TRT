@@ -29,15 +29,7 @@
   const reportViolatorId = $("#report-violator-id");
   const btnReportOne = $("#btn-report-one");
   const btnReportAll = $("#btn-report-all");
-  const playerPanel = $("#player-panel");
-  const playerHint = $("#player-hint");
-  const playerStage = $("#player-stage");
-  const playerVideo = $("#player-video");
-  const playerCanvas = $("#player-canvas");
-  const playerBoxes = $("#player-boxes");
-  const btnPlayViol = $("#btn-play-viol");
-  const btnPlayStart = $("#btn-play-start");
-  const btnPlayStop = $("#btn-play-stop");
+  const btnBuildScene = $("#btn-build-scene");
   const jobIdInput = $("#job-id-input");
   const btnResumeJob = $("#btn-resume-job");
   const jobIdHint = $("#job-id-hint");
@@ -55,16 +47,7 @@
   let currentRunDir = null;
   let currentRunId = null;
   let currentViolators = [];
-  let overlayHls = null;
-  let overlayTimeline = null;
-  let overlayEventIdx = 0;
-  let overlayHlsOffset = 0;
-  let overlayRaf = 0;
-  let overlayUseRvfc = false;
-  let overlayLastEvent = null;
-  let overlayWin = { t0: 0, t1: -1 };
-  let overlayLoading = false;
-  let overlayFetchAt = 0;
+  let currentBuildMode = "clips";
   let pollTimer = null;
   let pollJobId = null;
   let buildPollTimer = null;
@@ -169,9 +152,8 @@
       <dt>Папка</dt><dd><code>${currentRunDir || "—"}</code></dd>
     `;
     crossWarn.classList.add("hidden");
-    btnBuild.onclick = () => startBuild(currentRunDir, currentRunId);
+    btnBuild.onclick = () => startBuild(currentRunDir, currentRunId, null, "clips");
     await loadReportViolators(currentRunDir, currentRunId);
-    await preparePlayer();
     showToast("Прогон открыт", currentRunId || currentRunDir);
     cardVideo?.scrollIntoView({ behavior: "smooth", block: "start" });
   }
@@ -413,394 +395,6 @@
     }
   }
 
-  function overlayQuery() {
-    const q = new URLSearchParams({
-      run_dir: currentRunDir || "",
-      run_id: currentRunId || "",
-    });
-    const src = (sourceVideoInput?.value || "").trim();
-    if (src) q.set("source_video", src);
-    return q;
-  }
-
-  async function clientHevcOk() {
-    try {
-      if (window.VideoDecoder) {
-        const r = await VideoDecoder.isConfigSupported({
-          codec: "hvc1.1.6.L93.B0",
-          codedWidth: 1280,
-          codedHeight: 720,
-        });
-        if (r && r.supported) return true;
-      }
-    } catch (_) {
-      /* ignore */
-    }
-    const probe = document.createElement("video");
-    return probe.canPlayType('video/mp4; codecs="hvc1.1.6.L93.B0"') === "probably";
-  }
-
-  function stopOverlayLoop() {
-    if (!overlayRaf) return;
-    if (overlayUseRvfc && playerVideo?.cancelVideoFrameCallback) {
-      try {
-        playerVideo.cancelVideoFrameCallback(overlayRaf);
-      } catch (_) {
-        /* ignore */
-      }
-    } else {
-      cancelAnimationFrame(overlayRaf);
-    }
-    overlayRaf = 0;
-  }
-
-  function destroyOverlayHls() {
-    stopOverlayLoop();
-    overlayLastEvent = null;
-    overlayWin = { t0: 0, t1: -1 };
-    if (playerBoxes) playerBoxes.replaceChildren();
-    if (overlayHls) {
-      try {
-        overlayHls.destroy();
-      } catch (_) {
-        /* ignore */
-      }
-      overlayHls = null;
-    }
-    if (playerCanvas) {
-      const ctx = playerCanvas.getContext("2d");
-      if (ctx) ctx.clearRect(0, 0, playerCanvas.width, playerCanvas.height);
-    }
-    if (playerVideo) {
-      playerVideo.pause();
-      playerVideo.removeAttribute("src");
-      try {
-        playerVideo.load();
-      } catch (_) {
-        /* ignore */
-      }
-    }
-  }
-
-  function mediaAbsTime() {
-    return (overlayHlsOffset || 0) + (playerVideo?.currentTime || 0);
-  }
-
-  function findOverlayEvent(t) {
-    const events = overlayTimeline?.events || [];
-    if (!events.length) return overlayLastEvent;
-    while (overlayEventIdx + 1 < events.length && events[overlayEventIdx + 1].t0 <= t) {
-      overlayEventIdx += 1;
-    }
-    while (overlayEventIdx > 0 && events[overlayEventIdx].t0 > t) {
-      overlayEventIdx -= 1;
-    }
-    const ev = events[overlayEventIdx];
-    if (!ev) return overlayLastEvent;
-    if (t < ev.t0 - 0.25) return overlayLastEvent;
-    if (ev.t1 != null && t > ev.t1 + 1.5) return overlayLastEvent;
-    overlayLastEvent = ev;
-    return ev;
-  }
-
-  function renderDomBoxes(ev) {
-    if (!playerBoxes) return;
-    playerBoxes.replaceChildren();
-    if (!ev) return;
-    const srcW = Math.max(1, overlayTimeline?.width || 1);
-    const srcH = Math.max(1, overlayTimeline?.height || 1);
-    for (const b of ev.boxes || []) {
-      const el = document.createElement("div");
-      el.className = "player-box" + (b.k === "h" ? " helm" : b.v ? " viol" : "");
-      el.style.left = `${(b.x / srcW) * 100}%`;
-      el.style.top = `${(b.y / srcH) * 100}%`;
-      el.style.width = `${(b.w / srcW) * 100}%`;
-      el.style.height = `${(b.h / srcH) * 100}%`;
-      el.textContent = b.k === "h" ? "helmet" : b.v ? `NO HELMET ID ${b.id}` : `ID ${b.id}`;
-      playerBoxes.appendChild(el);
-    }
-  }
-
-  function drawOverlayBoxes() {
-    if (!playerVideo || !playerCanvas) return;
-    const ctx = playerCanvas.getContext("2d", { alpha: true });
-    if (!ctx) return;
-    const w = playerVideo.videoWidth || overlayTimeline?.width || 0;
-    const h = playerVideo.videoHeight || overlayTimeline?.height || 0;
-    if (!w || !h) return;
-    if (playerCanvas.width !== w) playerCanvas.width = w;
-    if (playerCanvas.height !== h) playerCanvas.height = h;
-    ctx.clearRect(0, 0, w, h);
-    const ev = findOverlayEvent(mediaAbsTime());
-    renderDomBoxes(ev);
-    if (!ev) return;
-    const sx = w / Math.max(1, overlayTimeline?.width || w);
-    const sy = h / Math.max(1, overlayTimeline?.height || h);
-    ctx.lineJoin = "round";
-    ctx.font = "bold 18px Segoe UI, system-ui, sans-serif";
-    for (const b of ev.boxes || []) {
-      const x = b.x * sx;
-      const y = b.y * sy;
-      const bw = b.w * sx;
-      const bh = b.h * sy;
-      const helmet = b.k === "h";
-      const color = helmet ? "#38bdf8" : b.v ? "#ef4444" : "#22c55e";
-      ctx.lineWidth = helmet ? 2 : b.v ? 5 : 3;
-      ctx.strokeStyle = color;
-      ctx.strokeRect(x, y, bw, bh);
-      ctx.fillStyle = color;
-      const label = helmet ? "helmet" : b.v ? `NO HELMET ID ${b.id}` : `ID ${b.id}`;
-      ctx.fillText(label, x, Math.max(18, y - 6));
-    }
-  }
-
-  function startOverlayLoop() {
-    const loop = () => {
-      drawOverlayBoxes();
-      if (!playerVideo || playerVideo.paused || playerVideo.ended) {
-        overlayRaf = 0;
-        return;
-      }
-      if (playerVideo.requestVideoFrameCallback) {
-        overlayUseRvfc = true;
-        overlayRaf = playerVideo.requestVideoFrameCallback(loop);
-      } else {
-        overlayUseRvfc = false;
-        overlayRaf = requestAnimationFrame(loop);
-      }
-    };
-    stopOverlayLoop();
-    overlayRaf = requestAnimationFrame(loop);
-  }
-
-  async function loadOverlayWindow(startSec, durationSec, { quiet } = {}) {
-    overlayTimeline = null;
-    overlayEventIdx = 0;
-    overlayLastEvent = null;
-    const q = overlayQuery();
-    const t0 = Math.max(0, Number(startSec) || 0);
-    const span = Math.max(8, Number(durationSec) || 90);
-    const win0 = Math.max(0, t0 - 2);
-    const win1 = t0 + span + 4;
-    q.set("t0", String(win0));
-    q.set("t1", String(win1));
-    const r = await fetch(`/overlay/timeline?${q}`);
-    if (!r.ok) throw new Error(await r.text());
-    overlayTimeline = await r.json();
-    overlayEventIdx = 0;
-    overlayWin = { t0: win0, t1: win1 };
-    const n = overlayTimeline?.events?.length || 0;
-    if (!n && !quiet) {
-      showToast("Оверлей", "В этом окне нет пакетов детекции", "error", 8000);
-    }
-    drawOverlayBoxes();
-    return n;
-  }
-
-  function maybeSlideOverlay() {
-    const t = mediaAbsTime();
-    if (overlayLoading) return;
-    if (overlayWin.t1 >= 0 && t >= overlayWin.t0 && t <= overlayWin.t1 - 8) return;
-    const now = performance.now();
-    if (now - overlayFetchAt < 1200) return;
-    overlayFetchAt = now;
-    overlayLoading = true;
-    loadOverlayWindow(Math.max(0, t - 1), 180, { quiet: true })
-      .catch(() => {})
-      .finally(() => {
-        overlayLoading = false;
-      });
-  }
-
-  async function preparePlayer() {
-    if (!playerPanel || !currentRunDir || !currentRunId) return;
-    playerPanel.classList.remove("hidden");
-    try {
-      const r = await fetch(`/overlay/info?${overlayQuery()}`);
-      if (!r.ok) throw new Error(await r.text());
-      const info = await r.json();
-      if (!info.has_source) {
-        playerHint.textContent =
-          "Исходник не найден. Положи RUNID_source.mp4 в папку прогона или укажи путь ниже.";
-        return;
-      }
-      if (info.hevc) {
-        const nativeHevc = await clientHevcOk();
-        playerHint.textContent = nativeHevc
-          ? "HEVC: этот браузер умеет декодировать сам (GPU клиента, не сервера). Если чёрный экран — превью на CPU."
-          : "HEVC: на веб-сервере нет GPU. «Смотреть» — короткое CPU-превью H.264 (~90 с, 480p), без NVENC.";
-      } else {
-        playerHint.textContent = `Кодек ${info.codec || "h264"} — играем исходник в Chrome без перекодирования.`;
-      }
-    } catch (_) {
-      playerHint.textContent = "Плеер: не удалось проверить исходник.";
-    }
-  }
-
-  function attachHls(playlistUrl) {
-    destroyOverlayHls();
-    playerStage?.classList.remove("hidden");
-    const HlsCtor = window.Hls;
-    if (HlsCtor && HlsCtor.isSupported()) {
-      overlayHls = new HlsCtor({
-        enableWorker: true,
-        lowLatencyMode: false,
-        liveDurationInfinity: true,
-      });
-      overlayHls.loadSource(playlistUrl);
-      overlayHls.attachMedia(playerVideo);
-      overlayHls.on(HlsCtor.Events.MANIFEST_PARSED, () => {
-        playerVideo?.play()?.catch(() => {});
-        startOverlayLoop();
-      });
-      overlayHls.on(HlsCtor.Events.ERROR, (_ev, data) => {
-        if (data?.fatal) {
-          showToast("Плеер", data.details || "HLS error", "error", 8000);
-        }
-      });
-      return;
-    }
-    if (playerVideo?.canPlayType("application/vnd.apple.mpegurl")) {
-      playerVideo.src = playlistUrl;
-      playerVideo.play()?.catch(() => {});
-    } else {
-      showToast("Плеер", "Нужен Chrome/Edge с hls.js", "error");
-    }
-  }
-
-  async function playNativeSource(startSec) {
-    destroyOverlayHls();
-    overlayHlsOffset = 0;
-    playerStage?.classList.remove("hidden");
-    playerVideo.src = `/overlay/source?${overlayQuery()}`;
-    await new Promise((resolve, reject) => {
-      const onMeta = () => {
-        playerVideo.removeEventListener("loadedmetadata", onMeta);
-        playerVideo.removeEventListener("error", onErr);
-        resolve();
-      };
-      const onErr = () => {
-        playerVideo.removeEventListener("loadedmetadata", onMeta);
-        playerVideo.removeEventListener("error", onErr);
-        reject(new Error("native"));
-      };
-      playerVideo.addEventListener("loadedmetadata", onMeta);
-      playerVideo.addEventListener("error", onErr);
-      playerVideo.load();
-    });
-    if (startSec > 0.2 && Number.isFinite(playerVideo.duration)) {
-      const target = Math.min(startSec, Math.max(0, playerVideo.duration - 0.2));
-      await new Promise((resolve) => {
-        let settled = false;
-        const done = () => {
-          if (settled) return;
-          settled = true;
-          playerVideo.removeEventListener("seeked", done);
-          resolve();
-        };
-        playerVideo.addEventListener("seeked", done);
-        try {
-          playerVideo.currentTime = target;
-        } catch (_) {
-          done();
-          return;
-        }
-        setTimeout(done, 1800);
-      });
-    }
-    await playerVideo.play();
-  }
-
-  async function playInBrowser(btn, { fromStart } = {}) {
-    if (!currentRunDir || !currentRunId) {
-      showToast("Ошибка", "Сначала выполните анализ", "error");
-      return;
-    }
-    const prevText = btn?.textContent;
-    if (btn) {
-      btn.disabled = true;
-      btn.textContent = "Старт…";
-    }
-    try {
-      const infoR = await fetch(`/overlay/info?${overlayQuery()}`);
-      const info = infoR.ok ? await infoR.json() : {};
-      let sid = fromStart ? null : reportViolatorId?.value;
-      if (!fromStart && !sid && currentViolators.length) {
-        sid = String(currentViolators[0].stable_id);
-      }
-      let startSec = fromStart ? 0 : null;
-      if (startSec == null && sid) {
-        const s = await fetch(`/overlay/seek?${overlayQuery()}&stable_id=${encodeURIComponent(sid)}`);
-        if (s.ok) {
-          const body = await s.json();
-          startSec = Number(body.start_sec) || 0;
-        } else {
-          startSec = 0;
-        }
-      }
-      startSec = Number(startSec) || 0;
-      const nativeOk = !info.hevc || (await clientHevcOk());
-      if (nativeOk && info.has_source) {
-        try {
-          await playNativeSource(startSec);
-          overlayHlsOffset = 0;
-          let nEv = 0;
-          try {
-            nEv = await loadOverlayWindow(startSec, fromStart ? 180 : 120);
-          } catch (err) {
-            showToast("Оверлей", String(err.message || err), "error", 8000);
-          }
-          startOverlayLoop();
-          showToast("Плеер", "Исходник в браузере, рамки рисуются на кадре");
-          playerHint.textContent = `Исходник с ${startSec.toFixed(1)}с. Рамки: ${nEv || 0} ключ.кадров.`;
-          return;
-        } catch (_) {
-          if (!info.hevc) throw new Error("Не удалось открыть исходник");
-        }
-      }
-      const r = await fetch("/overlay/hls/start", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          run_dir: currentRunDir,
-          run_id: currentRunId,
-          source_video: (sourceVideoInput?.value || "").trim() || null,
-          stable_id: sid ? Number(sid) : null,
-          start_sec: fromStart ? 0 : startSec,
-          duration_sec: 90,
-        }),
-      });
-      if (!r.ok) throw new Error(await r.text());
-      const data = await r.json();
-      overlayHlsOffset = Number(data.start_sec) || 0;
-      attachHls(data.playlist_url);
-      let nEv = 0;
-      try {
-        nEv = await loadOverlayWindow(overlayHlsOffset, Number(data.duration_sec) || 90);
-      } catch (err) {
-        showToast("Оверлей", String(err.message || err), "error", 8000);
-      }
-      playerHint.textContent = `CPU-превью ~${Number(data.duration_sec || 90)}с с ${overlayHlsOffset.toFixed(1)}с. Рамки: ${nEv || 0} ключ.кадров.`;
-      showToast("Плеер", "Превью на CPU, детекции рисуются на кадре");
-    } catch (e) {
-      showToast("Плеер", String(e.message || e), "error", 10000);
-    } finally {
-      if (btn) {
-        btn.disabled = false;
-        btn.textContent = prevText;
-      }
-    }
-  }
-
-  async function stopPlayer() {
-    destroyOverlayHls();
-    playerStage?.classList.add("hidden");
-    try {
-      await fetch("/overlay/hls/stop", { method: "POST" });
-    } catch (_) {
-      /* ignore */
-    }
-  }
 
   async function loadReportViolators(runDir, runId) {
     if (!reportViolatorsWrap || !reportViolatorId) return;
@@ -1270,7 +864,6 @@
     }
     if (currentRunDir && currentRunId && !resolveErr) {
       loadReportViolators(currentRunDir, currentRunId);
-      preparePlayer();
     }
     runMeta.innerHTML = `
       <dt>Job ID</dt><dd><code>${jobId || "—"}</code></dd>
@@ -1297,7 +890,7 @@
       crossWarn.classList.add("hidden");
     }
 
-    btnBuild.onclick = () => startBuild(currentRunDir, currentRunId, jobId);
+    btnBuild.onclick = () => startBuild(currentRunDir, currentRunId, jobId, "clips");
     cardVideo?.scrollIntoView({ behavior: "smooth", block: "start" });
   }
 
@@ -1348,6 +941,19 @@
     }
   });
 
+  function videoCardTitle(v) {
+    if (v.kind === "scene" || String(v.stable_id) === "all") {
+      return "Общее видео — все люди и каски";
+    }
+    const extra = [
+      v.violation_count != null ? `${v.violation_count} без каски` : "",
+      v.presence_frames != null ? `${v.presence_frames} кадр. в кадре` : "",
+    ]
+      .filter(Boolean)
+      .join(" · ");
+    return `Нарушитель #${v.stable_id}${extra ? ` · ${extra}` : ""}`;
+  }
+
   function renderVideoPlayers(videos) {
     if (!videos || !videos.length) {
       videoList.classList.add("hidden");
@@ -1356,32 +962,53 @@
     }
     videoList.classList.remove("hidden");
     videoList.innerHTML = videos
-      .map(
-        (v) => `
+      .map((v) => {
+        const scene = v.kind === "scene" || String(v.stable_id) === "all";
+        const reportBtn = scene
+          ? ""
+          : `<button type="button" class="btn btn-report" data-report-id="${v.stable_id}">Скачать отчёт Word</button>`;
+        return `
       <article class="video-card" data-stable-id="${v.stable_id}">
-        <h3>Нарушитель #${v.stable_id}${v.violation_count != null ? ` · ${v.violation_count} без каски` : ""}${v.presence_frames != null ? ` · ${v.presence_frames} кадр. в кадре` : ""}</h3>
+        <h3>${videoCardTitle(v)}</h3>
         <video controls preload="metadata" playsinline src="${encodeURI(v.video_url)}"></video>
         <a class="btn btn-download" href="${encodeURI(v.video_url)}" download="${v.video_name}">Скачать MP4</a>
-        <button type="button" class="btn btn-report" data-report-id="${v.stable_id}">Скачать отчёт Word</button>
-      </article>`
-      )
+        ${reportBtn}
+      </article>`;
+      })
       .join("");
     videoList.querySelectorAll(".btn-report").forEach((btn) => {
       btn.addEventListener("click", () => downloadWordReport(btn.dataset.reportId, btn));
     });
   }
 
+  function setBuildBusy(busy, mode) {
+    const clipLabel = "Собрать клипы NO HELMET";
+    const sceneLabel = "Собрать общее видео";
+    if (btnBuild) {
+      btnBuild.disabled = busy;
+      btnBuild.textContent = busy && mode === "clips" ? "Сборка…" : clipLabel;
+    }
+    if (btnBuildScene) {
+      btnBuildScene.disabled = busy;
+      btnBuildScene.textContent = busy && mode === "scene" ? "Сборка…" : sceneLabel;
+    }
+  }
+
   function finishBuildPoll(data, ok, message) {
     clearInterval(buildPollTimer);
     buildPollTimer = null;
     buildStatus.textContent = message;
+    const scene = currentBuildMode === "scene" || (data.videos || []).some((v) => v.kind === "scene");
     if (ok && (data.videos || []).length) {
       renderVideoPlayers(data.videos);
-      showToast("Клипы готовы", `Собрано ${data.videos.length} видео`);
-      notifyBrowser("Клипы готовы", `Собрано ${data.videos.length} видео`);
+      const title = scene ? "Общее видео готово" : "Клипы готовы";
+      const body = scene
+        ? "Все люди на одном ролике"
+        : `Собрано ${data.videos.length} видео`;
+      showToast(title, body);
+      notifyBrowser(title, body);
     }
-    btnBuild.disabled = false;
-    btnBuild.textContent = "Собрать клипы NO HELMET";
+    setBuildBusy(false, currentBuildMode);
   }
 
   async function pollBuild(buildId) {
@@ -1402,10 +1029,11 @@
       }
 
       if (data.status === "done" && (data.videos || []).length) {
+        const scene = currentBuildMode === "scene";
         finishBuildPoll(
           data,
           true,
-          `Готово: ${data.videos.length} клип(ов)`
+          scene ? "Готово: общее видео" : `Готово: ${data.videos.length} клип(ов)`
         );
         return;
       }
@@ -1414,7 +1042,9 @@
         finishBuildPoll(
           data,
           false,
-          "Нарушений не найдено — клипы не созданы"
+          currentBuildMode === "scene"
+            ? "Не удалось собрать общее видео"
+            : "Нарушений не найдено — клипы не созданы"
         );
         return;
       }
@@ -1428,15 +1058,15 @@
     }
   }
 
-  async function startBuild(runDir, runId, jobId) {
+  async function startBuild(runDir, runId, jobId, mode) {
     if (!runDir || !runId) return;
-    btnBuild.disabled = true;
-    btnBuild.textContent = "Сборка…";
+    currentBuildMode = mode === "scene" ? "scene" : "clips";
+    setBuildBusy(true, currentBuildMode);
     buildProgressWrap.classList.remove("hidden");
     videoList.classList.add("hidden");
     videoList.innerHTML = "";
     buildProgress.style.width = "0%";
-    buildStatus.textContent = "Старт…";
+    buildStatus.textContent = currentBuildMode === "scene" ? "Общее видео: старт…" : "Старт…";
 
     try {
       const r = await fetch("/build-video", {
@@ -1445,6 +1075,7 @@
         body: JSON.stringify({
           run_dir: runDir,
           run_id: runId,
+          mode: currentBuildMode,
           source_video: (sourceVideoInput?.value || "").trim() || null,
           job_id: jobId || currentJob?.job_id || pollJobId || null,
         }),
@@ -1455,10 +1086,10 @@
       pollBuild(build_id);
     } catch (e) {
       buildStatus.textContent = String(e);
-      btnBuild.disabled = false;
-      btnBuild.textContent = "Собрать клипы NO HELMET";
+      setBuildBusy(false, currentBuildMode);
     }
   }
+
 
   btnResumeJob?.addEventListener("click", () => {
     resumeJobById(jobIdInput?.value || storedJobId());
@@ -1555,17 +1186,8 @@
     await bootstrapResume();
   }
 
-  btnPlayViol?.addEventListener("click", () => playInBrowser(btnPlayViol));
-  btnPlayStart?.addEventListener("click", () => playInBrowser(btnPlayStart, { fromStart: true }));
-  btnPlayStop?.addEventListener("click", () => stopPlayer());
-  playerVideo?.addEventListener("timeupdate", () => {
-    maybeSlideOverlay();
-    drawOverlayBoxes();
-  });
-  playerVideo?.addEventListener("seeked", drawOverlayBoxes);
-  playerVideo?.addEventListener("play", startOverlayLoop);
-  sourceVideoInput?.addEventListener("change", () => {
-    if (currentRunDir && currentRunId) preparePlayer();
+  btnBuildScene?.addEventListener("click", () => {
+    startBuild(currentRunDir, currentRunId, currentJob?.job_id || pollJobId, "scene");
   });
 
   bootstrap();

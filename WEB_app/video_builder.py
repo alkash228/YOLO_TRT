@@ -975,6 +975,68 @@ def _render_target_only(
     return src_i, rgb
 
 
+def _make_full_scene_render_fn():
+    """Draw every person + helmet on the frame; red callout on all NO HELMET IDs."""
+    debug_hud = web_debug_show_all_dets()
+
+    def _render(job: _EncodeJob, ctx: _RenderContext) -> tuple[int, np.ndarray]:
+        work = replace(job.carry, frame_idx=job.src_i)
+        src_i, rgb = _render_encode_job(
+            replace(job, carry=work, frame_bgr=job.frame_bgr), ctx
+        )
+        rgb = stamp_all_people_boxes_rgb(
+            rgb,
+            work,
+            target_w=ctx.target_w,
+            target_h=ctx.target_h,
+            focus_sid=None,
+        )
+        rgb = stamp_helmet_accessories_rgb(
+            rgb,
+            work,
+            target_w=ctx.target_w,
+            target_h=ctx.target_h,
+        )
+        if bool(ctx.overlay.get("draw_pose", False)):
+            rgb = stamp_all_poses_rgb(
+                rgb,
+                work,
+                target_w=ctx.target_w,
+                target_h=ctx.target_h,
+                pose_kpt_conf=float(ctx.overlay.get("pose_kpt_conf", 0.25)),
+                pose_point_radius=int(ctx.overlay.get("pose_point_radius", 6) or 6),
+                pose_line_thickness=int(ctx.overlay.get("pose_line_thickness", 3) or 3),
+            )
+        seen: set[int] = set()
+        sids = work.stable_ids
+        n = int(work.n_inst or 0)
+        for i in range(n):
+            if sids is None or i >= len(sids):
+                break
+            sid = int(sids[i])
+            if sid in seen:
+                continue
+            seen.add(sid)
+            rgb = highlight_no_helmet_on_rgb(
+                rgb,
+                work,
+                sid,
+                target_w=ctx.target_w,
+                target_h=ctx.target_h,
+                frame_bgr=job.frame_bgr,
+                force=False,
+            )
+        if debug_hud:
+            rgb = stamp_debug_hud_rgb(
+                rgb,
+                work,
+                draw_pose=bool(ctx.overlay.get("draw_pose", False)),
+            )
+        return src_i, rgb
+
+    return _render
+
+
 def _make_person_render_fn(target_sid: int):
     """Per-ID clip: target only, hold-forward between stride gaps; highlight NO HELMET."""
     last_draw: FramePacket | None = None
@@ -1267,6 +1329,96 @@ def encode_violations_videos_per_id(
         "stable_ids": [o["stable_id"] for o in outputs],
         "violation_counts": {str(k): v for k, v in violation_counts.items()},
         "presence_counts": {str(k): v for k, v in presence_counts.items()},
+        "overlay_used": overlay,
+        "videos": outputs,
+    }
+    return outputs, info
+
+
+def encode_full_scene_video(
+    run_dir: Path | str,
+    *,
+    run_id: str | None = None,
+    overlay_override: dict[str, Any] | None = None,
+    source_video: str | None = None,
+    post_workers: int = 6,
+    encode_preset: str = "fast",
+    encode_crf: int = 23,
+    encode_codec: str = "libx264",
+    on_progress: Callable[[int, int], None] | None = None,
+    on_log: Callable[[str], None] | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """One MP4 of the full source timeline with every person + helmet drawn."""
+    run_dir = Path(run_dir)
+    rid = infer_run_id(run_dir, run_id)
+    meta = load_run_metadata(run_dir, rid, source_video=source_video)
+    data = meta["packets_data"]
+    overlay = resolve_overlay(meta, overlay_override=overlay_override)
+
+    if not meta.get("input_path"):
+        raise ValueError(meta.get("source_missing_hint") or "Source video not found for this run")
+    n_src = int(meta.get("source_frame_count") or 0)
+    if n_src <= 0:
+        raise ValueError("source_frame_count is missing — cannot encode the full scene")
+    if on_log:
+        on_log(f"Source video: {meta['input_path']}")
+        on_log(f"Full-scene encode: {n_src} frames, all people on one MP4")
+
+    if data.get("format") == "chunked" and "chunks" in data:
+        lookup: _ChunkPacketLookup | _SortedPacketLookup = _ChunkPacketLookup(data, run_dir)
+    else:
+        lookup = _SortedPacketLookup(list(data.get("packets") or []))
+
+    out_path = run_dir / f"{rid}_annotated.mp4"
+    try:
+        if out_path.is_file():
+            out_path.unlink()
+    except OSError:
+        pass
+
+    path = _encode_timeline_streaming(
+        lookup,
+        video_path=out_path,
+        fps=float(meta["fps"]),
+        prompt=str(meta["prompt"]),
+        overlay=overlay,
+        input_path=str(meta["input_path"] or "") or None,
+        width=int(meta["width"]),
+        height=int(meta["height"]),
+        source_frame_count=n_src,
+        frame_stride=int(meta.get("frame_stride") or 1),
+        post_workers=post_workers,
+        encode_preset=encode_preset,
+        encode_crf=encode_crf,
+        encode_codec=encode_codec,
+        on_progress=on_progress,
+        on_log=on_log,
+        encode_src_indices=None,
+        run_id=str(rid),
+        render_job_fn=_make_full_scene_render_fn(),
+    )
+    input_path = str(meta["input_path"] or "")
+    if input_path:
+        from app.core.ffmpeg_utils import mux_audio_if_possible
+
+        mux_audio_if_possible(input_path, path)
+
+    outputs = [
+        {
+            "stable_id": "all",
+            "kind": "scene",
+            "video_path": str(path.resolve()),
+            "video_name": path.name,
+            "violation_frames": 0,
+            "violation_count": int(meta.get("cross_check_violations") or 0),
+            "presence_frames": n_src,
+        }
+    ]
+    info = {
+        "run_id": rid,
+        "kind": "scene",
+        "cross_check_enabled": meta["cross_check_enabled"],
+        "cross_check_violations": meta["cross_check_violations"],
         "overlay_used": overlay,
         "videos": outputs,
     }

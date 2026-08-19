@@ -4,14 +4,14 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Контроль касок — YOLO_DRT</title>
-  <link rel="stylesheet" href="/static/css/app.css?v=overlay-boxes3" />
+  <link rel="stylesheet" href="/static/css/app.css?v=restore-scene1" />
 </head>
 <body>
   <div class="page">
     <header class="header">
       <div class="header-main">
         <h1>Контроль касок</h1>
-        <p class="subtitle">Загрузите видео — система найдёт нарушения и сформирует отчёты Word</p>
+        <p class="subtitle">Загрузите видео — система найдёт нарушения и соберёт клипы</p>
       </div>
       <div class="status-pill" id="status-pill" aria-live="polite">
         <span class="status-dot" id="status-dot"></span>
@@ -88,10 +88,10 @@
 
       <section class="card hidden" id="card-video">
         <div class="step-label">Шаг 3</div>
-        <h2>Отчёты Word</h2>
+        <h2>Клипы нарушений</h2>
         <dl class="meta" id="run-meta"></dl>
         <p class="warn hidden" id="cross-warn"></p>
-        <p class="hint">Клипы — короткий MP4 вокруг первого кадра без каски. Word-акт строится отдельно.</p>
+        <p class="hint">Фрагменты по каждому нарушителю — person∩helmet (без каски) выделены на видео</p>
         <div class="report-panel" id="report-panel">
           <h3 class="report-panel-title">Параметры отчёта Word</h3>
           <div class="report-grid">
@@ -115,7 +115,7 @@
               <input type="time" id="report-time" class="input-time" step="60" />
             </label>
           </div>
-          <p class="hint report-hint">Фото в отчёте — первый кадр NO HELMET этого ID, все детекции на снимке.</p>
+          <p class="hint report-hint">В отчёт — кадр NO HELMET выбранного ID с подписью ID на фото (не общий кадр с клипа)</p>
           <div class="report-violators hidden" id="report-violators-wrap">
             <label class="field">
               <span>Нарушитель (ID)</span>
@@ -129,33 +129,19 @@
         </div>
         <label class="field">
           <span>Исходное видео (если прогон с другой машины)</span>
-          <input type="text" id="source-video-input" placeholder="C:\\videos\\source.mp4" autocomplete="off" spellcheck="false" />
+          <input type="text" id="source-video-input" placeholder="C:\\videos\\clip.mp4" autocomplete="off" spellcheck="false" />
         </label>
-        <p class="hint">Нужен оригинал: кадр в Word, плеер и короткие клипы. Положи <code>RUNID_source.mp4</code> в папку прогона или укажи путь здесь.</p>
-        <div class="report-panel player-panel hidden" id="player-panel">
-          <h3 class="report-panel-title">Плеер в браузере</h3>
-          <p class="hint" id="player-hint">На веб-сервере нет GPU: HEVC в Chrome не перегоняем через NVENC. Если в браузере есть HEVC — играем исходник. Иначе короткое CPU-превью H.264 (~1.5 мин, 480p).</p>
-          <div class="player-actions">
-            <button type="button" class="btn btn-primary" id="btn-play-viol">Смотреть с нарушения</button>
-            <button type="button" class="btn btn-secondary" id="btn-play-start">С начала ролика</button>
-            <button type="button" class="btn btn-secondary" id="btn-play-stop">Стоп</button>
-          </div>
-          <div class="player-stage hidden" id="player-stage">
-            <video id="player-video" controls playsinline></video>
-            <canvas id="player-canvas"></canvas>
-            <div id="player-boxes" class="player-boxes"></div>
-          </div>
+        <p class="hint">В пакетах нет пикселей — нужен оригинал. Положи <code>RUNID_source.mp4</code> в папку прогона или укажи путь здесь.</p>
+        <div class="build-actions">
+          <button type="button" class="btn btn-accent btn-lg" id="btn-build">Собрать клипы NO HELMET</button>
+          <button type="button" class="btn btn-secondary btn-lg" id="btn-build-scene">Собрать общее видео</button>
         </div>
-        <div class="report-panel" id="clips-panel">
-          <h3 class="report-panel-title">Клипы MP4</h3>
-          <p class="hint">Короткий ролик (~12 с) вокруг первого NO HELMET, libx264 на CPU. Не весь прогон.</p>
-          <button type="button" class="btn btn-accent" id="btn-build">Собрать клипы</button>
-          <div class="progress-wrap hidden" id="build-progress-wrap">
-            <div class="progress-bar"><div class="progress-fill" id="build-progress"></div></div>
-            <p class="progress-text" id="build-status">—</p>
-          </div>
-          <div class="video-list hidden" id="video-list"></div>
+        <p class="hint">Общее видео — весь ролик, все люди и каски на одном MP4. На HEVC долго: decode с начала файла.</p>
+        <div class="progress-wrap hidden" id="build-progress-wrap">
+          <div class="progress-bar"><div class="progress-fill" id="build-progress"></div></div>
+          <p class="progress-text" id="build-status">—</p>
         </div>
+        <div class="video-list hidden" id="video-list"></div>
       </section>
     </main>
 
@@ -164,7 +150,6 @@
     </footer>
   </div>
   <div class="toast-stack" id="toast-stack" aria-live="polite" aria-atomic="true"></div>
-  <script src="/static/vendor/hls.min.js"></script>
-  <script src="/static/js/app.js?v=overlay-boxes3"></script>
+  <script src="/static/js/app.js?v=restore-scene1"></script>
 </body>
 </html>

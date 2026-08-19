@@ -82,7 +82,7 @@ def _scan_violator_packets(
     """
     One pass over spill packets:
     presence frames, violation frames, a packet for the chosen report frame, counts.
-    Prefers a NO HELMET frame (middle of violations) for the photo.
+    Photo is the first NO HELMET frame (not mid-clip).
     """
     sid = int(stable_id)
     presence: list[int] = []
@@ -167,12 +167,12 @@ def _annotate_stable_id(rgb: np.ndarray, stable_id: int, frame_idx: int) -> np.n
     return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
 
 def read_source_frame_bgr(input_path: str, frame_idx: int) -> np.ndarray | None:
-    """Grab one source frame. HEVC-safe (no OpenCV seek — that yields corrupt frames)."""
-    from app.core.frame_io import read_frame_bgr_smart
+    """Grab one source frame. Sequential decode — HEVC-safe (no POS_FRAMES seek)."""
+    from app.core.window_frame_loader import read_frame_bgr_sequential
 
     if not input_path:
         return None
-    return read_frame_bgr_smart(str(input_path), int(frame_idx))
+    return read_frame_bgr_sequential(str(input_path), int(frame_idx))
 
 
 def _imwrite_bgr(path: Path, bgr: np.ndarray, *, quality: int = 92) -> None:

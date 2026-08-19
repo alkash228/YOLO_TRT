@@ -670,9 +670,7 @@ def _encode_timeline_streaming(
     reader: _FfmpegHwVideoReader | _PrefetchedVideoReader | None = None
     cap: cv2.VideoCapture | None = None
     clip_mode = encode_src_indices is not None
-    # Full-timeline encode: stream-decode every frame. Clip mode uses grab-skip
-    # to needed indices only (long videos otherwise look "stuck on decode").
-    if (not clip_mode) and resolved_input and Path(resolved_input).is_file():
+    if resolved_input and Path(resolved_input).is_file():
         try:
             reader = _open_decode_reader(
                 str(resolved_input),
@@ -690,12 +688,6 @@ def _encode_timeline_streaming(
                     on_log("Decode: none (packets only)")
             elif on_log:
                 on_log("Decode: OpenCV (sync)")
-    elif clip_mode and resolved_input and Path(resolved_input).is_file():
-        if on_log:
-            on_log(
-                f"Decode: grab-skip to {len(encode_src_indices or [])} violation frames "
-                f"(not full {n_src}-frame scan)"
-            )
     elif on_log:
         on_log(
             source_video_missing_message(
@@ -733,54 +725,21 @@ def _encode_timeline_streaming(
             if on_progress is not None:
                 on_progress(written, encode_total)
 
-    def _submit_clip_frame(src_i: int, frame_bgr: np.ndarray | None) -> None:
-        nonlocal out_seq, next_write
-        keyframe = lookup.keyframe_at(src_i)
-        if keyframe is None:
-            return
-        carry_local = keyframe
-        seq = out_seq
-        out_seq += 1
-        if next_write is None:
-            next_write = seq
-        fb_copy = frame_bgr.copy() if frame_bgr is not None else None
-        pending[seq] = executor.submit(
-            render_one,
-            _EncodeJob(src_i=src_i, carry=replace(carry_local), frame_bgr=fb_copy),
-            render_ctx,
-        )
-        _flush_ready(block=False)
-        while len(pending) >= max_inflight:
-            if next_write is None or next_write not in pending:
-                break
-            _flush_ready(block=True)
-
     try:
-        if clip_mode:
-            needed = sorted({int(i) for i in (encode_src_indices or set())})
-            encode_total = max(1, len(needed))
-            if resolved_input and Path(resolved_input).is_file():
-                from app.core.frame_io import iter_selected_bgr_frames
+        for src_i in range(n_src):
+            frame_bgr = _read_frame_bgr()
+            if frame_bgr is None and (reader is not None or cap is not None):
+                break
 
-                def _on_scan(cur: int, last: int) -> None:
-                    if on_log and cur % 900 == 0:
-                        on_log(f"Decode scan {cur}/{last} (grab-skip)")
+            if encode_src_indices is not None and src_i not in encode_src_indices:
+                continue
 
-                for src_i, frame_bgr in iter_selected_bgr_frames(
-                    str(resolved_input),
-                    needed,
-                    on_scan=_on_scan,
-                ):
-                    _submit_clip_frame(src_i, frame_bgr)
+            if clip_mode:
+                keyframe = lookup.keyframe_at(src_i)
+                if keyframe is None:
+                    continue
+                carry = keyframe
             else:
-                for src_i in needed:
-                    _submit_clip_frame(src_i, None)
-        else:
-            for src_i in range(n_src):
-                frame_bgr = _read_frame_bgr()
-                if frame_bgr is None and (reader is not None or cap is not None):
-                    break
-
                 keyframe = lookup.keyframe_at(src_i)
                 if keyframe is not None:
                     carry = keyframe
@@ -789,19 +748,21 @@ def _encode_timeline_streaming(
                 if carry is None:
                     continue
 
-                seq = src_i
-                if next_write is None:
-                    next_write = seq
+            seq = out_seq if clip_mode else src_i
+            if clip_mode:
+                out_seq += 1
+            if next_write is None:
+                next_write = seq
 
-                fb_copy = frame_bgr.copy() if frame_bgr is not None else None
-                job = _EncodeJob(src_i=src_i, carry=replace(carry), frame_bgr=fb_copy)
-                pending[seq] = executor.submit(render_one, job, render_ctx)
+            fb_copy = frame_bgr.copy() if frame_bgr is not None else None
+            job = _EncodeJob(src_i=src_i, carry=replace(carry), frame_bgr=fb_copy)
+            pending[seq] = executor.submit(render_one, job, render_ctx)
 
-                _flush_ready(block=False)
-                while len(pending) >= max_inflight:
-                    if next_write is None or next_write not in pending:
-                        break
-                    _flush_ready(block=True)
+            _flush_ready(block=False)
+            while len(pending) >= max_inflight:
+                if next_write is None or next_write not in pending:
+                    break
+                _flush_ready(block=True)
 
         while pending:
             if next_write is None:
