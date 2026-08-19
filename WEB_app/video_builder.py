@@ -15,7 +15,7 @@ from typing import Any
 import cv2
 import numpy as np
 
-from app.core.frame_pipeline import FramePacket
+from app.core.frame_pipeline import FramePacket, materialize_packet_for_render
 from app.core.video_encode import (
     _ChunkPacketLookup,
     _EncodeJob,
@@ -976,40 +976,51 @@ def _render_target_only(
 
 
 def _make_full_scene_render_fn():
-    """Draw every person + helmet on the frame; red callout on all NO HELMET IDs."""
+    """Draw every person + helmet on THIS source frame (no stale hold-forward)."""
     debug_hud = web_debug_show_all_dets()
 
     def _render(job: _EncodeJob, ctx: _RenderContext) -> tuple[int, np.ndarray]:
-        work = replace(job.carry, frame_idx=job.src_i)
         src_i, rgb = _render_encode_job(
-            replace(job, carry=work, frame_bgr=job.frame_bgr), ctx
+            replace(job, carry=replace(job.carry, frame_idx=job.src_i)),
+            ctx,
+        )
+        if int(job.carry.n_inst or 0) <= 0:
+            return src_i, rgb
+
+        rh, rw = int(rgb.shape[0]), int(rgb.shape[1])
+        # Geometry must match the pixels we just drew, not inference size / ctx target.
+        drawn = materialize_packet_for_render(
+            replace(job.carry, frame_idx=job.src_i),
+            job.frame_bgr,
+            height=rh,
+            width=rw,
         )
         rgb = stamp_all_people_boxes_rgb(
             rgb,
-            work,
-            target_w=ctx.target_w,
-            target_h=ctx.target_h,
+            drawn,
+            target_w=rw,
+            target_h=rh,
             focus_sid=None,
         )
         rgb = stamp_helmet_accessories_rgb(
             rgb,
-            work,
-            target_w=ctx.target_w,
-            target_h=ctx.target_h,
+            drawn,
+            target_w=rw,
+            target_h=rh,
         )
         if bool(ctx.overlay.get("draw_pose", False)):
             rgb = stamp_all_poses_rgb(
                 rgb,
-                work,
-                target_w=ctx.target_w,
-                target_h=ctx.target_h,
+                drawn,
+                target_w=rw,
+                target_h=rh,
                 pose_kpt_conf=float(ctx.overlay.get("pose_kpt_conf", 0.25)),
                 pose_point_radius=int(ctx.overlay.get("pose_point_radius", 6) or 6),
                 pose_line_thickness=int(ctx.overlay.get("pose_line_thickness", 3) or 3),
             )
         seen: set[int] = set()
-        sids = work.stable_ids
-        n = int(work.n_inst or 0)
+        sids = drawn.stable_ids
+        n = int(drawn.n_inst or 0)
         for i in range(n):
             if sids is None or i >= len(sids):
                 break
@@ -1019,17 +1030,17 @@ def _make_full_scene_render_fn():
             seen.add(sid)
             rgb = highlight_no_helmet_on_rgb(
                 rgb,
-                work,
+                drawn,
                 sid,
-                target_w=ctx.target_w,
-                target_h=ctx.target_h,
+                target_w=rw,
+                target_h=rh,
                 frame_bgr=job.frame_bgr,
                 force=False,
             )
         if debug_hud:
             rgb = stamp_debug_hud_rgb(
                 rgb,
-                work,
+                drawn,
                 draw_pose=bool(ctx.overlay.get("draw_pose", False)),
             )
         return src_i, rgb
@@ -1362,7 +1373,7 @@ def encode_full_scene_video(
         raise ValueError("source_frame_count is missing — cannot encode the full scene")
     if on_log:
         on_log(f"Source video: {meta['input_path']}")
-        on_log(f"Full-scene encode: {n_src} frames, all people on one MP4")
+        on_log(f"Full-scene encode: {n_src} frames, all people; OpenCV sequential, no hold-forward")
 
     if data.get("format") == "chunked" and "chunks" in data:
         lookup: _ChunkPacketLookup | _SortedPacketLookup = _ChunkPacketLookup(data, run_dir)
@@ -1396,6 +1407,8 @@ def encode_full_scene_video(
         encode_src_indices=None,
         run_id=str(rid),
         render_job_fn=_make_full_scene_render_fn(),
+        keep_all_frames=True,
+        prefer_opencv_decode=True,
     )
     input_path = str(meta["input_path"] or "")
     if input_path:

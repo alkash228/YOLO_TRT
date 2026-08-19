@@ -393,6 +393,24 @@ def _packet_frame_bgr(
     )
 
 
+def _empty_overlay_packet(src_i: int) -> FramePacket:
+    """No detections — encode the source pixels without overlay."""
+    return FramePacket(
+        frame_idx=int(src_i),
+        frame_bgr=np.empty((1, 1, 3), dtype=np.uint8),
+        stack=np.zeros((0, 1, 1), dtype=np.uint8),
+        stable_ids=np.zeros((0,), dtype=np.int64),
+        scores=np.zeros((0,), dtype=np.float32),
+        labels=[],
+        n_inst=0,
+        detect_ms=0.0,
+        seg_ms=0.0,
+        reid_ms=0.0,
+        infer_ms=0.0,
+        reid_recoveries=0,
+    )
+
+
 _VIDEO_SUFFIXES = {".mp4", ".mkv", ".mov", ".webm", ".avi", ".m4v"}
 
 
@@ -617,6 +635,8 @@ def _encode_timeline_streaming(
     encode_src_indices: set[int] | None = None,
     run_id: str | None = None,
     render_job_fn: Callable[[_EncodeJob, _RenderContext], tuple[int, np.ndarray]] | None = None,
+    keep_all_frames: bool = False,
+    prefer_opencv_decode: bool = False,
 ) -> Path:
     if source_frame_count <= 0:
         raise ValueError("source_frame_count required for streaming encode")
@@ -635,7 +655,7 @@ def _encode_timeline_streaming(
     target_w, target_h = _resolve_target_size(width=width, height=height, input_path=input_path)
     prompt_lookup = prompt_id_lookup_from_prompt(prompt)
     n_src = int(source_frame_count)
-    encode_total = len(encode_src_indices) if encode_src_indices else n_src
+    encode_total = n_src if keep_all_frames else (len(encode_src_indices) if encode_src_indices else n_src)
     workers = max(1, int(post_workers))
     render_ctx = _RenderContext(
         target_w=target_w,
@@ -671,23 +691,37 @@ def _encode_timeline_streaming(
     cap: cv2.VideoCapture | None = None
     clip_mode = encode_src_indices is not None
     if resolved_input and Path(resolved_input).is_file():
-        try:
-            reader = _open_decode_reader(
-                str(resolved_input),
-                width=target_w,
-                height=target_h,
-                prefetch=max(16, workers * 3),
-                ffmpeg_exe=ffmpeg_exe,
-                on_log=on_log,
-            )
-        except (OSError, RuntimeError):
-            cap = cv2.VideoCapture(str(resolved_input))
-            if not cap.isOpened():
-                cap = None
+        opened = False
+        if not prefer_opencv_decode:
+            try:
+                reader = _open_decode_reader(
+                    str(resolved_input),
+                    width=target_w,
+                    height=target_h,
+                    prefetch=max(16, workers * 3),
+                    ffmpeg_exe=ffmpeg_exe,
+                    on_log=on_log,
+                )
+                opened = reader is not None
+            except (OSError, RuntimeError):
+                opened = False
+                reader = None
+        if not opened:
+            try:
+                reader = _PrefetchedVideoReader(
+                    str(resolved_input),
+                    prefetch=max(16, workers * 3),
+                )
                 if on_log:
-                    on_log("Decode: none (packets only)")
-            elif on_log:
-                on_log("Decode: OpenCV (sync)")
+                    on_log("Decode: OpenCV sequential")
+            except OSError:
+                cap = cv2.VideoCapture(str(resolved_input))
+                if not cap.isOpened():
+                    cap = None
+                    if on_log:
+                        on_log("Decode: none (packets only)")
+                elif on_log:
+                    on_log("Decode: OpenCV (sync)")
     elif on_log:
         on_log(
             source_video_missing_message(
@@ -734,7 +768,10 @@ def _encode_timeline_streaming(
             if encode_src_indices is not None and src_i not in encode_src_indices:
                 continue
 
-            if clip_mode:
+            if keep_all_frames:
+                keyframe = lookup.keyframe_at(src_i)
+                carry = keyframe if keyframe is not None else _empty_overlay_packet(src_i)
+            elif clip_mode:
                 keyframe = lookup.keyframe_at(src_i)
                 if keyframe is None:
                     continue
@@ -748,8 +785,8 @@ def _encode_timeline_streaming(
                 if carry is None:
                     continue
 
-            seq = out_seq if clip_mode else src_i
-            if clip_mode:
+            seq = src_i if (keep_all_frames or not clip_mode) else out_seq
+            if clip_mode and not keep_all_frames:
                 out_seq += 1
             if next_write is None:
                 next_write = seq
